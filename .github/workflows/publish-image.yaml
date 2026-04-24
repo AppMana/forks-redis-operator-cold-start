@@ -53,7 +53,10 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # linux/amd64 only — our k8s cluster has no arm64 nodes and QEMU-emulated
+          # arm64 adds ~12 min per build. If we ever add arm64 workers, re-enable
+          # with: platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           build-args: |
             IMG=${{ fromJSON(steps.meta.outputs.json).tags[0] }}
