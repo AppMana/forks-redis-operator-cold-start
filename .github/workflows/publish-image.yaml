@@ -4,15 +4,21 @@ on:
   push:
     tags:
       - 'v*'
+    branches:
+      - cold-start-bootstrap
+  workflow_dispatch: {}
 
 env:
   REGISTRY: ghcr.io
-  REPOSITORY: ot-container-kit/redis-operator
-  QuayImageName: quay.io/opstree/redis-operator
+  # Lowercased because GHCR requires it. Repository is ghcr.io/appmana/forks-redis-operator-cold-start.
+  IMAGE: ghcr.io/appmana/forks-redis-operator-cold-start
 
 jobs:
   release-ghcr-image:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -30,9 +36,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Env
-        run: |
-          echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=tag
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            # Mark the cold-start-bootstrap branch head as :latest for convenience.
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/cold-start-bootstrap' }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
@@ -42,44 +56,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            IMG=${{ env.REGISTRY }}/${{ env.REPOSITORY }}/redis-operator:${{ env.TAG }}
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/redis-operator:${{ env.TAG }}
-            ${{ env.REGISTRY }}/${{ env.REPOSITORY }}/redis-operator:latest
-
-  release-quay-image:
-    runs-on: ubuntu-latest
-    environment: release-image
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Login to Quay.io
-        uses: docker/login-action@v3
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
-
-      - name: Setup Env
-        run: |
-          echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-
-      - name: Build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: |
-            IMG=${{ env.QuayImageName }}:${{ env.TAG }}
-          tags: |
-            ${{ env.QuayImageName }}:${{ env.TAG }}
-            ${{ env.QuayImageName }}:latest
+            IMG=${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
