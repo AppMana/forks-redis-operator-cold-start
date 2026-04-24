@@ -363,14 +363,37 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	if len(masterNodes) > 1 {
+	if len(masterNodes) == 0 && len(slaveNodes) > 0 {
+		// Cold-start recovery: every pod came up as a slave (usually because every
+		// pod's own master_host points at a ghost IP from a prior topology, with
+		// master_link_status=down). No pod is a valid master, so no reconcile path
+		// in upstream handles this — it just spins forever. Promote a candidate
+		// deterministically (CR status if set, else lowest ordinal) and reslave.
+		realMaster = k8sutils.PickPreferredMaster(instance, slaveNodes)
+		log.FromContext(ctx).Info("No master in cluster, promoting pod", "pod", realMaster)
+		if err := k8sutils.PromoteMasterAndReslave(ctx, r.K8sClient, instance, slaveNodes, realMaster); err != nil {
+			log.FromContext(ctx).Error(err, "cold-start promote failed")
+			return intctrlutil.RequeueAfter(ctx, time.Second*30, "cold-start promote failed")
+		}
+	} else if len(masterNodes) > 1 {
 		log.FromContext(ctx).Info("Creating redis replication by executing replication creation commands")
 
 		realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
-		if len(slaveNodes) == 0 {
-			realMaster = masterNodes[0]
+		if realMaster == "" {
+			// Cold-start recovery: multiple pods report role:master and none has
+			// attached slaves that we can use to disambiguate. Previously the
+			// upstream only fell back to masterNodes[0] when len(slaveNodes) == 0,
+			// which left the production split-brain shape (two masters + one
+			// slave-of-ghost) unresolved. Always fall back to PickPreferredMaster
+			// so we never call CreateMasterSlaveReplication with an empty master.
+			realMaster = k8sutils.PickPreferredMaster(instance, masterNodes)
+			log.FromContext(ctx).Info("No real master detectable, falling back", "pod", realMaster)
 		}
-		if err := k8sutils.CreateMasterSlaveReplication(ctx, r.K8sClient, instance, masterNodes, realMaster); err != nil {
+		// Include slaveNodes: in the split-brain shape we saw in prod, slaves were
+		// pointed at a dead IP (master_link_status=down). They must be re-slaved
+		// to the real master as part of recovery.
+		allPods := append(append([]string{}, masterNodes...), slaveNodes...)
+		if err := k8sutils.CreateMasterSlaveReplication(ctx, r.K8sClient, instance, allPods, realMaster); err != nil {
 			return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 		}
 	} else if len(masterNodes) == 1 && len(slaveNodes) > 0 {

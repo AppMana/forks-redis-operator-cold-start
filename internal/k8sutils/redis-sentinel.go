@@ -367,8 +367,16 @@ func getRedisReplicationMasterPod(ctx context.Context, client kubernetes.Interfa
 	}
 
 	if realMasterPod == "" {
-		log.FromContext(ctx).Error(errors.New("no real master pod found"), "")
-		return emptyRedisInfo
+		// Cold-start fallback: in the upstream path this was a terminal error,
+		// which left Sentinel stuck monitoring the 0.0.0.0 placeholder forever.
+		// Prefer the CR's persisted .status.masterNode if it points at one of
+		// the candidate master pods; otherwise the lowest-ordinal master pod.
+		realMasterPod = PickPreferredMaster(&replicationInstance, masterPods)
+		if realMasterPod == "" {
+			log.FromContext(ctx).Error(errors.New("no real master pod found"), "")
+			return emptyRedisInfo
+		}
+		log.FromContext(ctx).Info("No real master detectable via INFO, using cold-start fallback", "pod", realMasterPod)
 	}
 
 	return RedisDetails{
