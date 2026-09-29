@@ -461,8 +461,7 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 			return intctrlutil.RequeueE(ctx, err, "")
 		}
 	}
-	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
-	if err = r.Healer.UpdateRedisRoleLabel(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS); err != nil {
+	if err = r.publishObservedRoleLabels(ctx, instance, masterNodes); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 
@@ -477,6 +476,18 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	}
 
 	return intctrlutil.Reconciled()
+}
+
+// An empty replacement starts as master until topology reconciliation reslaves
+// it. Never publish multiple observed masters into the writable Service during
+// that interval. Sentinel failover becomes publishable once the old master has
+// demoted; cold-start repair remains responsible for resolving ambiguity.
+func (r *Reconciler) publishObservedRoleLabels(ctx context.Context, instance *rrvb2.RedisReplication, masterNodes []string) error {
+	if len(masterNodes) != 1 {
+		return nil
+	}
+	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
+	return r.Healer.UpdateRedisRoleLabel(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS)
 }
 
 func (r *Reconciler) updateStatus(ctx context.Context, rr *rrvb2.RedisReplication, status rrvb2.RedisReplicationStatus) error {
