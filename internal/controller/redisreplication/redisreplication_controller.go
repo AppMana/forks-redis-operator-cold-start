@@ -360,11 +360,17 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 	var realMaster string
 	masterNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "master")
 	if err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
+		// Missing replicas are an expected degraded state. Keep observing
+		// elected roles every 30s instead of exponential error backoff.
+		log.FromContext(ctx).Error(err, "topology observation incomplete; keeping current replication")
+		return intctrlutil.RequeueAfter(ctx, 30*time.Second, "waiting for complete topology observation")
 	}
 	slaveNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "slave")
 	if err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
+		// Missing replicas are an expected degraded state. Keep observing
+		// elected roles every 30s instead of exponential error backoff.
+		log.FromContext(ctx).Error(err, "topology observation incomplete; keeping current replication")
+		return intctrlutil.RequeueAfter(ctx, 30*time.Second, "waiting for complete topology observation")
 	}
 	if len(masterNodes) == 0 && len(slaveNodes) > 0 {
 		// Cold-start recovery: every pod came up as a slave (usually because every
