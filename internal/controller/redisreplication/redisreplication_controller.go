@@ -60,8 +60,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	reconcilers := []reconciler{
 		{typ: "finalizer", rec: r.reconcileFinalizer},
 		{typ: "resources", rec: r.reconcileResources},
-		{typ: "redis", rec: r.reconcileRedis},
+		// Publish observed roles even when topology reconciliation must wait for
+		// an unavailable replica. Otherwise Sentinel succeeds but the master
+		// Service stays empty indefinitely.
 		{typ: "status", rec: r.reconcileStatus},
+		{typ: "redis", rec: r.reconcileRedis},
 	}
 
 	for _, reconciler := range reconcilers {
@@ -436,20 +439,28 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	var err error
 	var realMaster string
 
-	masterNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "master")
+	masterNodes, err := k8sutils.ObserveRedisNodesByRole(ctx, r.K8sClient, instance, "master")
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
-	if err = r.UpdateRedisReplicationMaster(ctx, instance, realMaster); err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
+	if len(masterNodes) == 1 {
+		realMaster = masterNodes[0]
+	} else {
+		realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
+	}
+	// A partial or cold-start view cannot disprove the last recorded primary.
+	// Preserve it for the existing conservative bootstrap recovery policy.
+	if realMaster != "" {
+		if err = r.UpdateRedisReplicationMaster(ctx, instance, realMaster); err != nil {
+			return intctrlutil.RequeueE(ctx, err, "")
+		}
 	}
 	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
 	if err = r.Healer.UpdateRedisRoleLabel(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 
-	slaveNodes, err := k8sutils.GetRedisNodesByRole(ctx, r.K8sClient, instance, "slave")
+	slaveNodes, err := k8sutils.ObserveRedisNodesByRole(ctx, r.K8sClient, instance, "slave")
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}

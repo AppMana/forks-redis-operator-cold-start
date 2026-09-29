@@ -69,6 +69,9 @@ func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map
 		}
 	}
 	for _, pod := range pods.Items {
+		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+			continue
+		}
 		connInfo := createConnectionInfo(ctx, pod, password, tlsConfig, h.k8s, ns, "6379")
 		isMaster, err := h.redis.Connect(connInfo).IsMaster(ctx)
 		if err != nil {

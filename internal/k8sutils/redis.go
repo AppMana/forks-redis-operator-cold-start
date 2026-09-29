@@ -20,6 +20,7 @@ import (
 	redis "github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -694,6 +695,22 @@ func getRedisReplicationHostname(redisInfo RedisDetails, cr *rrvb2.RedisReplicat
 
 // Get Redis nodes by it's role i.e. master, slave and sentinel
 func GetRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, redisRole string) ([]string, error) {
+	return getRedisNodesByRole(ctx, cl, cr, redisRole, false, func(name string) *redis.Client {
+		return configureRedisReplicationClient(ctx, cl, cr, name)
+	})
+}
+
+// ObserveRedisNodesByRole is read-only discovery for status and Service labels.
+// Missing/unreachable replicas must not hide a primary already elected by Sentinel.
+// Do not use this partial view to promote/demote nodes: topology reconciliation
+// intentionally keeps using GetRedisNodesByRole, which requires a complete view.
+func ObserveRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, redisRole string) ([]string, error) {
+	return getRedisNodesByRole(ctx, cl, cr, redisRole, true, func(name string) *redis.Client {
+		return configureRedisReplicationClient(ctx, cl, cr, name)
+	})
+}
+
+func getRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, redisRole string, allowUnavailable bool, newClient func(string) *redis.Client) ([]string, error) {
 	statefulset, err := GetStatefulSet(ctx, cl, cr.GetNamespace(), cr.GetName())
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Failed to Get the Statefulset of the", "custom resource", cr.Name, "in namespace", cr.Namespace)
@@ -705,10 +722,25 @@ func GetRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2
 
 	for i := 0; i < int(replicas); i++ {
 		podName := statefulset.Name + "-" + strconv.Itoa(i)
-		redisClient := configureRedisReplicationClient(ctx, cl, cr, podName)
+		if allowUnavailable {
+			pod, err := cl.CoreV1().Pods(cr.Namespace).Get(ctx, podName, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+				continue
+			}
+		}
+		redisClient := newClient(podName)
 		defer redisClient.Close()
 		podRole, err := checkRedisServerRole(ctx, redisClient, podName)
 		if err != nil {
+			if allowUnavailable {
+				continue
+			}
 			return nil, err
 		}
 		if podRole == redisRole {
