@@ -13,11 +13,13 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 )
 
 const (
@@ -70,7 +72,8 @@ func (r *RedisSentinelReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	return intctrlutil.Reconciled()
+	// Pod IPs can change without changing the replication CR status.
+	return intctrlutil.RequeueAfter(ctx, 30*time.Second, "refresh Sentinel discovery")
 }
 
 type reconciler struct {
@@ -144,9 +147,8 @@ func (r *RedisSentinelReconciler) reconcileSentinel(ctx context.Context, instanc
 	if err := r.Healer.SentinelSet(ctx, instance, monitorAddr); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	if err := r.Healer.SentinelReset(ctx, instance); err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
-	}
+	// Do not RESET healthy monitors: that discards discovered replicas and
+	// election state. SentinelMonitor already replaces a changed address.
 	return intctrlutil.Reconciled()
 }
 
@@ -164,6 +166,30 @@ func (r *RedisSentinelReconciler) reconcileService(ctx context.Context, instance
 	return intctrlutil.Reconciled()
 }
 
+// sentinelsForPod wakes monitors when a Redis pod gets a new IP, including when
+// the primary ordinal and RedisReplication status remain unchanged.
+func (r *RedisSentinelReconciler) sentinelsForPod(ctx context.Context, object client.Object) []ctrl.Request {
+	if object.GetLabels()["redis_setup_type"] != string(common.SetupTypeReplication) {
+		return nil
+	}
+	replication := object.GetLabels()["app"]
+	if replication == "" {
+		return nil
+	}
+	var sentinels rsvb2.RedisSentinelList
+	if err := r.List(ctx, &sentinels, client.InNamespace(object.GetNamespace())); err != nil {
+		ctrl.LoggerFrom(ctx).Error(err, "list Sentinel monitors for Redis pod")
+		return nil
+	}
+	var requests []ctrl.Request
+	for _, sentinel := range sentinels.Items {
+		if config := sentinel.Spec.RedisSentinelConfig; config != nil && config.RedisReplicationName == replication {
+			requests = append(requests, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: sentinel.Namespace, Name: sentinel.Name}})
+		}
+	}
+	return requests
+}
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options) error {
 	return ctrl.NewControllerManagedBy(mgr).
@@ -171,5 +197,6 @@ func (r *RedisSentinelReconciler) SetupWithManager(mgr ctrl.Manager, opts contro
 		Owns(&appsv1.StatefulSet{}).
 		WithOptions(opts).
 		Watches(&rrvb2.RedisReplication{}, r.ReplicationWatcher).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.sentinelsForPod)).
 		Complete(r)
 }
