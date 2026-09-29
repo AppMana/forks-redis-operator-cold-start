@@ -12,10 +12,12 @@ import (
 type recordingRoleHealer struct {
 	redishealer.Healer
 	calls int
+ observedMaster []string
 }
 
-func (h *recordingRoleHealer) UpdateRedisRoleLabel(context.Context, string, map[string]string, *commonapi.ExistingPasswordSecret, *commonapi.TLSConfig) error {
+func (h *recordingRoleHealer) UpdateRedisRoleLabel(context.Context, string, map[string]string, *commonapi.ExistingPasswordSecret, *commonapi.TLSConfig, observedMaster ...string) error {
 	h.calls++
+ h.observedMaster = observedMaster
 	return nil
 }
 
@@ -34,6 +36,7 @@ func TestPublishObservedRoleLabels(t *testing.T) {
 			r := &Reconciler{Healer: h}
 			require.NoError(t, r.publishObservedRoleLabels(context.Background(), &rrvb2.RedisReplication{}, tc.masters))
 			require.Equal(t, tc.calls, h.calls)
+ if tc.calls == 1 { require.Equal(t, tc.masters, h.observedMaster) }
 		})
 	}
 }

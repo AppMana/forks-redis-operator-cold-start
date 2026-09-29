@@ -29,7 +29,7 @@ type Healer interface {
 	SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel) error
 
 	// UpdatePodRoleLabel connect to all redis pods and update pod role label `redis-role` to `master` or `slave` according to their role.
-	UpdateRedisRoleLabel(ctx context.Context, ns string, labels map[string]string, secret *commonapi.ExistingPasswordSecret, tlsConfig *commonapi.TLSConfig) error
+	UpdateRedisRoleLabel(ctx context.Context, ns string, labels map[string]string, secret *commonapi.ExistingPasswordSecret, tlsConfig *commonapi.TLSConfig, observedMaster ...string) error
 }
 
 type healer struct {
@@ -44,7 +44,7 @@ func NewHealer(clientset kubernetes.Interface) Healer {
 	}
 }
 
-func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map[string]string, secret *commonapi.ExistingPasswordSecret, tlsConfig *commonapi.TLSConfig) error {
+func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map[string]string, secret *commonapi.ExistingPasswordSecret, tlsConfig *commonapi.TLSConfig, observedMaster ...string) error {
 	selector := make([]string, 0, len(labels))
 	for key, value := range labels {
 		selector = append(selector, fmt.Sprintf("%s=%s", key, value))
@@ -80,6 +80,11 @@ func (h *healer) UpdateRedisRoleLabel(ctx context.Context, ns string, labels map
 		}
 		role := common.RedisRoleLabelSlave
 		if isMaster {
+			// A replacement can appear between discovery and this pod list.
+			// Never publish an unobserved master into the writable Service.
+			if len(observedMaster) > 0 && pod.Name != observedMaster[0] {
+				continue
+			}
 			role = common.RedisRoleLabelMaster
 		}
 		if oldRole := pod.Labels[common.RedisRoleLabelKey]; oldRole != role {
