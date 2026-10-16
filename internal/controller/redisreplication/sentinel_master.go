@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
@@ -107,23 +108,34 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			logger.Error(err, "get Sentinel password", "masterGroup", group.masterGroup)
 			continue
 		}
-		var answers []string
+		var (
+			mu      sync.Mutex
+			wg      sync.WaitGroup
+			answers []string
+		)
 		for _, pod := range group.pods {
 			if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
 				continue
 			}
 			connInfo := redishealer.ConnectionInfoForPod(ctx, pod, password, group.tls, r.K8sClient, rr.Namespace, "26379")
-			queryCtx, cancel := context.WithTimeout(ctx, sentinelQueryTimeout)
-			host, port, monitored, err := redisClient.Connect(connInfo).SentinelGetMasterAddrByName(queryCtx, group.masterGroup)
-			cancel()
-			if err != nil {
-				logger.V(1).Info("Sentinel did not answer", "sentinel", pod.Name, "error", err.Error())
-				continue
-			}
-			if monitored {
-				answers = append(answers, net.JoinHostPort(host, port))
-			}
+			wg.Add(1)
+			go func(name string) {
+				defer wg.Done()
+				queryCtx, cancel := context.WithTimeout(ctx, sentinelQueryTimeout)
+				defer cancel()
+				host, port, monitored, err := redisClient.Connect(connInfo).SentinelGetMasterAddrByName(queryCtx, group.masterGroup)
+				if err != nil {
+					logger.V(1).Info("Sentinel did not answer", "sentinel", name, "error", err.Error())
+					return
+				}
+				if monitored {
+					mu.Lock()
+					answers = append(answers, net.JoinHostPort(host, port))
+					mu.Unlock()
+				}
+			}(pod.Name)
 		}
+		wg.Wait()
 		addr, ok := majorityAddress(answers, group.size)
 		if !ok {
 			continue

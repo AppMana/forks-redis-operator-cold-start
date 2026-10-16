@@ -94,6 +94,9 @@ func (s *service) createClient() *rediscli.Client {
 		Addr:     s.connectionInfo.GetAddress(),
 		Password: s.connectionInfo.Password,
 		DB:       0,
+		// Honour caller deadlines; go-redis otherwise applies only its own
+		// 5 s dial and 3 s read timeouts.
+		ContextTimeoutEnabled: true,
 	}
 	if s.connectionInfo.TLSConfig != nil {
 		opts.TLSConfig = s.connectionInfo.TLSConfig

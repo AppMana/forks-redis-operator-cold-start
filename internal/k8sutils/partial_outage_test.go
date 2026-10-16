@@ -3,7 +3,9 @@ package k8sutils
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
+	"time"
 
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	"github.com/go-redis/redismock/v9"
@@ -17,60 +19,107 @@ import (
 	"k8s.io/utils/ptr"
 )
 
-// The production failure: Sentinel already promoted pod0 while pod2 was Pending.
-// Discovery must publish pod0; topology mutation must still reject a partial view.
+func partialOutageReplication(pendingLast bool) (*rrvb2.RedisReplication, *fake.Clientset) {
+	cr := &rrvb2.RedisReplication{ObjectMeta: metav1.ObjectMeta{Name: "redis-test", Namespace: "test"}, Spec: rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3))}}
+	objects := []runtime.Object{&appsv1.StatefulSet{ObjectMeta: cr.ObjectMeta}}
+	for i, name := range []string{"redis-test-0", "redis-test-1", "redis-test-2"} {
+		ip := "10.0.0.1"
+		if i == 2 && pendingLast {
+			ip = ""
+		}
+		objects = append(objects, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test"}, Status: corev1.PodStatus{PodIP: ip}})
+	}
+	return cr, fake.NewSimpleClientset(objects...)
+}
+
+// Sentinel already promoted pod0 while pod2 was Pending or unreachable.
+// Observation must report pod0 as master; topology mutation must still reject
+// a partial view.
 func TestPartialOutageRoleObservation(t *testing.T) {
 	for _, tc := range []struct {
-		name            string
-		pending, strict bool
+		name    string
+		pending bool
 	}{
 		{name: "pending replica", pending: true},
 		{name: "unreachable replica"},
-		{name: "topology still requires complete observation", strict: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			cr := &rrvb2.RedisReplication{ObjectMeta: metav1.ObjectMeta{Name: "redis-test", Namespace: "test"}, Spec: rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3))}}
-			objects := []runtime.Object{&appsv1.StatefulSet{ObjectMeta: cr.ObjectMeta}}
+			cr, k8s := partialOutageReplication(tc.pending)
 			clients := map[string]*redis.Client{}
 			var mocks []redismock.ClientMock
 			for i, name := range []string{"redis-test-0", "redis-test-1", "redis-test-2"} {
-				ip := "10.0.0.1"
-				if i == 2 && tc.pending {
-					ip = ""
-				}
-				objects = append(objects, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test"}, Status: corev1.PodStatus{PodIP: ip}})
 				if i == 2 && tc.pending {
 					continue
 				}
 				c, m := redismock.NewClientMock()
 				clients[name] = c
 				mocks = append(mocks, m)
-				if i == 2 {
+				switch i {
+				case 0:
+					m.ExpectInfo("Replication").SetVal("role:master\r\n")
+				case 1:
+					m.ExpectInfo("Replication").SetVal("role:slave\r\n")
+				default:
 					m.ExpectInfo("Replication").SetErr(errors.New("replica unreachable"))
-				} else {
-					role := "master"
-					if i == 1 {
-						role = "slave"
-					}
-					m.ExpectInfo("Replication").SetVal("role:" + role + "\r\n")
 				}
 			}
-			nodes, err := getRedisNodesByRole(ctx, fake.NewSimpleClientset(objects...), cr, "master", !tc.strict, func(name string) *redis.Client {
+			roles, err := observeRedisReplicationRoles(context.Background(), k8s, cr, func(name string) *redis.Client {
 				c, ok := clients[name]
 				require.True(t, ok, "must not dial a Pending pod")
 				return c
 			})
-			if tc.strict {
-				require.Error(t, err)
-				require.Nil(t, nodes)
-			} else {
-				require.NoError(t, err)
-				require.Equal(t, []string{"redis-test-0"}, nodes)
-			}
+			require.NoError(t, err)
+			require.Equal(t, map[string]string{"redis-test-0": "master", "redis-test-1": "slave"}, roles)
 			for _, m := range mocks {
 				require.NoError(t, m.ExpectationsWereMet())
 			}
 		})
 	}
+
+	t.Run("topology still requires complete observation", func(t *testing.T) {
+		cr, k8s := partialOutageReplication(false)
+		c, m := redismock.NewClientMock()
+		m.ExpectInfo("Replication").SetErr(errors.New("replica unreachable"))
+		nodes, err := getRedisNodesByRole(context.Background(), k8s, cr, "master", func(string) *redis.Client { return c })
+		require.Error(t, err)
+		require.Nil(t, nodes)
+	})
+}
+
+// A hung or partitioned old primary accepts TCP but never answers. Its probe
+// must neither delay the other pods' probes nor exceed RoleProbeTimeout, since
+// the master Service cannot move until observation returns.
+func TestHungPodRoleObservationIsBounded(t *testing.T) {
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+
+	cr, k8s := partialOutageReplication(false)
+	healthy, m := redismock.NewClientMock()
+	m.ExpectInfo("Replication").SetVal("role:master\r\n")
+	start := time.Now()
+	roles, err := observeRedisReplicationRoles(context.Background(), k8s, cr, func(name string) *redis.Client {
+		if name == "redis-test-2" {
+			return healthy
+		}
+		return redis.NewClient(&redis.Options{Addr: listener.Addr().String(), MaxRetries: -1, ContextTimeoutEnabled: true})
+	})
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"redis-test-2": "master"}, roles)
+	require.Less(t, elapsed, RoleProbeTimeout+time.Second, "hung pods must be probed concurrently within RoleProbeTimeout")
+
+	// The production client must honour that deadline too.
+	client := configureRedisReplicationClient(context.Background(), k8s, cr, "redis-test-0")
+	defer client.Close()
+	require.True(t, client.Options().ContextTimeoutEnabled)
 }

@@ -42,16 +42,16 @@ type Reconciler struct {
 	K8sClient kubernetes.Interface
 
 	// Test seams; nil uses the live Redis and Sentinel probes.
-	ObserveRoles          func(ctx context.Context, instance *rrvb2.RedisReplication, role string) ([]string, error)
+	ObserveRoles          func(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error)
 	RealMaster            func(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string
 	SentinelElectedMaster func(ctx context.Context, instance *rrvb2.RedisReplication) (string, bool)
 }
 
-func (r *Reconciler) observeRoles(ctx context.Context, instance *rrvb2.RedisReplication, role string) ([]string, error) {
+func (r *Reconciler) observeRoles(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error) {
 	if r.ObserveRoles != nil {
-		return r.ObserveRoles(ctx, instance, role)
+		return r.ObserveRoles(ctx, instance)
 	}
-	return k8sutils.ObserveRedisNodesByRole(ctx, r.K8sClient, instance, role)
+	return k8sutils.ObserveRedisReplicationRoles(ctx, r.K8sClient, instance)
 }
 
 func (r *Reconciler) realMaster(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string {
@@ -479,7 +479,9 @@ const noMasterRequeue = 5 * time.Second
 // master Service selects. It must keep working while pods are missing or
 // terminating: that is exactly when the master moves.
 func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
-	masterNodes, err := r.observeRoles(ctx, instance, "master")
+	// One concurrent, bounded probe per pod feeds both the election and the
+	// labels, so an unresponsive old primary costs one RoleProbeTimeout.
+	roles, err := r.observeRoles(ctx, instance)
 	if apierrors.IsNotFound(err) {
 		// The StatefulSet is created by the resources step.
 		return intctrlutil.Reconciled()
@@ -487,10 +489,17 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	slaveNodes, err := r.observeRoles(ctx, instance, "slave")
-	if err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
+	var masterNodes, slaveNodes []string
+	for pod, role := range roles {
+		switch role {
+		case "master":
+			masterNodes = append(masterNodes, pod)
+		case "slave":
+			slaveNodes = append(slaveNodes, pod)
+		}
 	}
+	slices.Sort(masterNodes)
+	slices.Sort(slaveNodes)
 
 	realMaster := r.electedMaster(ctx, instance, masterNodes, slaveNodes)
 	// A partial or cold-start view cannot disprove the last recorded primary.
@@ -501,7 +510,7 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 		}
 	}
 	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
-	if err = r.Healer.PublishReplicationRoleLabels(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS, realMaster); err != nil {
+	if err = r.Healer.PublishReplicationRoleLabels(ctx, instance.GetNamespace(), labels, roles, realMaster); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 

@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
@@ -682,6 +683,9 @@ func configureRedisReplicationClient(ctx context.Context, client kubernetes.Inte
 		Addr:     addr,
 		Password: pass,
 		DB:       0,
+		// Honour context deadlines such as RoleProbeTimeout; go-redis
+		// otherwise applies only its own 5 s dial and 3 s read timeouts.
+		ContextTimeoutEnabled: true,
 	}
 	if cr.Spec.TLS != nil {
 		opts.TLSConfig = getRedisTLSConfig(ctx, client, cr.Namespace, cr.Spec.TLS.Secret.SecretName, podName)
@@ -695,22 +699,14 @@ func getRedisReplicationHostname(redisInfo RedisDetails, cr *rrvb2.RedisReplicat
 
 // Get Redis nodes by it's role i.e. master, slave and sentinel
 func GetRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, redisRole string) ([]string, error) {
-	return getRedisNodesByRole(ctx, cl, cr, redisRole, false, func(name string) *redis.Client {
+	return getRedisNodesByRole(ctx, cl, cr, redisRole, func(name string) *redis.Client {
 		return configureRedisReplicationClient(ctx, cl, cr, name)
 	})
 }
 
-// ObserveRedisNodesByRole is read-only discovery for status and Service labels.
-// Missing/unreachable replicas must not hide a primary already elected by Sentinel.
-// Do not use this partial view to promote/demote nodes: topology reconciliation
-// intentionally keeps using GetRedisNodesByRole, which requires a complete view.
-func ObserveRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, redisRole string) ([]string, error) {
-	return getRedisNodesByRole(ctx, cl, cr, redisRole, true, func(name string) *redis.Client {
-		return configureRedisReplicationClient(ctx, cl, cr, name)
-	})
-}
-
-func getRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, redisRole string, allowUnavailable bool, newClient func(string) *redis.Client) ([]string, error) {
+// getRedisNodesByRole requires every pod to answer: topology reconciliation
+// must never promote or demote nodes from a partial view.
+func getRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, redisRole string, newClient func(string) *redis.Client) ([]string, error) {
 	statefulset, err := GetStatefulSet(ctx, cl, cr.GetNamespace(), cr.GetName())
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Failed to Get the Statefulset of the", "custom resource", cr.Name, "in namespace", cr.Namespace)
@@ -722,25 +718,10 @@ func getRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2
 
 	for i := 0; i < int(replicas); i++ {
 		podName := statefulset.Name + "-" + strconv.Itoa(i)
-		if allowUnavailable {
-			pod, err := cl.CoreV1().Pods(cr.Namespace).Get(ctx, podName, metav1.GetOptions{})
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			if err != nil {
-				return nil, err
-			}
-			if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
-				continue
-			}
-		}
 		redisClient := newClient(podName)
 		defer redisClient.Close()
 		podRole, err := checkRedisServerRole(ctx, redisClient, podName)
 		if err != nil {
-			if allowUnavailable {
-				continue
-			}
 			return nil, err
 		}
 		if podRole == redisRole {
@@ -749,6 +730,69 @@ func getRedisNodesByRole(ctx context.Context, cl kubernetes.Interface, cr *rrvb2
 	}
 
 	return pods, nil
+}
+
+// RoleProbeTimeout bounds one INFO probe during role observation.
+const RoleProbeTimeout = time.Second
+
+// ObserveRedisReplicationRoles is read-only discovery for status and Service
+// labels: it returns the role of every pod that answered. Missing or
+// unreachable replicas must not hide a primary already elected by Sentinel.
+// Do not use this partial view to promote/demote nodes; topology
+// reconciliation uses GetRedisNodesByRole, which requires a complete view.
+func ObserveRedisReplicationRoles(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication) (map[string]string, error) {
+	return observeRedisReplicationRoles(ctx, cl, cr, func(name string) *redis.Client {
+		return configureRedisReplicationClient(ctx, cl, cr, name)
+	})
+}
+
+func observeRedisReplicationRoles(ctx context.Context, cl kubernetes.Interface, cr *rrvb2.RedisReplication, newClient func(string) *redis.Client) (map[string]string, error) {
+	statefulset, err := GetStatefulSet(ctx, cl, cr.GetNamespace(), cr.GetName())
+	if err != nil {
+		return nil, err
+	}
+	var live []string
+	for i := 0; i < int(cr.Spec.GetReplicationCounts("replication")); i++ {
+		podName := statefulset.Name + "-" + strconv.Itoa(i)
+		pod, err := cl.CoreV1().Pods(cr.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+			continue
+		}
+		live = append(live, podName)
+	}
+
+	// Probe concurrently: a hung old primary would otherwise cost a full
+	// read timeout per probe, in sequence, before the master Service moves.
+	var (
+		mu    sync.Mutex
+		wg    sync.WaitGroup
+		roles = map[string]string{}
+	)
+	for _, podName := range live {
+		wg.Add(1)
+		go func(podName string) {
+			defer wg.Done()
+			redisClient := newClient(podName)
+			defer redisClient.Close()
+			probeCtx, cancel := context.WithTimeout(ctx, RoleProbeTimeout)
+			defer cancel()
+			role, err := checkRedisServerRole(probeCtx, redisClient, podName)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			roles[podName] = role
+			mu.Unlock()
+		}(podName)
+	}
+	wg.Wait()
+	return roles, nil
 }
 
 // Check the Redis Server Role i.e. master, slave and sentinel

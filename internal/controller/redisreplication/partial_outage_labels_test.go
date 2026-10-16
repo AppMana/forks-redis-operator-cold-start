@@ -20,6 +20,7 @@ import (
 type recordingRoleHealer struct {
 	redishealer.Healer
 	published *string
+	roles     map[string]string
 }
 
 func (h *recordingRoleHealer) UpdateRedisRoleLabel(_ context.Context, _ string, _ map[string]string, _ *commonapi.ExistingPasswordSecret, _ *commonapi.TLSConfig, observedMaster ...string) error {
@@ -31,8 +32,9 @@ func (h *recordingRoleHealer) UpdateRedisRoleLabel(_ context.Context, _ string, 
 	return nil
 }
 
-func (h *recordingRoleHealer) PublishReplicationRoleLabels(_ context.Context, _ string, _ map[string]string, _ *commonapi.ExistingPasswordSecret, _ *commonapi.TLSConfig, master string) error {
+func (h *recordingRoleHealer) PublishReplicationRoleLabels(_ context.Context, _ string, _ map[string]string, roles map[string]string, master string) error {
 	h.published = &master
+	h.roles = roles
 	return nil
 }
 
@@ -122,11 +124,15 @@ func TestReconcileStatusPublishesElectedMaster(t *testing.T) {
 			r := &Reconciler{
 				Client: c,
 				Healer: h,
-				ObserveRoles: func(_ context.Context, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-					if role == "master" {
-						return tc.masters, nil
+				ObserveRoles: func(context.Context, *rrvb2.RedisReplication) (map[string]string, error) {
+					roles := map[string]string{}
+					for _, pod := range tc.masters {
+						roles[pod] = "master"
 					}
-					return tc.slaves, nil
+					for _, pod := range tc.slaves {
+						roles[pod] = "slave"
+					}
+					return roles, nil
 				},
 				RealMaster: func(context.Context, *rrvb2.RedisReplication, []string) string { return tc.realMaster },
 				SentinelElectedMaster: func(context.Context, *rrvb2.RedisReplication) (string, bool) {
@@ -137,6 +143,7 @@ func TestReconcileStatusPublishesElectedMaster(t *testing.T) {
 			require.NoError(t, err)
 			require.NotNil(t, h.published, "role labels were not published")
 			require.Equal(t, tc.published, *h.published)
+			require.Len(t, h.roles, len(tc.masters)+len(tc.slaves), "labels must be published from the same observation")
 
 			stored := &rrvb2.RedisReplication{}
 			require.NoError(t, c.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "redis-repl"}, stored))
