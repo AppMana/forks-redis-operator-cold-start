@@ -19,27 +19,27 @@ func TestPickPreferredMaster(t *testing.T) {
 	}{
 		{
 			name:       "status points at candidate (split-brain recovery)",
-			cr:         mk("redis-harbor-1"),
-			candidates: []string{"redis-harbor-0", "redis-harbor-1", "redis-harbor-2"},
-			want:       "redis-harbor-1",
+			cr:         mk("redis-repl-1"),
+			candidates: []string{"redis-repl-0", "redis-repl-1", "redis-repl-2"},
+			want:       "redis-repl-1",
 		},
 		{
 			name:       "status points at non-candidate, fall back to lowest ordinal",
-			cr:         mk("redis-harbor-5"),
-			candidates: []string{"redis-harbor-0", "redis-harbor-1"},
-			want:       "redis-harbor-0",
+			cr:         mk("redis-repl-5"),
+			candidates: []string{"redis-repl-0", "redis-repl-1"},
+			want:       "redis-repl-0",
 		},
 		{
 			name:       "fresh cold start: no status, pick lowest ordinal",
 			cr:         mk(""),
-			candidates: []string{"redis-harbor-0", "redis-harbor-1", "redis-harbor-2"},
-			want:       "redis-harbor-0",
+			candidates: []string{"redis-repl-0", "redis-repl-1", "redis-repl-2"},
+			want:       "redis-repl-0",
 		},
 		{
 			name:       "nil CR, pick lowest ordinal",
 			cr:         nil,
-			candidates: []string{"redis-lago-0", "redis-lago-1"},
-			want:       "redis-lago-0",
+			candidates: []string{"redis-repl-0", "redis-repl-1"},
+			want:       "redis-repl-0",
 		},
 		{
 			name:       "no candidates, return empty",
@@ -49,9 +49,9 @@ func TestPickPreferredMaster(t *testing.T) {
 		},
 		{
 			name:       "candidates are the slave pods (all-slaves cold start)",
-			cr:         mk("redis-harbor-0"),
-			candidates: []string{"redis-harbor-0", "redis-harbor-1", "redis-harbor-2"},
-			want:       "redis-harbor-0",
+			cr:         mk("redis-repl-0"),
+			candidates: []string{"redis-repl-0", "redis-repl-1", "redis-repl-2"},
+			want:       "redis-repl-0",
 		},
 	}
 	for _, tc := range tests {
