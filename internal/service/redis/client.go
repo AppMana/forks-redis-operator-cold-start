@@ -3,6 +3,8 @@ package redis
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -57,6 +59,10 @@ type Service interface {
 	SentinelSet(ctx context.Context, masterGroupName, key, value string) error
 	SentinelReset(ctx context.Context, masterGroupName string) error
 	GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, error)
+	// SentinelGetMasterAddrByName returns the address this Sentinel currently
+	// considers the master of masterGroupName. ok is false when the Sentinel
+	// does not monitor that group.
+	SentinelGetMasterAddrByName(ctx context.Context, masterGroupName string) (host, port string, ok bool, err error)
 	GetClusterInfo(ctx context.Context) (*ClusterStatus, error)
 }
 
@@ -150,6 +156,26 @@ func (c *service) GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, err
 	}
 
 	return info, nil
+}
+
+func (c *service) SentinelGetMasterAddrByName(ctx context.Context, masterGroupName string) (string, string, bool, error) {
+	client := c.createClient()
+	if client == nil {
+		return "", "", false, nil
+	}
+	defer client.Close()
+
+	addr, err := client.Do(ctx, "SENTINEL", "GET-MASTER-ADDR-BY-NAME", masterGroupName).StringSlice()
+	if errors.Is(err, rediscli.Nil) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	if len(addr) != 2 {
+		return "", "", false, fmt.Errorf("unexpected SENTINEL GET-MASTER-ADDR-BY-NAME reply %q", addr)
+	}
+	return addr[0], addr[1], true, nil
 }
 
 func (c *service) SentinelSet(ctx context.Context, masterGroupName, key, value string) error {

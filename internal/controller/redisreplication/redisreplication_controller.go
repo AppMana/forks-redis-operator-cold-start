@@ -3,6 +3,7 @@ package redisreplication
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -17,12 +18,15 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/monitoring"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const (
@@ -36,6 +40,25 @@ type Reconciler struct {
 	k8sutils.StatefulSet
 	Healer    redishealer.Healer
 	K8sClient kubernetes.Interface
+
+	// Test seams; nil uses the live Redis and Sentinel probes.
+	ObserveRoles          func(ctx context.Context, instance *rrvb2.RedisReplication, role string) ([]string, error)
+	RealMaster            func(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string
+	SentinelElectedMaster func(ctx context.Context, instance *rrvb2.RedisReplication) (string, bool)
+}
+
+func (r *Reconciler) observeRoles(ctx context.Context, instance *rrvb2.RedisReplication, role string) ([]string, error) {
+	if r.ObserveRoles != nil {
+		return r.ObserveRoles(ctx, instance, role)
+	}
+	return k8sutils.ObserveRedisNodesByRole(ctx, r.K8sClient, instance, role)
+}
+
+func (r *Reconciler) realMaster(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string {
+	if r.RealMaster != nil {
+		return r.RealMaster(ctx, instance, masters)
+	}
+	return k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masters)
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -59,25 +82,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	reconcilers := []reconciler{
 		{typ: "finalizer", rec: r.reconcileFinalizer},
-		{typ: "resources", rec: r.reconcileResources},
-		// Publish observed roles even when topology reconciliation must wait for
-		// an unavailable replica. Otherwise Sentinel succeeds but the master
-		// Service stays empty indefinitely.
+		// Publish the elected master before anything that can wait or fail:
+		// resources and topology repair both back off while pods are missing,
+		// which is exactly when the master Service has to move.
 		{typ: "status", rec: r.reconcileStatus},
+		{typ: "resources", rec: r.reconcileResources},
 		{typ: "redis", rec: r.reconcileRedis},
 	}
 
+	requeueAfter := 30 * time.Second
 	for _, reconciler := range reconcilers {
 		result, err := reconciler.rec(ctx, instance)
 		if err != nil {
 			return intctrlutil.RequeueE(ctx, err, "")
 		}
+		if result.RequeueAfter > 0 && result.RequeueAfter < requeueAfter {
+			requeueAfter = result.RequeueAfter
+		}
 		if result.Requeue {
-			return result, nil
+			if result.RequeueAfter == 0 {
+				return result, nil
+			}
+			return intctrlutil.RequeueAfter(ctx, requeueAfter, "")
 		}
 	}
 
-	return intctrlutil.RequeueAfter(ctx, time.Second*30, "")
+	return intctrlutil.RequeueAfter(ctx, requeueAfter, "")
 }
 
 func (r *Reconciler) UpdateRedisReplicationMaster(ctx context.Context, instance *rrvb2.RedisReplication, masterNode string) error {
@@ -440,20 +470,29 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 	return intctrlutil.Reconciled()
 }
 
-// reconcileStatus update status and label.
-func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
-	var err error
-	var realMaster string
+// noMasterRequeue is how soon status is re-observed while no pod can be put
+// into the master Service, i.e. while writes are failing. Pod and Sentinel
+// events normally wake the reconciler before it elapses.
+const noMasterRequeue = 5 * time.Second
 
-	masterNodes, err := k8sutils.ObserveRedisNodesByRole(ctx, r.K8sClient, instance, "master")
+// reconcileStatus records the elected master and makes it the only pod the
+// master Service selects. It must keep working while pods are missing or
+// terminating: that is exactly when the master moves.
+func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
+	masterNodes, err := r.observeRoles(ctx, instance, "master")
+	if apierrors.IsNotFound(err) {
+		// The StatefulSet is created by the resources step.
+		return intctrlutil.Reconciled()
+	}
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
-	if len(masterNodes) == 1 {
-		realMaster = masterNodes[0]
-	} else {
-		realMaster = k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
+	slaveNodes, err := r.observeRoles(ctx, instance, "slave")
+	if err != nil {
+		return intctrlutil.RequeueE(ctx, err, "")
 	}
+
+	realMaster := r.electedMaster(ctx, instance, masterNodes, slaveNodes)
 	// A partial or cold-start view cannot disprove the last recorded primary.
 	// Preserve it for the existing conservative bootstrap recovery policy.
 	if realMaster != "" {
@@ -461,33 +500,58 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 			return intctrlutil.RequeueE(ctx, err, "")
 		}
 	}
-	if err = r.publishObservedRoleLabels(ctx, instance, masterNodes); err != nil {
+	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
+	if err = r.Healer.PublishReplicationRoleLabels(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS, realMaster); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 
-	slaveNodes, err := k8sutils.ObserveRedisNodesByRole(ctx, r.K8sClient, instance, "slave")
-	if err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
-	}
 	if realMaster != "" {
 		monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(len(slaveNodes)))
-	} else {
-		monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(0))
+		return intctrlutil.Reconciled()
 	}
-
-	return intctrlutil.Reconciled()
+	monitoring.RedisReplicationConnectedSlavesTotal.WithLabelValues(instance.Namespace, instance.Name).Set(float64(0))
+	return ctrl.Result{RequeueAfter: noMasterRequeue}, nil
 }
 
-// An empty replacement starts as master until topology reconciliation reslaves
-// it. Never publish multiple observed masters into the writable Service during
-// that interval. Sentinel failover becomes publishable once the old master has
-// demoted; cold-start repair remains responsible for resolving ambiguity.
-func (r *Reconciler) publishObservedRoleLabels(ctx context.Context, instance *rrvb2.RedisReplication, masterNodes []string) error {
-	if len(masterNodes) != 1 {
-		return nil
+// electedMaster returns the pod that may be put into the master Service, or
+// "" when no pod can be positively identified as the primary.
+//
+// Sentinel is authoritative when it monitors the replication: it is what
+// promotes replicas, and its answer is available while pods are missing or
+// while an empty replacement also reports role:master. The Sentinel choice is
+// only published once that pod reports role:master itself.
+//
+// Without a Sentinel answer, a lone observed master is only trusted when the
+// view is complete, when it has attached replicas, or when it is the recorded
+// master (the same guard upstream applies in observedRedisReplicationMaster);
+// otherwise an empty replacement of a dead primary would become writable.
+func (r *Reconciler) electedMaster(ctx context.Context, instance *rrvb2.RedisReplication, masters, slaves []string) string {
+	logger := log.FromContext(ctx)
+	if elected, ok := r.sentinelElectedMaster(ctx, instance); ok {
+		if slices.Contains(masters, elected) {
+			return elected
+		}
+		logger.Info("Sentinel-elected master is not serving as master",
+			"sentinelMaster", elected, "observedMasters", masters)
+		return ""
 	}
-	labels := common.GetRedisLabels(instance.GetName(), common.SetupTypeReplication, "replication", instance.GetLabels())
-	return r.Healer.UpdateRedisRoleLabel(ctx, instance.GetNamespace(), labels, instance.Spec.KubernetesConfig.ExistingPasswordSecret, instance.Spec.TLS, masterNodes[0])
+	switch len(masters) {
+	case 0:
+		return ""
+	case 1:
+		candidate := masters[0]
+		if instance.Spec.Size != nil && len(masters)+len(slaves) == int(*instance.Spec.Size) {
+			return candidate
+		}
+		if r.realMaster(ctx, instance, masters) == candidate || candidate == instance.Status.MasterNode {
+			return candidate
+		}
+		logger.Info("Not trusting the only observed master of a partial view",
+			"candidate", candidate, "statusMasterNode", instance.Status.MasterNode, "slaves", slaves)
+		return ""
+	default:
+		return r.realMaster(ctx, instance, masters)
+	}
 }
 
 func (r *Reconciler) updateStatus(ctx context.Context, rr *rrvb2.RedisReplication, status rrvb2.RedisReplicationStatus) error {
@@ -497,10 +561,18 @@ func (r *Reconciler) updateStatus(ctx context.Context, rr *rrvb2.RedisReplicatio
 	return common.UpdateStatus(ctx, r.Client, copy)
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager sets up the controller with the Manager. Besides the CR,
+// Redis pod changes and Sentinel failover announcements trigger reconciles, so
+// the master Service follows the elected master without waiting for a resync.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options) error {
+	sentinelEvents := NewSentinelEvents(mgr.GetClient(), r.K8sClient)
+	if err := mgr.Add(sentinelEvents); err != nil {
+		return err
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&rrvb2.RedisReplication{}).
 		WithOptions(opts).
+		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(replicationForPod)).
+		WatchesRawSource(&source.Channel{Source: sentinelEvents.Events()}, &handler.EnqueueRequestForObject{}).
 		Complete(r)
 }
