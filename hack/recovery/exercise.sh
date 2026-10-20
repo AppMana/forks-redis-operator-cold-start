@@ -10,8 +10,9 @@ dir="$(cd "$(dirname "$0")" && pwd)"
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n redis-upgrade-canary)
 cli() { "${k[@]}" exec "$1" -- redis-cli --raw "${@:2}"; }
 converge() {
-  for attempt in {1..90}; do
-    if bash "$dir/check.sh" "$config" 2>/dev/null; then return 0; fi
+  local deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    if timeout 20s bash "$dir/check.sh" "$config" 2>/dev/null; then return 0; fi
     sleep 2
   done
   echo "FAIL: convergence deadline" >&2
