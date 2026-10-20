@@ -28,8 +28,19 @@ redisCluster:
   recreateStatefulSetOnUpdateInvalid: false
   # -- MaxMemoryPercentOfLimit is the percentage of the Redis container memory limit to be used as maxmemory.
   #    When a memory limit exists, the operator also exposes the computed value via the REDIS_MAX_MEMORY env var.
+  #    Requires the operator to run with the GenerateConfigInInitContainer feature gate enabled
+  #    (featureGates.GenerateConfigInInitContainer=true in the redis-operator chart); otherwise maxmemory stays 0.
   #    Default is 0 (disabled).
   maxMemoryPercentOfLimit: 0
+  # -- DynamicConfig is a list of "key value" Redis parameters applied at runtime
+  #    via CONFIG SET (without triggering a rolling restart). Note: CONFIG SET is
+  #    not persisted to disk, so values are not retained across pod restarts unless
+  #    they are also provided through externalConfig.
+  #    Example:
+  #    dynamicConfig:
+  #      - "maxmemory-policy allkeys-lru"
+  #      - "slowlog-log-slower-than 5000"
+  dynamicConfig: []
   persistentVolumeClaimRetentionPolicy: {}
     # whenDeleted: Delete
     # whenScaled: Retain
@@ -39,8 +50,10 @@ redisCluster:
   #    Default is false.
   enableMasterSlaveAntiAffinity: false
   leader:
-    # -- Number of Redis leader (master) nodes. If not set, uses clusterSize value
-    replicas: 3
+    # -- Number of Redis leader (master) nodes. Left unset it inherits `clusterSize`;
+    # set it explicitly to override that for leaders only.
+    # @default -- `redisCluster.clusterSize`
+    replicas: null
     serviceType: ClusterIP
     affinity: {}
       # nodeAffinity:
@@ -85,8 +98,11 @@ redisCluster:
       # initialDelaySeconds: 15
 
   follower:
-    # -- Number of Redis follower (slave) nodes. If not set, uses clusterSize value
-    replicas: 3
+    # -- Number of Redis follower (slave) nodes. Left unset it inherits `clusterSize`;
+    # set it explicitly to override that for followers only, including `0` for a
+    # leader-only cluster.
+    # @default -- `redisCluster.clusterSize`
+    replicas: null
     serviceType: ClusterIP
     affinity: null
       # nodeAffinity:
@@ -244,8 +260,11 @@ TLS:
   ca: ca.crt
   cert: tls.crt
   key: tls.key
+  # Any corev1.SecretVolumeSource field is accepted here and passed to the
+  # RedisCluster spec as-is.
   secret:
     secretName: ""
+    defaultMode: 0440
 
 acl:
   # Configure ACL from Kubernetes Secret
@@ -260,3 +279,5 @@ env: []
   #   value: "value1"
 
 serviceAccountName: ""
+
+podManagementPolicy: OrderedReady

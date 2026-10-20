@@ -49,6 +49,7 @@ helm delete <my-release> --namespace <namespace>
 | TLS.ca | string | `"ca.crt"` |  |
 | TLS.cert | string | `"tls.crt"` |  |
 | TLS.key | string | `"tls.key"` |  |
+| TLS.secret.defaultMode | int | `288` |  |
 | TLS.secret.secretName | string | `""` |  |
 | acl.secret.secretName | string | `""` |  |
 | annotations | object | `{}` |  |
@@ -66,11 +67,13 @@ helm delete <my-release> --namespace <namespace>
 | initContainer.imagePullPolicy | string | `"IfNotPresent"` |  |
 | initContainer.resources | object | `{}` |  |
 | labels | object | `{}` |  |
+| podManagementPolicy | string | `"OrderedReady"` |  |
 | podSecurityContext.fsGroup | int | `1000` |  |
 | podSecurityContext.runAsUser | int | `1000` |  |
 | priorityClassName | string | `""` |  |
 | redisCluster.clusterSize | int | `3` | Default number of replicas for both leader and follower when not explicitly set |
 | redisCluster.clusterVersion | string | `"v7"` |  |
+| redisCluster.dynamicConfig | list | `[]` | DynamicConfig is a list of "key value" Redis parameters applied at runtime    via CONFIG SET (without triggering a rolling restart). Note: CONFIG SET is    not persisted to disk, so values are not retained across pod restarts unless    they are also provided through externalConfig.    Example:    dynamicConfig:      - "maxmemory-policy allkeys-lru"      - "slowlog-log-slower-than 5000" |
 | redisCluster.enableMasterSlaveAntiAffinity | bool | `false` | Enable pod anti-affinity between leader and follower pods by adding the appropriate label.    Notice that this requires the operator to have its mutating webhook enabled,    otherwise it will only add an annotation to the RedisCluster CR.    Default is false. |
 | redisCluster.follower.affinity | string | `nil` |  |
 | redisCluster.follower.livenessProbe | object | `{}` |  |
@@ -79,7 +82,7 @@ helm delete <my-release> --namespace <namespace>
 | redisCluster.follower.pdb.maxUnavailable | int | `1` |  |
 | redisCluster.follower.pdb.minAvailable | int | `1` |  |
 | redisCluster.follower.readinessProbe | object | `{}` |  |
-| redisCluster.follower.replicas | int | `3` | Number of Redis follower (slave) nodes. If not set, uses clusterSize value |
+| redisCluster.follower.replicas | string | `redisCluster.clusterSize` | Number of Redis follower (slave) nodes. Left unset it inherits `clusterSize`; set it explicitly to override that for followers only, including `0` for a leader-only cluster. |
 | redisCluster.follower.securityContext | object | `{}` |  |
 | redisCluster.follower.serviceType | string | `"ClusterIP"` |  |
 | redisCluster.follower.tolerations | list | `[]` |  |
@@ -94,12 +97,12 @@ helm delete <my-release> --namespace <namespace>
 | redisCluster.leader.pdb.maxUnavailable | int | `1` |  |
 | redisCluster.leader.pdb.minAvailable | int | `1` |  |
 | redisCluster.leader.readinessProbe | object | `{}` |  |
-| redisCluster.leader.replicas | int | `3` | Number of Redis leader (master) nodes. If not set, uses clusterSize value |
+| redisCluster.leader.replicas | string | `redisCluster.clusterSize` | Number of Redis leader (master) nodes. Left unset it inherits `clusterSize`; set it explicitly to override that for leaders only. |
 | redisCluster.leader.securityContext | object | `{}` |  |
 | redisCluster.leader.serviceType | string | `"ClusterIP"` |  |
 | redisCluster.leader.tolerations | list | `[]` |  |
 | redisCluster.leader.topologySpreadConstraints | list | `[]` |  |
-| redisCluster.maxMemoryPercentOfLimit | int | `0` | MaxMemoryPercentOfLimit is the percentage of the Redis container memory limit to be used as maxmemory.    When a memory limit exists, the operator also exposes the computed value via the REDIS_MAX_MEMORY env var.    Default is 0 (disabled). |
+| redisCluster.maxMemoryPercentOfLimit | int | `0` | MaxMemoryPercentOfLimit is the percentage of the Redis container memory limit to be used as maxmemory.    When a memory limit exists, the operator also exposes the computed value via the REDIS_MAX_MEMORY env var.    Requires the operator to run with the GenerateConfigInInitContainer feature gate enabled    (featureGates.GenerateConfigInInitContainer=true in the redis-operator chart); otherwise maxmemory stays 0.    Default is 0 (disabled). |
 | redisCluster.minReadySeconds | int | `0` |  |
 | redisCluster.name | string | `""` |  |
 | redisCluster.persistenceEnabled | bool | `true` |  |

@@ -78,11 +78,12 @@ func TestPartialOutageRoleObservation(t *testing.T) {
 
 	t.Run("topology still requires complete observation", func(t *testing.T) {
 		cr, k8s := partialOutageReplication(false)
-		c, m := redismock.NewClientMock()
-		m.ExpectInfo("Replication").SetErr(errors.New("replica unreachable"))
-		nodes, err := getRedisNodesByRole(context.Background(), k8s, cr, "master", func(string) *redis.Client { return c })
-		require.Error(t, err)
-		require.Nil(t, nodes)
+		topology, err := getRedisReplicationTopology(context.Background(), k8s, cr, func(context.Context, *corev1.Pod) (string, error) {
+			return "", errors.New("replica unreachable")
+		})
+		require.NoError(t, err)
+		require.False(t, topology.Complete())
+		require.Empty(t, topology.Masters)
 	})
 }
 

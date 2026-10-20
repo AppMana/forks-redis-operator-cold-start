@@ -119,6 +119,7 @@ type statefulSetParameters struct {
 	IgnoreAnnotations                    []string
 	HostNetwork                          bool
 	MinReadySeconds                      int32
+	PodManagementPolicy                  *string
 }
 
 // containerParameters will define container input params
@@ -149,6 +150,16 @@ type containerParameters struct {
 	EnvVars                      *[]corev1.EnvVar
 	Port                         *int
 	HostPort                     *int
+	// Sentinel-driven preStop settings. These are only populated for the
+	// "replication" role when an embedded Sentinel is enabled. When
+	// SentinelService is empty the replication preStop hook is not installed.
+	SentinelService    string
+	SentinelMasterName string
+	SentinelPort       int
+	// PreStopWaitSeconds is not Sentinel-specific: it is populated for the
+	// "replication" role and for every RedisCluster leader and follower, and
+	// bounds the demotion wait in whichever preStop hook is installed.
+	PreStopWaitSeconds int
 }
 
 type initContainerParameters struct {
@@ -210,6 +221,16 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 				log.FromContext(ctx).V(1).Info("VolumeClaimTemplate change is being ignored because the field is immutable. Consider enabling recreating the statefulset option.")
 			}
 		}
+	}
+
+	// Since PodManagementPolicy is immutable, revert to the stored value if we
+	// are not recreating the StatefulSet, otherwise the API server would reject
+	// the update.
+	if !recreateStatefulSet && newStateful.Spec.PodManagementPolicy != storedStateful.Spec.PodManagementPolicy {
+		if newStateful.Spec.PodManagementPolicy != "" {
+			log.FromContext(ctx).V(1).Info("PodManagementPolicy change is being ignored because the field is immutable. Consider enabling recreating the statefulset option.")
+		}
+		newStateful.Spec.PodManagementPolicy = storedStateful.Spec.PodManagementPolicy
 	}
 
 	// Calculate the patch between the stored and new objects, ignoring immutable or unnecessary fields.
@@ -324,6 +345,10 @@ func generateStatefulSetsDef(stsMeta metav1.ObjectMeta, params statefulSetParame
 	}
 
 	statefulset.Spec.Template.Spec.InitContainers = generateInitContainerDef(containerParams.Role, stsMeta.GetName(), initcontainerParams, params.ExternalConfig, initcontainerParams.AdditionalMountPath, containerParams, params.ClusterVersion)
+
+	if params.PodManagementPolicy != nil {
+		statefulset.Spec.PodManagementPolicy = appsv1.PodManagementPolicyType(*params.PodManagementPolicy)
+	}
 
 	if params.Tolerations != nil {
 		statefulset.Spec.Template.Spec.Tolerations = *params.Tolerations
@@ -444,7 +469,6 @@ func createPVCTemplate(volumeName string, stsMeta metav1.ObjectMeta, storageSpec
 func generateContainerDef(name string, containerParams containerParameters, clusterMode, nodeConfVolume, enableMetrics bool, externalConfig, clusterVersion *string, mountpath []corev1.VolumeMount, sidecars []commonapi.Sidecar) []corev1.Container {
 	sentinelCntr := containerParams.Role == "sentinel"
 	enableTLS := containerParams.TLSConfig != nil
-	enableAuth := containerParams.EnabledPassword != nil && *containerParams.EnabledPassword
 	containerDefinition := []corev1.Container{
 		{
 			Name:            name,
@@ -465,8 +489,8 @@ func generateContainerDef(name string, containerParams containerParameters, clus
 				containerParams.Resources,
 				containerParams.MaxMemoryPercentOfLimit,
 			),
-			ReadinessProbe: getProbeInfo(containerParams.ReadinessProbe, sentinelCntr, enableTLS, enableAuth),
-			LivenessProbe:  getProbeInfo(containerParams.LivenessProbe, sentinelCntr, enableTLS, enableAuth),
+			ReadinessProbe: getProbeInfo(containerParams.ReadinessProbe, sentinelCntr, enableTLS),
+			LivenessProbe:  getProbeInfo(containerParams.LivenessProbe, sentinelCntr, enableTLS),
 			VolumeMounts:   getVolumeMount(name, containerParams.PersistenceEnabled, clusterMode, nodeConfVolume, externalConfig, mountpath, containerParams.TLSConfig, containerParams.ACLConfig),
 		},
 	}
@@ -481,7 +505,15 @@ func generateContainerDef(name string, containerParams containerParameters, clus
 		}
 	}
 
-	if preStopCmd := GeneratePreStopCommand(containerParams.Role, enableAuth, enableTLS); preStopCmd != "" {
+	preStopCfg := PreStopConfig{
+		Role:               containerParams.Role,
+		EnableTLS:          enableTLS,
+		SentinelService:    containerParams.SentinelService,
+		SentinelMasterName: containerParams.SentinelMasterName,
+		SentinelPort:       containerParams.SentinelPort,
+		WaitSeconds:        containerParams.PreStopWaitSeconds,
+	}
+	if preStopCmd := GeneratePreStopCommand(preStopCfg); preStopCmd != "" {
 		containerDefinition[0].Lifecycle = &corev1.Lifecycle{
 			PreStop: &corev1.LifecycleHandler{
 				Exec: &corev1.ExecAction{
@@ -538,41 +570,161 @@ func generateContainerDef(name string, containerParams containerParameters, clus
 	return containerDefinition
 }
 
-// GeneratePreStopCommand generates the preStop script based on the Redis role.
-// Only "cluster" role is supported for now; other roles return an empty string.
-func GeneratePreStopCommand(role string, enableAuth, enableTLS bool) string {
-	authArgs, tlsArgs := GenerateAuthAndTLSArgs(enableAuth, enableTLS)
+// redisCLIAuthSanitizer strips CR/LF from REDISCLI_AUTH before redis-cli reads
+// it. Password secrets frequently carry a trailing newline (echo | base64,
+// kubectl create secret --from-file), and every other consumer of the password
+// sees it trimmed: getRedisPassword applies strings.TrimSpace and requirepass
+// is read from a line-based config file. REDISCLI_AUTH is sourced raw from the
+// secretKeyRef, so without this the server holds the trimmed password while
+// redis-cli sends the untrimmed one and every AUTH fails with WRONGPASS.
+// The -n guard keeps the variable unset on password-less deployments, where
+// exporting an empty value would make redis-cli send AUTH with an empty password.
+const redisCLIAuthSanitizer = `if [ -n "${REDISCLI_AUTH:-}" ]; then REDISCLI_AUTH="$(printf %s "$REDISCLI_AUTH" | tr -d '\r\n')"; export REDISCLI_AUTH; fi`
 
-	switch role {
+// PreStopConfig holds the inputs needed to render a container preStop hook.
+type PreStopConfig struct {
+	Role      string
+	EnableTLS bool
+	// SentinelService, SentinelMasterName and SentinelPort describe the
+	// Sentinel that manages failover for the "replication" role. They must be
+	// sourced from the actual (embedded) Sentinel config rather than derived in
+	// shell. When SentinelService is empty the replication hook is disabled, so
+	// non-Sentinel replication deployments never get a hook that would block on
+	// a non-existent service.
+	SentinelService    string
+	SentinelMasterName string
+	SentinelPort       int
+	// WaitSeconds bounds how long a hook waits for the local node to be demoted
+	// to a slave -- both the cluster and the replication hook honour it. It is
+	// kept below terminationGracePeriodSeconds so the hook returns before the
+	// kubelet sends SIGKILL.
+	WaitSeconds int
+}
+
+// GeneratePreStopCommand generates the preStop script based on the Redis role.
+// "cluster" triggers a CLUSTER FAILOVER to the best slave; "replication"
+// triggers a Sentinel failover, but only when a Sentinel service is configured.
+// All other roles (and Sentinel-less replication) return an empty string.
+//
+// Authentication is taken from the REDISCLI_AUTH environment variable that the
+// operator sets on the pod, so the password is never passed on the command line.
+func GeneratePreStopCommand(cfg PreStopConfig) string {
+	tlsArgs := GenerateTLSArgs(cfg.EnableTLS)
+
+	switch cfg.Role {
 	case "cluster":
-		return generateClusterPreStop(authArgs, tlsArgs)
+		return generateClusterPreStop(tlsArgs, cfg)
+	case "replication":
+		// Without a Sentinel managing failover there is nothing to fail over
+		// to; installing the hook would make every master termination block on
+		// a redis-cli call to a service that does not exist.
+		if cfg.SentinelService == "" {
+			return ""
+		}
+		return generateReplicationPreStop(tlsArgs, cfg)
 	default:
 		return ""
 	}
 }
 
-// GenerateAuthAndTLSArgs constructs authentication and TLS arguments for redis-cli.
-func GenerateAuthAndTLSArgs(enableAuth, enableTLS bool) (string, string) {
-	authArgs := ""
+// preStopWaitSeconds bounds the demotion wait so the preStop hook returns with
+// headroom before terminationGracePeriodSeconds elapses, leaving the kubelet
+// time to deliver SIGTERM and let Redis shut down cleanly instead of being
+// SIGKILLed mid-failover.
+func preStopWaitSeconds(gracePeriodSeconds *int64) int {
+	const (
+		defaultGracePeriodSeconds = 30
+		headroomSeconds           = 10
+	)
+	grace := int64(defaultGracePeriodSeconds)
+	if gracePeriodSeconds != nil && *gracePeriodSeconds > 0 {
+		grace = *gracePeriodSeconds
+	}
+	return int(max(grace-headroomSeconds, 1))
+}
+
+// GenerateTLSArgs constructs TLS arguments for redis-cli. Authentication is
+// supplied via the REDISCLI_AUTH environment variable, never on the command line.
+func GenerateTLSArgs(enableTLS bool) string {
 	tlsArgs := ""
 
-	if enableAuth {
-		authArgs = " -a \"${REDIS_PASSWORD}\""
-	}
 	if enableTLS {
-		tlsArgs = " --tls --cert \"${REDIS_TLS_CERT}\" --key \"${REDIS_TLS_CERT_KEY}\" --cacert \"${REDIS_TLS_CA_CERT}\""
+		tlsArgs = " --tls --cert \"${REDIS_TLS_CERT}\" --key \"${REDIS_TLS_CERT_KEY}\"${REDIS_TLS_CA_CERT:+ --cacert \"${REDIS_TLS_CA_CERT}\"}"
 	}
-	return authArgs, tlsArgs
+	return tlsArgs
+}
+
+// demotionWaitLoop renders the shell loop that blocks until the local node
+// reports role:slave, i.e. until a failover triggered above has actually
+// completed. Both the cluster and the Sentinel hook need it, so it lives in one
+// place: every hardening change here applies to both.
+//
+// The loop is bounded by a wall-clock deadline rather than an iteration count.
+// An iteration costs one redis-cli round trip plus a sleep, so counting
+// iterations bounds the wait from below, not above, and a slow local Redis
+// could push the hook past terminationGracePeriodSeconds. Re-checking a
+// deadline bounds it from above, which is what the hook actually promises.
+//
+// The individual redis-cli calls deliberately carry no per-call timeout. Do not
+// add `redis-cli -t`: that option only exists from Redis 7.4 onwards, and this
+// hook is rendered identically for every Redis version the operator supports --
+// including the default 7.0.x images. On anything older, redis-cli rejects it
+// with "Unrecognized option" and exits 1, so NEW_ROLE would be empty on every
+// iteration and the loop would burn the whole budget even when the demotion
+// succeeded immediately: worse than the bug this hook exists to fix.
+//
+// The cost is that a local Redis wedged on a fork or an fsync stall can still
+// overrun the deadline by one round trip. That matches the pre-existing
+// behaviour, and the deadline keeps the common case honest.
+//
+// indent is the leading whitespace of the block the loop is spliced into, so
+// the rendered script stays readable in `kubectl get sts -o yaml`.
+func demotionWaitLoop(tlsArgs string, waitSeconds int, indent string) string {
+	loop := fmt.Sprintf(`DEADLINE=$(( $(date +%%s) + %d ))
+while [ "$(date +%%s)" -lt "$DEADLINE" ]; do
+    NEW_ROLE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s info replication | awk -F: '/role:slave/ {print "slave"}')
+    if [ "$NEW_ROLE" = "slave" ]; then
+        break
+    fi
+    sleep 1
+done`, waitSeconds, tlsArgs)
+
+	lines := strings.Split(loop, "\n")
+	for i, line := range lines {
+		if line != "" {
+			lines[i] = indent + line
+		}
+	}
+	// The caller supplies the indentation of the first line.
+	return strings.TrimPrefix(strings.Join(lines, "\n"), indent)
 }
 
 // generateClusterPreStop generates the preStop script for Redis cluster mode.
-// It identifies the master node and triggers a failover to the best available slave before shutdown.
-func generateClusterPreStop(authArgs, tlsArgs string) string {
+// It identifies the master node and triggers a failover to the best available
+// slave before shutdown.
+//
+// CLUSTER FAILOVER only starts the handoff and returns before it completes, so
+// the hook then polls the local node until it has been demoted to a slave. This
+// keeps the kubelet from SIGKILLing the old master mid-failover, which would
+// abort the coordinated handoff and fall back to slower failure detection. The
+// wait is bounded by cfg.WaitSeconds so the hook still returns before the grace
+// period expires.
+//
+// The wait is entered only when the replica accepts the failover. Redis
+// declines a manual failover in routine situations -- a replica whose link to
+// the master is down, a leader whose slots were already resharded away, or an
+// election the replica cannot win -- and in all of them the local node is never
+// demoted. Waiting anyway would burn the whole budget on every such
+// termination and leave only the headroom for the SIGTERM shutdown, which is
+// where a master with save points writes its final RDB.
+func generateClusterPreStop(tlsArgs string, cfg PreStopConfig) string {
+	waitSeconds := max(cfg.WaitSeconds, 1)
 	return fmt.Sprintf(`#!/bin/sh
-ROLE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s %s info replication | awk -F: '/role:master/ {print "master"}')
+%s
+ROLE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s info replication | awk -F: '/role:master/ {print "master"}')
 
 if [ "$ROLE" = "master" ]; then
-    BEST_SLAVE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s %s info replication | awk -F: '
+    BEST_SLAVE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s info replication | awk -F: '
         BEGIN { maxOffset = -1; bestSlave = "" }
         /slave[0-9]+:ip/ {
             split($2, a, ",");
@@ -589,9 +741,58 @@ if [ "$ROLE" = "master" ]; then
     ')
 
     if [ -n "$BEST_SLAVE" ]; then
-        redis-cli -h "$BEST_SLAVE" -p ${REDIS_PORT} %s %s cluster failover
+        FAILOVER_RESULT=$(redis-cli -h "$BEST_SLAVE" -p ${REDIS_PORT} %s cluster failover 2>&1)
+        case "$FAILOVER_RESULT" in
+            OK*) ;;
+            *)
+                # Exit 0: a declined failover is routine, and a non-zero preStop
+                # hook only buys a FailedPreStopHook event on every such pod.
+                echo "preStop: cluster failover declined: $FAILOVER_RESULT" >&2
+                exit 0
+                ;;
+        esac
+
+        %s
     fi
-fi`, authArgs, tlsArgs, authArgs, tlsArgs, authArgs, tlsArgs)
+fi`, redisCLIAuthSanitizer, tlsArgs, tlsArgs, tlsArgs, demotionWaitLoop(tlsArgs, waitSeconds, "        "))
+}
+
+// generateReplicationPreStop generates the preStop script for Redis replication mode.
+// It checks if this pod is the master, and if so, asks Sentinel to fail over to a
+// replica before allowing the pod to terminate, preventing unnecessary downtime.
+//
+// The Sentinel service, master group name and port are injected from the actual
+// (embedded) Sentinel configuration rather than derived in shell, so they stay
+// correct regardless of the resource name or topology. The demotion wait is
+// bounded by cfg.WaitSeconds so the hook returns before the grace period expires.
+//
+// As in the cluster hook, the wait is entered only when Sentinel accepts the
+// failover: SENTINEL FAILOVER replies -NOGOODSLAVE when no replica is eligible
+// and -INPROGRESS when one is already running, and in neither case does waiting
+// for this node's demotion achieve anything.
+func generateReplicationPreStop(tlsArgs string, cfg PreStopConfig) string {
+	sentinelPort := cfg.SentinelPort
+	if sentinelPort == 0 {
+		sentinelPort = 26379
+	}
+	waitSeconds := max(cfg.WaitSeconds, 1)
+	return fmt.Sprintf(`#!/bin/sh
+%s
+ROLE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s info replication | awk -F: '/role:master/ {print "master"}')
+
+if [ "$ROLE" = "master" ]; then
+    FAILOVER_RESULT=$(redis-cli -h "%s" -p %d SENTINEL FAILOVER %s 2>&1)
+    case "$FAILOVER_RESULT" in
+        OK*) ;;
+        *)
+            # Exit 0: see generateClusterPreStop.
+            echo "preStop: sentinel failover declined: $FAILOVER_RESULT" >&2
+            exit 0
+            ;;
+    esac
+
+    %s
+fi`, redisCLIAuthSanitizer, tlsArgs, cfg.SentinelService, sentinelPort, cfg.SentinelMasterName, demotionWaitLoop(tlsArgs, waitSeconds, "    "))
 }
 
 func generateInitContainerDef(role, name string, initcontainerParams initContainerParameters, externalConfig *string, mountpath []corev1.VolumeMount, containerParams containerParameters, clusterVersion *string) []corev1.Container {
@@ -609,6 +810,9 @@ func generateInitContainerDef(role, name string, initcontainerParams initContain
 		}
 		if externalConfig != nil {
 			VolumeMounts = append(VolumeMounts, externalConfigMount)
+		}
+		if aclMount := generateACLVolumeMount(containerParams.ACLConfig, true); aclMount != nil {
+			VolumeMounts = append(VolumeMounts, *aclMount)
 		}
 
 		container := corev1.Container{
@@ -664,30 +868,19 @@ func generateInitContainerDef(role, name string, initcontainerParams initContain
 func GenerateTLSEnvironmentVariables(tlsconfig *commonapi.TLSConfig) []corev1.EnvVar {
 	var envVars []corev1.EnvVar
 	root := "/tls/"
-
-	// get and set Defaults
-	caCert := "ca.crt"
-	tlsCert := "tls.crt"
-	tlsCertKey := "tls.key"
-
-	if tlsconfig.CaCertFile != "" {
-		caCert = tlsconfig.CaCertFile
-	}
-	if tlsconfig.CertKeyFile != "" {
-		tlsCert = tlsconfig.CertKeyFile
-	}
-	if tlsconfig.KeyFile != "" {
-		tlsCertKey = tlsconfig.KeyFile
-	}
+	caCert, tlsCert, tlsCertKey := getTLSSecretKeys(tlsconfig)
+	hasExplicitCA := tlsconfig != nil && tlsconfig.CaCertFile != ""
 
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "TLS_MODE",
 		Value: "true",
 	})
-	envVars = append(envVars, corev1.EnvVar{
-		Name:  "REDIS_TLS_CA_CERT",
-		Value: path.Join(root, caCert),
-	})
+	if hasExplicitCA {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "REDIS_TLS_CA_CERT",
+			Value: path.Join(root, caCert),
+		})
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "REDIS_TLS_CERT",
 		Value: path.Join(root, tlsCert),
@@ -726,18 +919,21 @@ func getExporterEnvironmentVariables(params containerParameters) []corev1.EnvVar
 	var envVars []corev1.EnvVar
 	redisHost := "redis://localhost:"
 	if params.TLSConfig != nil {
+		caCert, tlsCert, tlsKey := getTLSSecretKeys(params.TLSConfig)
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "REDIS_EXPORTER_TLS_CLIENT_KEY_FILE",
-			Value: "/tls/tls.key",
+			Value: path.Join("/tls/", tlsKey),
 		})
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "REDIS_EXPORTER_TLS_CLIENT_CERT_FILE",
-			Value: "/tls/tls.crt",
+			Value: path.Join("/tls/", tlsCert),
 		})
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "REDIS_EXPORTER_TLS_CA_CERT_FILE",
-			Value: "/tls/ca.crt",
-		})
+		if params.TLSConfig.CaCertFile != "" {
+			envVars = append(envVars, corev1.EnvVar{
+				Name:  "REDIS_EXPORTER_TLS_CA_CERT_FILE",
+				Value: path.Join("/tls/", caCert),
+			})
+		}
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "REDIS_EXPORTER_SKIP_TLS_VERIFICATION",
 			Value: "true",
@@ -810,19 +1006,8 @@ func getVolumeMount(name string, persistenceEnabled *bool, clusterMode bool, nod
 		})
 	}
 
-	if aclConfig != nil {
-		if aclConfig.PersistentVolumeClaim != nil {
-			VolumeMounts = append(VolumeMounts, corev1.VolumeMount{
-				Name:      "acl-pvc",
-				MountPath: "/data/redis",
-			})
-		} else {
-			VolumeMounts = append(VolumeMounts, corev1.VolumeMount{
-				Name:      "acl-secret",
-				MountPath: "/etc/redis/user.acl",
-				SubPath:   "user.acl",
-			})
-		}
+	if aclMount := generateACLVolumeMount(aclConfig, false); aclMount != nil {
+		VolumeMounts = append(VolumeMounts, *aclMount)
 	}
 
 	if externalConfig != nil {
@@ -838,10 +1023,32 @@ func getVolumeMount(name string, persistenceEnabled *bool, clusterMode bool, nod
 	return VolumeMounts
 }
 
+func generateACLVolumeMount(aclConfig *commonapi.ACLConfig, readOnly bool) *corev1.VolumeMount {
+	switch {
+	case aclConfig == nil:
+		return nil
+	case aclConfig.Secret != nil:
+		return &corev1.VolumeMount{
+			Name:      "acl-secret",
+			MountPath: "/etc/redis/user.acl",
+			SubPath:   "user.acl",
+			ReadOnly:  readOnly,
+		}
+	case aclConfig.PersistentVolumeClaim != nil:
+		return &corev1.VolumeMount{
+			Name:      "acl-pvc",
+			MountPath: "/data/redis",
+			ReadOnly:  readOnly,
+		}
+	default:
+		return nil
+	}
+}
+
 // getProbeInfo generate probe for Redis StatefulSet
 // The `ping` command will exit successfully even if the node is loading,
 // so we need to verify that the Redis `ping` command returns "PONG".
-func getProbeInfo(probe *corev1.Probe, sentinel, enableTLS, enableAuth bool) *corev1.Probe {
+func getProbeInfo(probe *corev1.Probe, sentinel, enableTLS bool) *corev1.Probe {
 	if probe == nil {
 		probe = &corev1.Probe{}
 	}
@@ -855,17 +1062,14 @@ func getProbeInfo(probe *corev1.Probe, sentinel, enableTLS, enableAuth bool) *co
 		} else {
 			redisHealthCheck = append(redisHealthCheck, "-p", "${REDIS_PORT}")
 		}
-		if enableAuth {
-			redisHealthCheck = append(redisHealthCheck, "-a", "${REDIS_PASSWORD}")
-		}
 		if enableTLS {
-			redisHealthCheck = append(redisHealthCheck, "--tls", "--cert", "${REDIS_TLS_CERT}", "--key", "${REDIS_TLS_CERT_KEY}", "--cacert", "${REDIS_TLS_CA_CERT}")
+			redisHealthCheck = append(redisHealthCheck, "--tls", "--cert", "${REDIS_TLS_CERT}", "--key", "${REDIS_TLS_CERT_KEY}", "${REDIS_TLS_CA_CERT:+--cacert}", "${REDIS_TLS_CA_CERT}")
 		}
 		redisHealthCheck = append(redisHealthCheck, "ping")
 
 		redisHealthCheckSubshell := strings.Join(redisHealthCheck, " ")
 
-		healthCheckScript := "RESP=\"$(" + redisHealthCheckSubshell + ")\"\n" + "[ \"$RESP\" = \"PONG\" ]"
+		healthCheckScript := redisCLIAuthSanitizer + "\n" + "RESP=\"$(" + redisHealthCheckSubshell + ")\"\n" + "[ \"$RESP\" = \"PONG\" ]"
 
 		// `-e` causes the shell to exit immediately if a (nontested) command fails
 		probe.ProbeHandler = corev1.ProbeHandler{
@@ -957,6 +1161,16 @@ func getEnvironmentVariables(role string, enabledPassword *bool, secretName *str
 					Key: *secretKey,
 				},
 			},
+		}, corev1.EnvVar{
+			Name: "REDISCLI_AUTH",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: *secretName,
+					},
+					Key: *secretKey,
+				},
+			},
 		})
 	}
 	if persistenceEnabled != nil && *persistenceEnabled {
@@ -975,7 +1189,7 @@ func getEnvironmentVariables(role string, enabledPassword *bool, secretName *str
 
 // createStatefulSet is a method to create statefulset in Kubernetes
 func createStatefulSet(ctx context.Context, cl kubernetes.Interface, namespace string, stateful *appsv1.StatefulSet) error {
-	_, err := cl.AppsV1().StatefulSets(namespace).Create(context.TODO(), stateful, metav1.CreateOptions{})
+	_, err := cl.AppsV1().StatefulSets(namespace).Create(ctx, stateful, metav1.CreateOptions{})
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Redis stateful creation failed")
 		return err
@@ -986,7 +1200,7 @@ func createStatefulSet(ctx context.Context, cl kubernetes.Interface, namespace s
 
 // updateStatefulSet is a method to update statefulset in Kubernetes
 func updateStatefulSet(ctx context.Context, cl kubernetes.Interface, namespace string, stateful *appsv1.StatefulSet, recreateStateFulSet bool, deletePropagation *metav1.DeletionPropagation) error {
-	_, err := cl.AppsV1().StatefulSets(namespace).Update(context.TODO(), stateful, metav1.UpdateOptions{})
+	_, err := cl.AppsV1().StatefulSets(namespace).Update(ctx, stateful, metav1.UpdateOptions{})
 	if recreateStateFulSet {
 		sErr, ok := err.(*apierrors.StatusError)
 		if ok && sErr.ErrStatus.Code == 422 && sErr.ErrStatus.Reason == metav1.StatusReasonInvalid {
@@ -995,7 +1209,7 @@ func updateStatefulSet(ctx context.Context, cl kubernetes.Interface, namespace s
 				failMsg[messageCount] = cause.Message
 			}
 			log.FromContext(ctx).V(1).Info("recreating StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
-			if err := cl.AppsV1().StatefulSets(namespace).Delete(context.TODO(), stateful.GetName(), metav1.DeleteOptions{PropagationPolicy: deletePropagation}); err != nil { //nolint:gocritic
+			if err := cl.AppsV1().StatefulSets(namespace).Delete(ctx, stateful.GetName(), metav1.DeleteOptions{PropagationPolicy: deletePropagation}); err != nil { //nolint:gocritic
 				return errors.Wrap(err, "failed to delete StatefulSet to avoid forbidden action")
 			}
 			return nil // rely on the controller to recreate the StatefulSet
@@ -1014,7 +1228,7 @@ func GetStatefulSet(ctx context.Context, cl kubernetes.Interface, namespace stri
 	getOpts := metav1.GetOptions{
 		TypeMeta: generateMetaInformation("StatefulSet", "apps/v1"),
 	}
-	statefulInfo, err := cl.AppsV1().StatefulSets(namespace).Get(context.TODO(), name, getOpts)
+	statefulInfo, err := cl.AppsV1().StatefulSets(namespace).Get(ctx, name, getOpts)
 	if err != nil {
 		log.FromContext(ctx).V(1).Info("Redis statefulset get action failed")
 		return nil, err

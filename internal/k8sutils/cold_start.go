@@ -19,11 +19,84 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// ValidateRecoveryLineage refuses to discard a nonempty peer unless the
+// candidate contains at least its replication offset in the same history.
+// Offsets from different replication IDs are not comparable. Empty peers
+// are safe to reattach, but missing observations are never treated as empty.
+func ValidateRecoveryLineage(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, pods []string, candidate string, counts map[string]int64) error {
+	infos := map[string]string{}
+	for _, pod := range pods {
+		count, ok := counts[pod]
+		if !ok {
+			return fmt.Errorf("recovery key count unavailable for %s", pod)
+		}
+		if count == 0 {
+			continue
+		}
+		c := configureRedisReplicationClient(ctx, client, cr, pod)
+		info, err := c.Info(ctx, "replication").Result()
+		c.Close()
+		if err != nil {
+			return fmt.Errorf("recovery lineage unavailable for %s: %w", pod, err)
+		}
+		infos[pod] = info
+	}
+	return validateRecoveryLineage(pods, candidate, counts, infos)
+}
+
+func validateRecoveryLineage(pods []string, candidate string, counts map[string]int64, infos map[string]string) error {
+	lineage := func(pod string) (string, int64, error) {
+		fields := map[string]string{}
+		for _, line := range strings.Split(infos[pod], "\n") {
+			key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+			if ok {
+				fields[key] = value
+			}
+		}
+		offset, err := strconv.ParseInt(fields["master_repl_offset"], 10, 64)
+		id := fields["master_replid"]
+		if err != nil || offset < 0 || id == "" || strings.Trim(id, "0") == "" {
+			return "", 0, fmt.Errorf("invalid replication history for %s", pod)
+		}
+		return id, offset, nil
+	}
+	candidateKeys, ok := counts[candidate]
+	if candidate == "" || !ok {
+		return fmt.Errorf("recovery candidate is unobserved")
+	}
+	for _, pod := range pods {
+		count, ok := counts[pod]
+		if !ok {
+			return fmt.Errorf("recovery key count unavailable for %s", pod)
+		}
+		if pod == candidate || count == 0 {
+			continue
+		}
+		if candidateKeys == 0 {
+			return fmt.Errorf("refusing empty candidate %s while %s holds data", candidate, pod)
+		}
+		id, offset, err := lineage(candidate)
+		if err != nil {
+			return err
+		}
+		peerID, peerOffset, err := lineage(pod)
+		if err != nil {
+			return err
+		}
+		if id != peerID || offset < peerOffset {
+			return fmt.Errorf("ambiguous recovery history between %s and %s; refusing automatic demotion", candidate, pod)
+		}
+	}
+	return nil
+}
 
 // PickPreferredMaster returns the preferred master pod name from a list of
 // candidates. Preference: (1) CR status.masterNode if it's in candidates;

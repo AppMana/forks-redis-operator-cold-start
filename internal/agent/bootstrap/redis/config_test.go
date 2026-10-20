@@ -1,10 +1,266 @@
 package bootstrap
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func Test_GenerateConfig_TLS_CACertFile(t *testing.T) {
+	tests := []struct {
+		name           string
+		caCertEnv      string
+		setCACertEnv   bool
+		expectCALine   bool
+		expectedCAPath string
+	}{
+		{
+			name:           "explicit CA cert env set - writes provided path",
+			caCertEnv:      "/tls/ca.crt",
+			setCACertEnv:   true,
+			expectCALine:   true,
+			expectedCAPath: "/tls/ca.crt",
+		},
+		{
+			name:         "CA cert env not set - omits tls-ca-cert-file",
+			setCACertEnv: false,
+			expectCALine: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			confPath := filepath.Join(t.TempDir(), "redis.conf")
+
+			t.Setenv("REDIS_CONFIG_FILE", confPath)
+			t.Setenv("TLS_MODE", "true")
+			t.Setenv("REDIS_TLS_CERT", "/tls/tls.crt")
+			t.Setenv("REDIS_TLS_CERT_KEY", "/tls/tls.key")
+			// Keep the run in standalone mode so GenerateConfig does not try to
+			// reach the network / read nodes.conf for cluster bootstrapping.
+			t.Setenv("SETUP_MODE", "standalone")
+			if tt.setCACertEnv {
+				t.Setenv("REDIS_TLS_CA_CERT", tt.caCertEnv)
+			} else {
+				os.Unsetenv("REDIS_TLS_CA_CERT")
+			}
+
+			require.NoError(t, GenerateConfig())
+
+			raw, err := os.ReadFile(confPath)
+			require.NoError(t, err)
+			conf := string(raw)
+
+			// TLS should always be configured when TLS_MODE is true.
+			assert.Contains(t, conf, "tls-cert-file /tls/tls.crt")
+			assert.Contains(t, conf, "tls-key-file /tls/tls.key")
+
+			if tt.expectCALine {
+				assert.Contains(t, conf, "tls-ca-cert-file "+tt.expectedCAPath)
+			} else {
+				assert.NotContains(t, conf, "tls-ca-cert-file")
+			}
+		})
+	}
+}
+
+func Test_GenerateConfig_AppendOnlyFilename_MatchesRedisDefault(t *testing.T) {
+	confPath := filepath.Join(t.TempDir(), "redis.conf")
+
+	t.Setenv("REDIS_CONFIG_FILE", confPath)
+	t.Setenv("PERSISTENCE_ENABLED", "true")
+	t.Setenv("SETUP_MODE", "standalone")
+	t.Setenv("TLS_MODE", "false")
+
+	require.NoError(t, GenerateConfig())
+
+	raw, err := os.ReadFile(confPath)
+	require.NoError(t, err)
+	conf := string(raw)
+
+	// The generated appendfilename must match Redis' own lowercase default
+	// ("appendonly.aof"). Diverging from it (e.g. "Appendonly.aof") makes
+	// Redis look for a file that doesn't exist on disk, silently losing all
+	// previously persisted data on startup.
+	assert.Contains(t, conf, `appendfilename "appendonly.aof"`)
+}
+
+func Test_GenerateConfig_ReplicaAnnounceIP(t *testing.T) {
+	const fakeFQDN = "redis-replication-0.redis-replication-headless.ns.svc.cluster.local"
+
+	tests := []struct {
+		name      string
+		setupMode string
+		announce  string
+		resolve   string
+		resolver  func() (string, error)
+		want      bool
+	}{
+		{
+			name:      "replication with hostnames enabled announces the FQDN",
+			setupMode: "replication", announce: "yes", resolve: "yes",
+			resolver: func() (string, error) { return fakeFQDN, nil },
+			want:     true,
+		},
+		{
+			// Sentinel rejects a hostname here unless it resolves hostnames itself,
+			// so announcing one would make the replica undiscoverable.
+			name:      "replication with resolve-hostnames off stays on IPs",
+			setupMode: "replication", announce: "yes", resolve: "no",
+			resolver: func() (string, error) { return fakeFQDN, nil },
+			want:     false,
+		},
+		{
+			name:      "replication with announce-hostnames off stays on IPs",
+			setupMode: "replication", announce: "no", resolve: "yes",
+			resolver: func() (string, error) { return fakeFQDN, nil },
+			want:     false,
+		},
+		{
+			name:      "replication with both off (the default) stays on IPs",
+			setupMode: "replication", announce: "no", resolve: "no",
+			resolver: func() (string, error) { return fakeFQDN, nil },
+			want:     false,
+		},
+		{
+			name:      "resolver failure omits the directive",
+			setupMode: "replication", announce: "yes", resolve: "yes",
+			resolver: func() (string, error) { return "", errors.New("boom") },
+			want:     false,
+		},
+		{
+			// go-fqdn returns a nil error even when it only found the short name.
+			name:      "unqualified hostname is rejected",
+			setupMode: "replication", announce: "yes", resolve: "yes",
+			resolver: func() (string, error) { return "redis-replication-0", nil },
+			want:     false,
+		},
+		{
+			name:      "standalone never announces",
+			setupMode: "standalone", announce: "yes", resolve: "yes",
+			resolver: func() (string, error) { return fakeFQDN, nil },
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			orig := fqdnHostname
+			fqdnHostname = tt.resolver
+			t.Cleanup(func() { fqdnHostname = orig })
+
+			confPath := filepath.Join(t.TempDir(), "redis.conf")
+			t.Setenv("REDIS_CONFIG_FILE", confPath)
+			t.Setenv("SETUP_MODE", tt.setupMode)
+			t.Setenv("ANNOUNCE_HOSTNAMES", tt.announce)
+			t.Setenv("RESOLVE_HOSTNAMES", tt.resolve)
+
+			require.NoError(t, GenerateConfig())
+
+			raw, err := os.ReadFile(confPath)
+			require.NoError(t, err)
+			conf := string(raw)
+
+			if tt.want {
+				assert.Contains(t, conf, "replica-announce-ip "+fakeFQDN)
+			} else {
+				assert.NotContains(t, conf, "replica-announce-ip")
+			}
+		})
+	}
+}
+
+func Test_GenerateConfig_ExternalConfig_ExpandsEnvPlaceholders(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "redis.conf")
+	externalPath := filepath.Join(dir, "redis-additional.conf")
+
+	// MAXMEMORY_POLICY is not something GenerateConfig writes itself, so the
+	// value can only reach the config through expansion of the external file.
+	external := "maxmemory-policy ${MAXMEMORY_POLICY}\nslowlog-max-len 158\n"
+	require.NoError(t, os.WriteFile(externalPath, []byte(external), 0o644))
+
+	t.Setenv("REDIS_CONFIG_FILE", confPath)
+	t.Setenv("EXTERNAL_CONFIG_FILE", externalPath)
+	t.Setenv("SETUP_MODE", "standalone")
+	t.Setenv("TLS_MODE", "false")
+	t.Setenv("MAXMEMORY_POLICY", "allkeys-lru")
+	t.Setenv("EXPAND_EXTERNAL_CONFIG", "true")
+
+	require.NoError(t, GenerateConfig())
+
+	raw, err := os.ReadFile(confPath)
+	require.NoError(t, err)
+	conf := string(raw)
+
+	// The include must point at an expanded copy, not the raw placeholder file.
+	expandedPath := filepath.Join(dir, "redis-additional.expanded.conf")
+	assert.Contains(t, conf, "include "+expandedPath)
+	assert.NotContains(t, conf, "include "+externalPath)
+
+	includedRaw, err := os.ReadFile(expandedPath)
+	require.NoError(t, err)
+	included := string(includedRaw)
+
+	assert.Contains(t, included, "maxmemory-policy allkeys-lru")
+	assert.NotContains(t, included, "${MAXMEMORY_POLICY}")
+	// Non-placeholder directives are preserved unchanged.
+	assert.Contains(t, included, "slowlog-max-len 158")
+}
+
+func Test_GenerateConfig_ExternalConfig_GateOff_IncludesVerbatim(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "redis.conf")
+	externalPath := filepath.Join(dir, "redis-additional.conf")
+
+	require.NoError(t, os.WriteFile(externalPath, []byte("maxmemory-policy ${MAXMEMORY_POLICY}\n"), 0o644))
+
+	t.Setenv("REDIS_CONFIG_FILE", confPath)
+	t.Setenv("EXTERNAL_CONFIG_FILE", externalPath)
+	t.Setenv("SETUP_MODE", "standalone")
+	t.Setenv("TLS_MODE", "false")
+	t.Setenv("MAXMEMORY_POLICY", "allkeys-lru")
+	// Gate off (default) — must include the raw file, no expanded copy written.
+	os.Unsetenv("EXPAND_EXTERNAL_CONFIG")
+
+	require.NoError(t, GenerateConfig())
+
+	raw, err := os.ReadFile(confPath)
+	require.NoError(t, err)
+	conf := string(raw)
+
+	// Historical behaviour: include points at the original mount, untouched.
+	assert.Contains(t, conf, "include "+externalPath)
+	_, statErr := os.Stat(filepath.Join(dir, "redis-additional.expanded.conf"))
+	assert.True(t, os.IsNotExist(statErr), "no expanded copy should be written when gate is off")
+}
+
+func Test_GenerateConfig_ExternalConfig_MissingVarBecomesEmpty(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "redis.conf")
+	externalPath := filepath.Join(dir, "redis-additional.conf")
+
+	require.NoError(t, os.WriteFile(externalPath, []byte("maxmemory-policy ${NOT_SET_VAR}\n"), 0o644))
+
+	t.Setenv("REDIS_CONFIG_FILE", confPath)
+	t.Setenv("EXTERNAL_CONFIG_FILE", externalPath)
+	t.Setenv("SETUP_MODE", "standalone")
+	t.Setenv("TLS_MODE", "false")
+	t.Setenv("EXPAND_EXTERNAL_CONFIG", "true")
+	os.Unsetenv("NOT_SET_VAR")
+
+	require.NoError(t, GenerateConfig())
+
+	includedRaw, err := os.ReadFile(filepath.Join(dir, "redis-additional.expanded.conf"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(includedRaw), "${NOT_SET_VAR}")
+	assert.Contains(t, string(includedRaw), "maxmemory-policy \n")
+}
 
 func Test_updateMyselfIP(t *testing.T) {
 	testData := `7a6b5f4f99496c97f4e32c30c077aa95cab92664 10.244.0.246:0@16379,,tls-port=6379,shard-id=a03445a0d3f6d405af261041e0cb77a8a176f42b slave b66f2fa597eeda567cf05f3701419be9a3b2f50e 0 1756463509000 1 connected
@@ -41,4 +297,107 @@ vars currentEpoch 3 lastVoteEpoch 0
 	}
 
 	t.Logf("Successfully updated nodes.conf with new IP %s", newIP)
+}
+
+func Test_GenerateConfig_RedisMajorVersionGates(t *testing.T) {
+	tests := []struct {
+		name              string
+		redisMajorVersion string
+		expectV7Features  bool
+	}{
+		{name: "v6 keeps the pre-7 configuration", redisMajorVersion: "v6", expectV7Features: false},
+		{name: "v7 enables hostname based clustering", redisMajorVersion: "v7", expectV7Features: true},
+		{name: "v8 also enables hostname based clustering", redisMajorVersion: "v8", expectV7Features: true},
+		{name: "v10 is not compared lexically", redisMajorVersion: "v10", expectV7Features: true},
+		{name: "unparseable version falls back to the v7 default", redisMajorVersion: "latest", expectV7Features: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			confPath := filepath.Join(tmp, "redis.conf")
+
+			t.Setenv("REDIS_CONFIG_FILE", confPath)
+			t.Setenv("SETUP_MODE", "cluster")
+			t.Setenv("NODE_CONF_DIR", tmp)
+			t.Setenv("NODEPORT", "false")
+			t.Setenv("TLS_MODE", "true")
+			t.Setenv("REDIS_TLS_CERT", "/tls/tls.crt")
+			t.Setenv("REDIS_TLS_CERT_KEY", "/tls/tls.key")
+			t.Setenv("REDIS_MAJOR_VERSION", tt.redisMajorVersion)
+
+			require.NoError(t, GenerateConfig())
+
+			raw, err := os.ReadFile(confPath)
+			require.NoError(t, err)
+			conf := string(raw)
+
+			if tt.expectV7Features {
+				assert.Contains(t, conf, "cluster-preferred-endpoint-type hostname")
+				// cluster-announce-hostname is only written when the FQDN lookup
+				// succeeds, which is environment dependent, so it is not asserted here.
+			} else {
+				assert.NotContains(t, conf, "cluster-preferred-endpoint-type")
+				assert.NotContains(t, conf, "cluster-announce-hostname")
+			}
+		})
+	}
+}
+
+func Test_validateACLDefaultUser(t *testing.T) {
+	tests := []struct {
+		name     string
+		acl      string
+		password string
+		wantErr  string
+	}{
+		{name: "plaintext password matches", acl: "user alice on >alicepass ~* &* +@all\nuser default on >secret ~* &* +@all\n", password: "secret"},
+		{name: "sha256 hash matches", acl: "user default on #2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b ~* &* +@all\n", password: "secret"},
+		{name: "trailing newline from secret is trimmed", acl: "user default on >secret ~* &* +@all\n", password: "secret\n"},
+		{name: "quoted arguments skip password comparison", acl: "user default on \">my secret\" ~* &* +@all\n", password: "other"},
+		{name: "empty password skips validation", acl: "user alice on >alicepass ~* &* +@all\n", password: ""},
+		{name: "file missing", password: "secret", wantErr: "not readable"},
+		{name: "default user missing", acl: "user alice on >alicepass ~* &* +@all\n", password: "secret", wantErr: "does not define the default user"},
+		{name: "default user nopass", acl: "user default on nopass ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "default user off", acl: "user default off >secret ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "default user without on", acl: "user default >secret ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "password mismatch", acl: "user default on >wrong ~* &* +@all\n", password: "secret", wantErr: "does not match"},
+		{name: "resetpass after password", acl: "user default on >secret resetpass ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "password removed again", acl: "user default on >secret <secret ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "user.acl")
+			if tt.acl != "" {
+				require.NoError(t, os.WriteFile(path, []byte(tt.acl), 0o600))
+			}
+
+			err := validateACLDefaultUser(path, tt.password)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.NotContains(t, err.Error(), "secret")
+		})
+	}
+}
+
+func Test_GenerateConfig_ACLMode_RejectsMissingDefaultUser(t *testing.T) {
+	dir := t.TempDir()
+	confPath := filepath.Join(dir, "redis.conf")
+	aclPath := filepath.Join(dir, "user.acl")
+	require.NoError(t, os.WriteFile(aclPath, []byte("user alice on >alicepass ~* &* +@all\n"), 0o600))
+
+	t.Setenv("REDIS_CONFIG_FILE", confPath)
+	t.Setenv("SETUP_MODE", "standalone")
+	t.Setenv("TLS_MODE", "false")
+	t.Setenv("ACL_MODE", "true")
+	t.Setenv("ACL_FILE_PATH", aclPath)
+	t.Setenv("REDIS_PASSWORD", "secret")
+
+	require.Error(t, GenerateConfig())
+	assert.NoFileExists(t, confPath)
 }

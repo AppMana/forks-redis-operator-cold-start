@@ -6,6 +6,9 @@ metadata:
 spec:
   redisConfig:
     maxMemoryPercentOfLimit: 80
+    dynamicConfig:
+      - "maxmemory-policy allkeys-lru"
+      - "slowlog-log-slower-than 5000"
   podSecurityContext:
     runAsUser: 1000
     fsGroup: 1000
@@ -15,13 +18,12 @@ spec:
         additionalAnnotations:
           test: test
     image: quay.io/opstree/redis:latest
-    imagePullPolicy: Always
+    imagePullPolicy: IfNotPresent
     resources:
       requests:
         cpu: 101m
         memory: 128Mi
       limits:
-        cpu: 101m
         memory: 128Mi
   storage:
     volumeClaimTemplate:

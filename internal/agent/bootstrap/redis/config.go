@@ -3,11 +3,14 @@ package bootstrap
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	agentutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/agent/util"
@@ -17,19 +20,36 @@ import (
 )
 
 // defaultRedisConfig from https://github.com/OT-CONTAINER-KIT/redis/blob/master/redis.conf
+// tcp-keepalive is lowered from the Redis default (300s) to 60s so that dead
+// peer connections are detected faster, which helps the cluster gossip layer
+// converge sooner after pod restarts with new IPs.
 const defaultRedisConfig = `
 bind 0.0.0.0 ::
 tcp-backlog 511
 timeout 0
-tcp-keepalive 300
+tcp-keepalive 60
 daemonize no
 supervised no
 pidfile /var/run/redis.pid
 `
 
+var fqdnHostname = fqdn.FqdnHostname
+
+func announceHostname() (string, error) {
+	name, err := fqdnHostname()
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(name, ".") {
+		return "", fmt.Errorf("hostname %q is not fully qualified", name)
+	}
+	return name, nil
+}
+
 // GenerateConfig generates Redis configuration file
 func GenerateConfig() error {
-	cfg := agentutil.NewConfig("/etc/redis/redis.conf", defaultRedisConfig)
+	confPath := util.CoalesceEnv1("REDIS_CONFIG_FILE", "/etc/redis/redis.conf")
+	cfg := agentutil.NewConfig(confPath, defaultRedisConfig)
 
 	var (
 		persistenceEnabled = util.CoalesceEnv1("PERSISTENCE_ENABLED", "false")
@@ -43,22 +63,35 @@ func GenerateConfig() error {
 		clusterMode        = util.CoalesceEnv1("SETUP_MODE", "standalone")
 		aclMode            = util.CoalesceEnv1("ACL_MODE", "")
 		aclFilePath        = util.CoalesceEnv1("ACL_FILE_PATH", "/etc/redis/user.acl")
+		expandExternal     = util.CoalesceEnv1(consts.ENV_KEY_EXPAND_EXTERNAL_CONFIG, "false")
 	)
 
-	if val, ok := util.CoalesceEnv("REDIS_PASSWORD", ""); ok && val != "" {
-		cfg.Append("masterauth", val)
-		cfg.Append("requirepass", val)
+	redisPassword := util.CoalesceEnv1("REDIS_PASSWORD", "")
+	if aclMode == "true" {
+		if err := validateACLDefaultUser(aclFilePath, redisPassword); err != nil {
+			return err
+		}
+	}
+	if redisPassword != "" {
+		cfg.Append("masterauth", redisPassword)
+		cfg.Append("requirepass", redisPassword)
 		cfg.Append("protected-mode", "yes")
 	} else {
 		fmt.Println("Redis is running without password which is not recommended")
 		cfg.Append("protected-mode", "no")
 	}
 
-	if clusterMode == "cluster" {
+	switch clusterMode {
+	case "cluster":
 		nodeConfPath := filepath.Join(nodeConfDir, "nodes.conf")
 
+		// cluster-node-timeout is raised from 5000ms to 15000ms (configurable
+		// via CLUSTER_NODE_TIMEOUT) to give gossip time to converge after
+		// pod restarts before marking nodes as failed.
+		clusterNodeTimeout := util.CoalesceEnv1("CLUSTER_NODE_TIMEOUT", "15000")
+
 		cfg.Append("cluster-enabled", "yes")
-		cfg.Append("cluster-node-timeout", "5000")
+		cfg.Append("cluster-node-timeout", clusterNodeTimeout)
 		cfg.Append("cluster-require-full-coverage", "no")
 		cfg.Append("cluster-migration-barrier", "1")
 		cfg.Append("cluster-config-file", nodeConfPath)
@@ -85,7 +118,7 @@ func GenerateConfig() error {
 		if clusterAnnounceIP != "" {
 			cfg.Append("cluster-announce-ip", clusterAnnounceIP)
 		}
-		if redisMajorVersion == "v7" {
+		if util.IsRedisVersionAtLeastV7(redisMajorVersion) {
 			fqdnName, err := fqdn.FqdnHostname()
 			if err != nil {
 				log.Printf("Warning: Failed to get FQDN: %v", err)
@@ -93,20 +126,33 @@ func GenerateConfig() error {
 				cfg.Append("cluster-announce-hostname", fqdnName)
 			}
 		}
-	} else {
+	case "replication":
+		fmt.Println("Setting up redis in replication mode")
+		announceHostnames := util.CoalesceEnv1("ANNOUNCE_HOSTNAMES", "no")
+		resolveHostnames := util.CoalesceEnv1("RESOLVE_HOSTNAMES", "no")
+		if announceHostnames == "yes" && resolveHostnames == "yes" {
+			if fqdnName, err := announceHostname(); err != nil {
+				log.Printf("Warning: Failed to get FQDN for replica-announce-ip: %v", err)
+			} else {
+				cfg.Append("replica-announce-ip", fqdnName)
+			}
+		}
+	default:
 		fmt.Println("Setting up redis in standalone mode")
 	}
 
 	if tlsMode == "true" {
 		cfg.Append("tls-cert-file", util.CoalesceEnv1("REDIS_TLS_CERT", ""))
 		cfg.Append("tls-key-file", util.CoalesceEnv1("REDIS_TLS_CERT_KEY", ""))
-		cfg.Append("tls-ca-cert-file", util.CoalesceEnv1("REDIS_TLS_CA_CERT", ""))
+		if caCert := util.CoalesceEnv1("REDIS_TLS_CA_CERT", ""); caCert != "" {
+			cfg.Append("tls-ca-cert-file", caCert)
+		}
 		cfg.Append("tls-auth-clients", "optional")
 		cfg.Append("tls-replication", "yes")
 
 		if clusterMode == "cluster" {
 			cfg.Append("tls-cluster", "yes")
-			if redisMajorVersion == "v7" && nodeport == "false" {
+			if util.IsRedisVersionAtLeastV7(redisMajorVersion) && nodeport == "false" {
 				cfg.Append("cluster-preferred-endpoint-type", "hostname")
 			}
 		}
@@ -125,8 +171,8 @@ func GenerateConfig() error {
 		cfg.Append("save", "900 1")
 		cfg.Append("save", "300 10")
 		cfg.Append("save", "60 10000")
-		cfg.Append("Appendonly", "yes")
-		cfg.Append("Appendfilename", "\"Appendonly.aof\"")
+		cfg.Append("appendonly", "yes")
+		cfg.Append("appendfilename", "\"appendonly.aof\"")
 		cfg.Append("dir", dataDir)
 	} else {
 		fmt.Println("Running without persistence mode")
@@ -161,10 +207,9 @@ func GenerateConfig() error {
 	if maxMemory := util.CoalesceEnv1(consts.ENV_KEY_REDIS_MAX_MEMORY, ""); maxMemory != "" {
 		cfg.Append("maxmemory", maxMemory)
 	}
+
 	// External configuration defined by user at the end
-	if _, err := os.Stat(externalConfigFile); err == nil {
-		cfg.Append("include", externalConfigFile)
-	}
+	cfg.AppendExternalConfig(externalConfigFile, expandExternal == "true")
 	return cfg.Commit()
 }
 
@@ -197,4 +242,37 @@ func updateMyselfIP(nodesConfPath, newIP string) (updated []byte, err error) {
 		return out.Bytes(), os.WriteFile(nodesConfPath, out.Bytes(), 0o644)
 	}
 	return nil, nil
+}
+
+func validateACLDefaultUser(path, password string) error {
+	password = agentutil.SanitizeConfigValue(password)
+	if password == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("ACL file %s is not readable: %w", path, err)
+	}
+	sum := sha256.Sum256([]byte(password))
+	hash := "#" + hex.EncodeToString(sum[:])
+	for _, line := range strings.Split(string(raw), "\n") {
+		rules := strings.Fields(line)
+		if len(rules) < 2 || rules[0] != "user" || rules[1] != "default" {
+			continue
+		}
+		if !slices.Contains(rules, "on") || slices.ContainsFunc(rules, func(r string) bool {
+			return r == "off" || r == "nopass" || r == "reset" || r == "resetpass" || r[0] == '<' || r[0] == '!'
+		}) {
+			return fmt.Errorf("ACL file %s must define the default user as on with a password; the operator authenticates as default with the redisSecret password", path)
+		}
+		if strings.ContainsAny(line, `"'`) {
+			log.Printf("Warning: ACL file %s defines the default user with quoted arguments; skipping password comparison", path)
+			return nil
+		}
+		if slices.Contains(rules, ">"+password) || slices.Contains(rules, hash) {
+			return nil
+		}
+		return fmt.Errorf("ACL file %s defines the default user with a password that does not match redisSecret; add >password or #sha256 for the redisSecret password", path)
+	}
+	return fmt.Errorf("ACL file %s does not define the default user; when redisSecret is set the ACL file must contain a line like \"user default on >password ~* &* +@all\" with the same password", path)
 }
