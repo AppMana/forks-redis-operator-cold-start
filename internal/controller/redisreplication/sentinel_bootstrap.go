@@ -50,6 +50,9 @@ func bootstrapPlaceholder(states []bootstrapMonitor, size int32, primary corev1.
 // Redis topology; only one placeholder is initialized, then authority is observed
 // again next reconcile. A crash needs no in-memory progress or weaker quorum.
 func (r *Reconciler) initializeEmbeddedSentinelPlaceholder(ctx context.Context, inst *rrvb2.RedisReplication, topology k8sutils.RedisReplicationTopology) (bool, error) {
+	if r.ResumeSentinelBootstrap != nil {
+		return r.ResumeSentinelBootstrap(ctx, inst, topology)
+	}
 	if !inst.EnableSentinel() || !topology.Complete() || len(topology.Masters) != 1 || inst.Spec.Size == nil || topology.Observed() != int(*inst.Spec.Size) || r.Checker == nil {
 		return false, nil
 	}

@@ -55,6 +55,14 @@ func (r *Reconciler) prepareSentinelHostnameMigration(ctx context.Context, rr *r
 	master, authoritative := r.sentinelElectedMaster(ctx, rr)
 	if authoritative {
 		if master == "" || !slices.Contains(topology.Masters, master) {
+			if master == "" {
+				// Resource preparation runs before reconcileRedis. An ephemeral
+				// rollout may have initialized only one monitor, so waiting here
+				// without resuming guarded bootstrap would prevent quorum forever.
+				if _, err := r.initializeEmbeddedSentinelPlaceholder(ctx, rr, topology); err != nil {
+					return fmt.Errorf("resume Sentinel bootstrap during hostname migration: %w", err)
+				}
+			}
 			return fmt.Errorf("cannot migrate hostnames with unresolved Sentinel authority")
 		}
 	} else {

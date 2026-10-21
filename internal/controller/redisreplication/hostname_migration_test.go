@@ -97,6 +97,50 @@ func TestSentinelConfigurationFailureIsNotSwallowed(t *testing.T) {
 	require.Error(t, r.configureSentinelPods(context.Background(), &fakeSentinelRedisClient{svc: svc}, rr, pods[:2], "redis.example", ""))
 }
 
+func TestHostnameMigrationResumesBootstrapWithoutAuthorizingRedisRollout(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "placeholder initialized", true: "repair failed"}[failed], func(t *testing.T) {
+			rr := persistentEmbeddedReplication()
+			rr.Spec.Size = ptr.To(int32(3))
+			rr.Spec.Sentinel.ResolveHostnames = "yes"
+			scheme := runtime.NewScheme()
+			require.NoError(t, appsv1.AddToScheme(scheme))
+			current := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: rr.Name, Namespace: rr.Namespace}}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(current).Build()
+			sts := appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Generation: 1}, Status: appsv1.StatefulSetStatus{ObservedGeneration: 1, ReadyReplicas: 3, UpdatedReplicas: 3, CurrentRevision: "r", UpdateRevision: "r"}}
+			topology := k8sutils.RedisReplicationTopology{Masters: []string{"redis-0"}, Slaves: []string{"redis-1", "redis-2"}}
+			resumed := false
+			failure := errors.New("placeholder observation failed")
+			r := &Reconciler{
+				Client: c,
+				RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
+					return topology, nil
+				},
+				SentinelElectedMaster: func(context.Context, *rrvb2.RedisReplication) (string, bool) { return "", true },
+				ResumeSentinelBootstrap: func(_ context.Context, instance *rrvb2.RedisReplication, observed k8sutils.RedisReplicationTopology) (bool, error) {
+					resumed = true
+					require.Same(t, rr, instance)
+					require.Equal(t, topology, observed)
+					if failed {
+						return false, failure
+					}
+					return true, nil
+				},
+				ConfigureSentinel: func(context.Context, *rrvb2.RedisReplication, string) error {
+					t.Fatal("must reobserve majority before configuring other monitors")
+					return nil
+				},
+			}
+			err := r.prepareSentinelHostnameMigration(context.Background(), rr, sts)
+			require.True(t, resumed)
+			require.Error(t, err, "Redis rollout remains blocked until majority is reobserved")
+			if failed {
+				require.ErrorIs(t, err, failure)
+			}
+		})
+	}
+}
+
 func TestHostnameMigrationBlocksRedisResourceWrites(t *testing.T) {
 	rr := persistentEmbeddedReplication()
 	rr.Spec.Size = ptr.To(int32(3))

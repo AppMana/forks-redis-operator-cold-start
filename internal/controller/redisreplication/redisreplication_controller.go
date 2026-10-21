@@ -50,9 +50,10 @@ type Reconciler struct {
 	PromoteRecoveryMaster      func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string, string) error
 
 	// Test seams; nil uses the live Redis and Sentinel probes.
-	ObserveRoles          func(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error)
-	RealMaster            func(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string
-	SentinelElectedMaster func(ctx context.Context, instance *rrvb2.RedisReplication) (string, bool)
+	ObserveRoles            func(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error)
+	RealMaster              func(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string
+	SentinelElectedMaster   func(ctx context.Context, instance *rrvb2.RedisReplication) (string, bool)
+	ResumeSentinelBootstrap func(context.Context, *rrvb2.RedisReplication, k8sutils.RedisReplicationTopology) (bool, error)
 }
 
 func (r *Reconciler) observeRoles(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error) {
