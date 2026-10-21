@@ -265,6 +265,19 @@ func (c *service) SentinelReset(ctx context.Context, masterGroupName string) err
 }
 
 func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, masterGroupName, quorum string) error {
+	// Validate before REMOVE can destroy a retained monitor. This also covers
+	// external Sentinel CRs, not just embedded controller validation.
+	if master == nil || master.Host == "" {
+		return errors.New("sentinel master address is required")
+	}
+	port, portErr := strconv.ParseUint(master.Port, 10, 16)
+	if portErr != nil || port == 0 {
+		return errors.New("sentinel master port must be between 1 and 65535")
+	}
+	quorumValue, quorumErr := strconv.ParseUint(quorum, 10, 31)
+	if quorumErr != nil || quorumValue == 0 {
+		return errors.New("sentinel quorum must be a positive 32-bit integer")
+	}
 	var (
 		cmd *rediscli.BoolCmd
 		err error

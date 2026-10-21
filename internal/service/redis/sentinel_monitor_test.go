@@ -136,3 +136,32 @@ func TestSentinelMonitorReportsQuorumUpdateFailure(t *testing.T) {
 	require.ErrorIs(t, err, updateErr)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestSentinelMonitorRejectsInvalidReplacementBeforeRedisAccess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		master *ConnectionInfo
+		quorum string
+		want   string
+	}{
+		{name: "missing master", quorum: "2", want: "master address"},
+		{name: "empty host", master: &ConnectionInfo{Port: "6379"}, quorum: "2", want: "master address"},
+		{name: "zero port", master: &ConnectionInfo{Host: "10.0.0.2", Port: "0"}, quorum: "2", want: "master port"},
+		{name: "overflow port", master: &ConnectionInfo{Host: "10.0.0.2", Port: "65536"}, quorum: "2", want: "master port"},
+		{name: "invalid port", master: &ConnectionInfo{Host: "10.0.0.2", Port: "invalid"}, quorum: "2", want: "master port"},
+		{name: "zero quorum", master: &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, quorum: "0", want: "quorum"},
+		{name: "negative quorum", master: &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, quorum: "-1", want: "quorum"},
+		{name: "invalid quorum", master: &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, quorum: "invalid", want: "quorum"},
+		{name: "overflow quorum", master: &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, quorum: "2147483648", want: "quorum"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := redismock.NewClientMock()
+			svc := &service{redisClient: db}
+			// No commands, particularly REMOVE, may precede validation.
+			require.NotPanics(t, func() {
+				require.ErrorContains(t, svc.SentinelMonitor(context.Background(), tc.master, "upgrade", tc.quorum), tc.want)
+			})
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
