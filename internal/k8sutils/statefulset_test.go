@@ -2589,7 +2589,7 @@ func TestGenerateInitContainerDefMountsACLFile(t *testing.T) {
 			aclConfig: &common.ACLConfig{
 				Secret: &corev1.SecretVolumeSource{SecretName: "acl-secret"},
 			},
-			wantMount: corev1.VolumeMount{Name: "acl-secret", MountPath: "/etc/redis/user.acl", SubPath: "user.acl", ReadOnly: true},
+			wantMount: corev1.VolumeMount{Name: "acl-secret", MountPath: "/etc/redis/acl", ReadOnly: true},
 		},
 		{
 			name: "acl from pvc is mounted read-only at the aclfile directory",
@@ -2604,7 +2604,7 @@ func TestGenerateInitContainerDefMountsACLFile(t *testing.T) {
 				Secret:                &corev1.SecretVolumeSource{SecretName: "acl-secret"},
 				PersistentVolumeClaim: ptr.To("acl-pvc"),
 			},
-			wantMount: corev1.VolumeMount{Name: "acl-secret", MountPath: "/etc/redis/user.acl", SubPath: "user.acl", ReadOnly: true},
+			wantMount: corev1.VolumeMount{Name: "acl-secret", MountPath: "/etc/redis/acl", ReadOnly: true},
 		},
 	}
 

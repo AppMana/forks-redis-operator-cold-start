@@ -1035,6 +1035,12 @@ func generateACLVolumeMount(aclConfig *commonapi.ACLConfig, readOnly bool) *core
 	case aclConfig == nil:
 		return nil
 	case aclConfig.Secret != nil:
+		// Generated config can use a dedicated directory so kubelet's atomic
+		// Secret projection reaches running pods. Keep legacy entrypoints on
+		// their original filename; mounting over /etc/redis would hide config.
+		if features.Enabled(features.GenerateConfigInInitContainer) {
+			return &corev1.VolumeMount{Name: "acl-secret", MountPath: "/etc/redis/acl", ReadOnly: readOnly}
+		}
 		return &corev1.VolumeMount{
 			Name:      "acl-secret",
 			MountPath: "/etc/redis/user.acl",
@@ -1143,7 +1149,9 @@ func getEnvironmentVariables(role string, enabledPassword *bool, secretName *str
 			Value: "true",
 		})
 		aclFilePath := "/etc/redis/user.acl"
-		if aclConfig.PersistentVolumeClaim != nil {
+		if aclConfig.Secret != nil && features.Enabled(features.GenerateConfigInInitContainer) {
+			aclFilePath = "/etc/redis/acl/user.acl"
+		} else if aclConfig.Secret == nil && aclConfig.PersistentVolumeClaim != nil {
 			aclFilePath = "/data/redis/user.acl"
 		}
 		envVars = append(envVars, corev1.EnvVar{
