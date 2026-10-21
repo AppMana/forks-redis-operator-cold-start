@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: native-sentinel-client
+  namespace: redis-upgrade-canary-empty-disk
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 180
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: appmana-redis-recovery:native-client-test
+          imagePullPolicy: IfNotPresent
+          command: [/operator]
+          args: [-test.run=^TestNativeSentinelClientAcrossFailover$, -test.v, -test.timeout=150s]
+          env:
+            - name: CANARY_NATIVE_SENTINEL_TEST
+              value: "1"
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {memory: 128Mi}
