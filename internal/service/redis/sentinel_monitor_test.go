@@ -64,6 +64,41 @@ func TestSentinelMonitorPreservesAlreadyCorrectHostname(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestSentinelMonitorEquivalentAddressRespectsAnnouncementMode(t *testing.T) {
+	for _, mode := range []string{"no", "yes", "missing", "unavailable"} {
+		t.Run(mode, func(t *testing.T) {
+			db, mock := redismock.NewClientMock()
+			svc := &service{redisClient: db, lookupHost: func(context.Context, string) ([]string, error) {
+				return []string{"::ffff:10.0.0.1"}, nil
+			}}
+			mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1", "port": "6379", "quorum": "3"})
+			mock.ExpectDo("SENTINEL", "CONFIG", "GET", "resolve-hostnames").SetVal(map[string]string{"resolve-hostnames": "yes"})
+			if mode == "unavailable" {
+				mock.ExpectDo("SENTINEL", "CONFIG", "GET", "announce-hostnames").SetErr(errors.New("unavailable"))
+			} else {
+				mock.ExpectDo("SENTINEL", "CONFIG", "GET", "announce-hostnames").SetVal(map[string]string{"announce-hostnames": mode})
+			}
+			switch mode {
+			case "no":
+				mock.ExpectDo("SENTINEL", "SET", "upgrade", "quorum", "2").SetVal("OK")
+			case "yes":
+				mock.ExpectDo("SENTINEL", "REMOVE", "upgrade").SetVal(true)
+				mock.ExpectDo("SENTINEL", "MONITOR", "upgrade", "redis-0.example", "6379", "2").SetVal(true)
+			}
+			if mode == "no" || mode == "yes" {
+				mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", "").SetVal(true)
+			}
+			err := svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "redis-0.example", Port: "6379"}, "upgrade", "2")
+			if mode == "no" || mode == "yes" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
 type sentinelTestError string
 
 func (e sentinelTestError) Error() string { return string(e) }

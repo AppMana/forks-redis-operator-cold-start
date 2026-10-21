@@ -506,7 +506,7 @@ func TestEmbeddedSentinelReconcilesHostnameSettingsInSafeOrder(t *testing.T) {
 			err := r.configureSentinelPod(context.Background(), &fakeSentinelRedisClient{svc: svc}, inst, corev1.Pod{}, "10.0.0.1", "")
 			require.NoError(t, err)
 			if mode == "yes" {
-				require.Equal(t, []string{"resolve-hostnames=yes", "monitor", "announce-hostnames=yes"}, svc.hostnameCalls)
+				require.Equal(t, []string{"resolve-hostnames=yes", "announce-hostnames=yes", "monitor"}, svc.hostnameCalls)
 			} else {
 				require.Equal(t, []string{"monitor", "announce-hostnames=no", "resolve-hostnames=no"}, svc.hostnameCalls)
 			}

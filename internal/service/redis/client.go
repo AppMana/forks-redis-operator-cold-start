@@ -303,6 +303,7 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 	defer client.Close()
 
 	masterExists := false
+	var currentMaster map[string]string
 	masterCheckCmd := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "MASTER", masterGroupName)
 	err = client.Process(ctx, masterCheckCmd)
 	if err != nil {
@@ -314,6 +315,7 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 	} else {
 		masterExists = true
 		result := masterCheckCmd.Val()
+		currentMaster = result
 		if result["ip"] == "" || result["port"] == "" {
 			return fmt.Errorf("incomplete Sentinel master metadata; existing monitor preserved")
 		}
@@ -362,6 +364,29 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 			if len(addresses) == 0 {
 				return errors.New("resolve replacement Sentinel master: no addresses; existing monitor preserved")
 			}
+			if currentMaster["port"] == master.Port && sentinelAddressMatches(currentMaster["ip"], addresses) {
+				// Redis 7 uses announce-hostnames for both API replies and config
+				// rewrites. In IP mode, re-MONITORing the equivalent hostname on
+				// every pass only discards election state; it cannot persist DNS.
+				// In hostname mode, do not shortcut an IP-only monitor's migration.
+				announceCmd := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "CONFIG", "GET", "announce-hostnames")
+				if err := client.Process(ctx, announceCmd); err != nil {
+					return fmt.Errorf("verify Sentinel announcement mode before changing equivalent monitor: %w", err)
+				}
+				switch announceCmd.Val()["announce-hostnames"] {
+				case "no":
+					if currentMaster["quorum"] != quorum {
+						if err := client.Do(ctx, "SENTINEL", "SET", masterGroupName, "quorum", quorum).Err(); err != nil {
+							return fmt.Errorf("update Sentinel quorum: %w", err)
+						}
+					}
+					return setSentinelMasterAuth(ctx, client, masterGroupName, master.Password)
+				case "yes":
+					// Preserve the existing explicit IP-to-hostname migration path.
+				default:
+					return errors.New("sentinel announcement mode is unavailable; existing monitor preserved")
+				}
+			}
 		}
 	}
 
@@ -392,6 +417,19 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 		return &SentinelMonitorMutationError{Stage: "authenticate new monitor", Err: err}
 	}
 	return nil
+}
+
+func sentinelAddressMatches(reported string, resolved []string) bool {
+	address := net.ParseIP(reported)
+	if address == nil {
+		return false
+	}
+	for _, candidate := range resolved {
+		if address.Equal(net.ParseIP(candidate)) {
+			return true
+		}
+	}
+	return false
 }
 
 // Reconcile credentials even when the monitored address is unchanged. Empty

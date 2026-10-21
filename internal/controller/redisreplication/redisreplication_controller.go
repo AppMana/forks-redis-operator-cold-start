@@ -476,6 +476,14 @@ func (r *Reconciler) configureSentinelPod(
 			return err
 		}
 	}
+	// Redis uses this setting for both MASTER replies and persisted monitor
+	// addresses. Enable the requested hostname mode before migration so a
+	// resolved IP match cannot hide a legacy IP-only monitor.
+	if announce == "yes" {
+		if err := sentinelService.SentinelConfigSet(ctx, "announce-hostnames", announce); err != nil {
+			return err
+		}
+	}
 
 	masterConnInfo := &redis.ConnectionInfo{
 		Host:     masterAddr,
@@ -491,8 +499,10 @@ func (r *Reconciler) configureSentinelPod(
 	); err != nil {
 		return err
 	}
-	if err := sentinelService.SentinelConfigSet(ctx, "announce-hostnames", announce); err != nil {
-		return err
+	if announce != "yes" {
+		if err := sentinelService.SentinelConfigSet(ctx, "announce-hostnames", announce); err != nil {
+			return err
+		}
 	}
 	// When disabling hostname mode, first move the monitor back to an IP and
 	// stop hostname announcements, then disable resolution.
