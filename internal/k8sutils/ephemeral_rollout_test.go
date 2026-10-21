@@ -119,7 +119,30 @@ func TestPersistentRedisStateMount(t *testing.T) {
 			if tc.shadow {
 				sts.Spec.Template.Spec.Volumes = []corev1.Volume{{Name: "state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
 			}
-			require.Equal(t, tc.want, hasPersistentRedisStateMount(sts))
+			require.Equal(t, tc.want, persistentRedisStateMount(sts) != "")
+		})
+	}
+}
+
+func TestRolloutGuardRequiresSamePersistentState(t *testing.T) {
+	for _, change := range []string{"claim", "subpath", "expression"} {
+		t.Run(change, func(t *testing.T) {
+			stored := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "redis", OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: "RedisReplication", UID: "owner"}}}}
+			stored.Spec.Template.Spec.Volumes = []corev1.Volume{{Name: "data", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "original"}}}}
+			stored.Spec.Template.Spec.Containers = []corev1.Container{{Name: "redis", VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}}}
+			desired := stored.DeepCopy()
+			switch change {
+			case "claim":
+				desired.Spec.Template.Spec.Volumes[0].PersistentVolumeClaim.ClaimName = "empty-replacement"
+			case "subpath":
+				desired.Spec.Template.Spec.Containers[0].VolumeMounts[0].SubPath = "empty-replacement"
+			default:
+				desired.Spec.Template.Spec.Containers[0].VolumeMounts[0].SubPathExpr = "$(STATE_DIR)"
+			}
+			changes := []byte(`{"spec":{"template":{"spec":{"volumes":[]}}}}`)
+			require.ErrorContains(t, guardEphemeralRollout(stored, desired, changes, false), "OnDelete")
+			desired.Spec.UpdateStrategy.Type = appsv1.OnDeleteStatefulSetStrategyType
+			require.NoError(t, guardEphemeralRollout(stored, desired, changes, false))
 		})
 	}
 }

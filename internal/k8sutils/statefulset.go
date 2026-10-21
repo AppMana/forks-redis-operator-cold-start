@@ -280,7 +280,7 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 // Do not let an operator template upgrade automatically replace those pods.
 // OnDelete stages the desired template for an explicitly coordinated migration.
 func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, recreate bool) error {
-	if hasPersistentRedisStateMount(stored) && hasPersistentRedisStateMount(desired) {
+	if state := persistentRedisStateMount(stored); state != "" && state == persistentRedisStateMount(desired) {
 		return nil
 	}
 	managed := false
@@ -309,7 +309,9 @@ func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, 
 
 // A config or sidecar claim is not evidence that the Redis dataset survives
 // pod replacement. Inspect the main container's writable state mount instead.
-func hasPersistentRedisStateMount(sts *appsv1.StatefulSet) bool {
+// Keep the backing claim and subdirectory in the identity: switching to another
+// persistent but empty location is not a data-preserving automatic rollout.
+func persistentRedisStateMount(sts *appsv1.StatefulSet) string {
 	statePath := "/data"
 	if sts.Spec.Template.Labels["redis_setup_type"] == "sentinel" {
 		statePath = "/etc/redis"
@@ -319,25 +321,29 @@ func hasPersistentRedisStateMount(sts *appsv1.StatefulSet) bool {
 			statePath = "/etc/redis"
 		}
 	}
-	claims := map[string]bool{}
+	claims := map[string]string{}
 	for _, claim := range sts.Spec.VolumeClaimTemplates {
-		claims[claim.Name] = true
+		claims[claim.Name] = "template:" + claim.Name
 	}
 	for _, volume := range sts.Spec.Template.Spec.Volumes {
-		claims[volume.Name] = volume.PersistentVolumeClaim != nil &&
-			volume.PersistentVolumeClaim.ClaimName != "" && !volume.PersistentVolumeClaim.ReadOnly
+		claims[volume.Name] = ""
+		if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName != "" && !volume.PersistentVolumeClaim.ReadOnly {
+			claims[volume.Name] = "claim:" + volume.PersistentVolumeClaim.ClaimName
+		}
 	}
 	for _, container := range sts.Spec.Template.Spec.Containers {
 		if container.Name != sts.Name {
 			continue
 		}
 		for _, mount := range container.VolumeMounts {
-			if mount.MountPath == statePath && !mount.ReadOnly && claims[mount.Name] {
-				return true
+			// An expression can resolve differently after an environment change.
+			// Require an explicit hold when its stable backing path is unknown.
+			if mount.MountPath == statePath && !mount.ReadOnly && mount.SubPathExpr == "" && claims[mount.Name] != "" {
+				return fmt.Sprintf("%q/%q/%q/%q", statePath, claims[mount.Name], mount.SubPath, mount.SubPathExpr)
 			}
 		}
 	}
-	return false
+	return ""
 }
 
 // syncManagedFields syncs system-managed fields from the stored object to the new object.
