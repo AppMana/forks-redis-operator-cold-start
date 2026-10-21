@@ -489,7 +489,23 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 						}
 					}
 				}
-				return service.SentinelMonitor(ctx, masterConnInfo, rs.Spec.RedisSentinelConfig.MasterGroupName, rs.Spec.RedisSentinelConfig.Quorum)
+				if err := service.SentinelMonitor(ctx, masterConnInfo, rs.Spec.RedisSentinelConfig.MasterGroupName, rs.Spec.RedisSentinelConfig.Quorum); err != nil {
+					return err
+				}
+				// Keep resolution available until the retained hostname monitor
+				// has safely moved to its desired address. A failed MONITOR must
+				// never leave the old monitor with its resolver disabled.
+				for _, setting := range []struct{ key, value string }{
+					{"announce-hostnames", rs.Spec.RedisSentinelConfig.AnnounceHostnames},
+					{"resolve-hostnames", rs.Spec.RedisSentinelConfig.ResolveHostnames},
+				} {
+					if setting.value == "no" {
+						if err := service.SentinelConfigSet(ctx, setting.key, setting.value); err != nil {
+							return fmt.Errorf("disable Sentinel %s after monitor migration: %w", setting.key, err)
+						}
+					}
+				}
+				return nil
 			},
 		})
 	}

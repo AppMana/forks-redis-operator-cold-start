@@ -645,6 +645,37 @@ func TestExternalSentinelPreservesMonitorOnHostnameConfigFailure(t *testing.T) {
 	require.Empty(t, remote.monitorHosts)
 }
 
+func TestExternalSentinelDisablesHostnameSettingsAfterMonitor(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "no"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "no"
+	remote := &fakeRedisClient{}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.NoError(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"))
+	require.Equal(t, []string{"monitor", "announce-hostnames=no", "resolve-hostnames=no"}, remote.monitorConfigOrder)
+}
+
+func TestExternalSentinelDoesNotDisableResolverAfterFailedMonitor(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "no"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "no"
+	remote := &fakeRedisClient{errByHost: map[string]error{"10.0.1.10": errors.New("monitor failed")}}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorContains(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"), "monitor failed")
+	require.Equal(t, []string{"monitor"}, remote.monitorConfigOrder)
+}
+
+func TestExternalSentinelStopsPeersAfterDisableFailure(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "no"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "no"
+	remote := &fakeRedisClient{configErr: errors.New("configuration rejected")}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorContains(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"), "configuration rejected")
+	require.Equal(t, []string{"10.0.1.10"}, remote.monitorHosts)
+	require.Equal(t, []string{"monitor", "announce-hostnames=no"}, remote.monitorConfigOrder)
+}
+
 func TestSentinelMonitorPreservesPeersWhenInventoryIsUnready(t *testing.T) {
 	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
 	labels := map[string]string{"app": rs.GetStatefulSetName()}
