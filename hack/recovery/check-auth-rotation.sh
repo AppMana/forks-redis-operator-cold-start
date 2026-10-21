@@ -28,6 +28,7 @@ for ordinal in 0 1 2; do
   [[ "$(cli redis-auth "$pod" upgrade GET appmana:rotation:retained)" == preserved-auth-rotation-20261020 ]]
 done
 [[ -n "$primary" ]]
+[[ "$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')" == "$primary" ]]
 [[ -z "${PREVIOUS_PRIMARY:-}" || "$primary" != "$PREVIOUS_PRIMARY" ]]
 for ordinal in 0 1 2; do
   pod="upgrade-s-$ordinal"

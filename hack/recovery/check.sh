@@ -34,6 +34,7 @@ for ordinal in 0 1 2; do
   [[ "$(cli "$pod" -n 1 GET appmana:upgrade:secondary-database)" == "$expected" ]]
 done
 [[ -n "$primary" ]]
+[[ "$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')" == "$primary" ]]
 for ordinal in 0 1 2; do
   pod="$sentinel_prefix-$ordinal"
   [[ "$(cli "$pod" -p 26379 SENTINEL CKQUORUM "$master_group")" == OK* ]]
