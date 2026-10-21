@@ -244,14 +244,33 @@ func sentinelHostnameSettings(ctx context.Context, ctrlClient client.Client, cr 
 		log.FromContext(ctx).Error(err, "failed to list RedisSentinel, assuming hostnames are disabled")
 		return "no", "no"
 	}
-	for i := range sentinels.Items {
-		cfg := sentinels.Items[i].Spec.RedisSentinelConfig
-		if cfg == nil || cfg.RedisReplicationName != cr.Name {
+	return externalSentinelHostnameSettings(sentinels.Items, cr.Name)
+}
+
+func externalSentinelHostnameSettings(sentinels []rsvb2.RedisSentinel, replicationName string) (string, string) {
+	resolve, announce := "no", "no"
+	allResolve := true
+	for i := range sentinels {
+		cfg := sentinels[i].Spec.RedisSentinelConfig
+		if cfg == nil || cfg.RedisReplicationName != replicationName {
 			continue
 		}
-		return sentinelHostnameFlag(cfg.ResolveHostnames), sentinelHostnameFlag(cfg.AnnounceHostnames)
+		if sentinelHostnameFlag(cfg.ResolveHostnames) == "yes" {
+			resolve = "yes"
+		} else {
+			allResolve = false
+		}
+		if sentinelHostnameFlag(cfg.AnnounceHostnames) == "yes" {
+			announce = "yes"
+		}
 	}
-	return "no", "no"
+	// Kubernetes list order is not stable. Aggregate every managing group so
+	// reconciles cannot oscillate the pod template and continuously roll Redis.
+	// A hostname announcement is safe only if every group can resolve it.
+	if !allResolve {
+		announce = "no"
+	}
+	return resolve, announce
 }
 
 // generateRedisReplicationInitContainerParams generates Redis Replication initcontainer information
