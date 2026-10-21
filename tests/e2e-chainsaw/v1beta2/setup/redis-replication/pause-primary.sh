@@ -22,7 +22,11 @@ role() {
 paused=false
 resume() {
   if [ "$paused" = true ]; then
-    if docker exec "$node" ctr -n k8s.io tasks list -q | grep -Fxq "$task"; then
+    if ! tasks=$(docker exec "$node" ctr -n k8s.io tasks list -q); then
+      echo 'FAIL: cannot observe task inventory during resume; watchdog remains armed' >&2
+      return 1
+    fi
+    if printf '%s\n' "$tasks" | grep -Fxq "$task"; then
       docker exec "$node" ctr -n k8s.io tasks resume "$task"
     fi
   fi
