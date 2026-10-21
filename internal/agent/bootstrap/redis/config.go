@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 
 	agentutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/agent/util"
@@ -256,20 +255,12 @@ func validateACLDefaultUser(path, password string) error {
 	sum := sha256.Sum256([]byte(password))
 	hash := "#" + hex.EncodeToString(sum[:])
 	for _, line := range strings.Split(string(raw), "\n") {
-		rules := strings.Fields(line)
+		// External ACL files use literal space delimiters, unlike redis.conf:
+		// quotes and embedded tabs are literal bytes, not shell syntax.
+		// Match ACLLoadFromFile rather than silently bypassing quoted lines.
+		rules := strings.Split(strings.Trim(line, " \t\r\n"), " ")
 		if len(rules) < 2 || rules[0] != "user" || rules[1] != "default" {
 			continue
-		}
-		if strings.ContainsAny(line, `"'`) {
-			// Preserve the existing quoted-rule handling until Redis-compatible
-			// tokenization is available; Fields cannot evaluate these rules.
-			if !slices.Contains(rules, "on") || slices.ContainsFunc(rules, func(r string) bool {
-				return r == "off" || r == "nopass" || r == "reset" || r == "resetpass" || r[0] == '<' || r[0] == '!'
-			}) {
-				return fmt.Errorf("ACL file %s must define the default user as on with a password; the operator authenticates as default with the redisSecret password", path)
-			}
-			log.Printf("Warning: ACL file %s defines the default user with quoted arguments; skipping password comparison", path)
-			return nil
 		}
 		// Redis applies ACL rules left-to-right, including resets and removal
 		// of old rotation credentials. Evaluate final authentication state,
@@ -277,6 +268,9 @@ func validateACLDefaultUser(path, password string) error {
 		enabled, nopass := false, false
 		passwords := make(map[string]bool)
 		for _, rule := range rules[2:] {
+			if rule == "" {
+				continue
+			}
 			switch strings.ToLower(rule) {
 			case "on":
 				enabled = true
