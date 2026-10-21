@@ -55,6 +55,10 @@ func NewHealer(clientset kubernetes.Interface) Healer {
 	}
 }
 
+// UnsafeMasterRole marks a confirmed empty primary whose peers retain data or
+// cannot be checked. It must lose its label, even without a replacement winner.
+const UnsafeMasterRole = "unsafe-master"
+
 // PublishReplicationRoleLabels makes master the only pod the writable Service
 // selects. roles holds the role each pod reported in the caller's observation
 // (pods that did not answer are absent), and master is the pod the caller
@@ -93,7 +97,11 @@ func (h *healer) PublishReplicationRoleLabels(ctx context.Context, ns string, la
 			reachable: reachable,
 			isMaster:  role == "master",
 		}
+		unsafe := role == UnsafeMasterRole
 		role, remove := desiredReplicationRoleLabel(observation, master, current)
+		if unsafe {
+			role, remove = "", true
+		}
 		var patch []byte
 		switch {
 		case remove && labelled:

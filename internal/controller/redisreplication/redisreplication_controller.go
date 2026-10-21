@@ -667,6 +667,15 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	slices.Sort(slaveNodes)
 
 	realMaster := r.electedMaster(ctx, instance, masterNodes, slaveNodes)
+	if realMaster != "" {
+		publishable, rejectEmpty := r.masterDataSafeForPublication(ctx, instance, realMaster)
+		if !publishable {
+			if rejectEmpty {
+				roles[realMaster] = redishealer.UnsafeMasterRole
+			}
+			realMaster = ""
+		}
+	}
 	// A partial or cold-start view cannot disprove the last recorded primary.
 	// Preserve it for the existing conservative bootstrap recovery policy.
 	if realMaster != "" {

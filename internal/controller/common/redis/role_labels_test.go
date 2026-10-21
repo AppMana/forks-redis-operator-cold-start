@@ -43,6 +43,14 @@ func roleLabels(t *testing.T, k8s *fake.Clientset) map[string]string {
 	return roles
 }
 
+func TestEmptyUnsafeMasterLosesExistingLabelWithoutReplacement(t *testing.T) {
+	k8s := fake.NewSimpleClientset(replicationPod("redis-repl-0", "10.0.0.10", "master", false))
+	h := NewHealer(k8s)
+	require.NoError(t, h.PublishReplicationRoleLabels(context.Background(), "team-a", map[string]string{"app": "redis-repl"},
+		map[string]string{"redis-repl-0": UnsafeMasterRole}, ""))
+	require.Empty(t, roleLabels(t, k8s)["redis-repl-0"])
+}
+
 func TestPublishReplicationRoleLabelsWithdrawsBeforePublishing(t *testing.T) {
 	for _, failWithdrawal := range []bool{false, true} {
 		t.Run(fmt.Sprint(failWithdrawal), func(t *testing.T) {

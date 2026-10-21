@@ -573,6 +573,7 @@ func TestReconcileStatusUpdatesMasterWhenANewMasterIsObserved(t *testing.T) {
 		},
 	}
 
+	r.Checker = keyCountsOf(map[string]int64{"example-replication-1": 120})
 	result, err := r.reconcileStatus(context.Background(), instance)
 
 	require.NoError(t, err)
@@ -612,6 +613,7 @@ func TestReconcileStatusUpdatesMasterWhenANewMasterWithAttachedReplicasIsObserve
 		},
 	}
 
+	r.Checker = keyCountsOf(map[string]int64{"example-replication-1": 120})
 	result, err := r.reconcileStatus(context.Background(), instance)
 
 	require.NoError(t, err)
@@ -716,6 +718,7 @@ func TestReconcileStatusRecordsPromotedMasterReportedBySentinel(t *testing.T) {
 		SentinelMonitoredMaster: sentinelMonitoring("example-replication-1"),
 	}
 
+	r.Checker = keyCountsOf(map[string]int64{"example-replication-1": 120})
 	result, err := r.reconcileStatus(context.Background(), instance)
 
 	require.NoError(t, err)
