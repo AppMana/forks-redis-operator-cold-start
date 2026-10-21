@@ -78,7 +78,7 @@ rules="$(net -S)"
 trap - EXIT
 for attempt in {1..60}; do
   if timeout 20s bash "$dir/check.sh" "$config" "$expected" 2>/dev/null; then
-    echo 'PASS: asymmetric Sentinel partition recovered without reversing election or losing test data'
+    echo 'PASS: asymmetric Sentinel partition recovered without reversing election; two retained baseline keys verified (not a concurrent-write durability assertion)'
     exit 0
   fi
   sleep 2

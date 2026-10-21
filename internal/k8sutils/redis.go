@@ -1254,7 +1254,7 @@ func CreateMasterSlaveReplication(ctx context.Context, client kubernetes.Interfa
 			redisClient := configureRedisReplicationClient(ctx, client, cr, masterPods[i])
 			defer redisClient.Close()
 			log.FromContext(ctx).V(1).Info("Setting the", "pod", masterPods[i], "to slave of", realMasterPod, "masterAddr", realMasterAddr)
-			err := redisClient.SlaveOf(ctx, realMasterAddr, "6379").Err()
+			err := reconfigureReplicationClient(ctx, redisClient, realMasterAddr)
 			if err != nil {
 				log.FromContext(ctx).Error(err, "Failed to set", "pod", masterPods[i], "to slave of", realMasterPod, "masterAddr", realMasterAddr)
 				return err
@@ -1263,6 +1263,47 @@ func CreateMasterSlaveReplication(ctx context.Context, client kubernetes.Interfa
 	}
 
 	return nil
+}
+
+func reconfigureReplicationClient(ctx context.Context, redisClient *redis.Client, masterAddr string) error {
+	info, err := redisClient.Info(ctx, "Replication").Result()
+	if err != nil {
+		return err
+	}
+	role, err := parseReplicationRole(info)
+	if err != nil {
+		return err
+	}
+	if role == "slave" {
+		fields := map[string]string{}
+		for _, line := range strings.Split(strings.ReplaceAll(info, "\r\n", "\n"), "\n") {
+			key, value, found := strings.Cut(line, ":")
+			if !found || (key != "master_host" && key != "master_port") {
+				continue
+			}
+			if _, exists := fields[key]; exists {
+				return errors.New("ambiguous replication upstream")
+			}
+			fields[key] = value
+		}
+		if fields["master_host"] == "" || fields["master_port"] == "" {
+			return errors.New("missing replication upstream")
+		}
+		if fields["master_host"] == masterAddr && fields["master_port"] == "6379" {
+			return nil
+		}
+	}
+	// Match Sentinel's client-reconfiguration contract. Merely issuing
+	// SLAVEOF leaves read-only clients pinned to the old primary indefinitely.
+	// Queue both commands in one transaction so a role change is not separated
+	// from reconnecting normal clients by a client-side network interruption.
+	// Do not disconnect replication links, pubsub clients, or this connection.
+	_, err = redisClient.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.SlaveOf(ctx, masterAddr, "6379")
+		pipe.ClientKillByFilter(ctx, "TYPE", "normal", "SKIPME", "yes")
+		return nil
+	})
+	return err
 }
 
 func GetRedisReplicationRealMaster(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string) string {
