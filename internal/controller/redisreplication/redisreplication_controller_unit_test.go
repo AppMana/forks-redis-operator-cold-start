@@ -982,6 +982,16 @@ func TestQuerySentinelMonitoredMaster(t *testing.T) {
 			want: "",
 		},
 		{
+			name:       "wrong-port votes cannot manufacture a recovery quorum",
+			candidates: []string{pod1},
+			sentinelInfo: map[string]*redis.InfoSentinelResult{
+				"10.0.1.10": sentinelInfoMonitoring("10.0.0.11:6379"),
+				"10.0.1.11": sentinelInfoMonitoring("10.0.0.11:6380"),
+				"10.0.1.12": sentinelInfoMonitoring("10.0.0.11"),
+			},
+			want: "",
+		},
+		{
 			name:       "a quorum reports the candidate by hostname",
 			candidates: []string{pod1},
 			sentinelInfo: map[string]*redis.InfoSentinelResult{
@@ -1089,13 +1099,25 @@ func TestQuerySentinelMonitoredMasterFailsWhenACandidateCannotBeFetched(t *testi
 	assert.ErrorContains(t, err, "example-replication-1")
 }
 
+func TestSentinelReportedMasterRejectsWrongEndpoint(t *testing.T) {
+	for _, address := range []string{
+		"10.0.0.11:6380", "10.0.0.11", "10.0.0.11:",
+		"10.0.0.11:not-a-port", "fd00::11:6380", "[fd00::11]:6380",
+	} {
+		t.Run(address, func(t *testing.T) {
+			assert.Empty(t, sentinelReportedMasterHost(sentinelInfoMonitoring(address)),
+				"a matching host alone cannot authorize recovery of a different Redis endpoint")
+		})
+	}
+}
+
 func TestSentinelAddressHost(t *testing.T) {
 	tests := map[string]string{
 		"10.0.0.11:6379":  "10.0.0.11",
 		"fd00::11:6379":   "fd00::11",
 		"[fd00::11]:6379": "fd00::11",
 		"example-replication-1.example-replication-headless.default.svc.cluster.local:6379": "example-replication-1.example-replication-headless.default.svc.cluster.local",
-		"10.0.0.11": "10.0.0.11",
+		"10.0.0.11": "",
 	}
 	for address, want := range tests {
 		assert.Equal(t, want, sentinelAddressHost(address), address)

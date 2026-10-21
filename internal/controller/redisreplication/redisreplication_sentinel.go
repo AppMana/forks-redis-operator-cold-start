@@ -344,13 +344,21 @@ func sentinelReportedMasterHost(info *redis.InfoSentinelResult) string {
 }
 
 func sentinelAddressHost(address string) string {
-	if host, _, err := net.SplitHostPort(address); err == nil {
+	if host, port, err := net.SplitHostPort(address); err == nil {
+		if port != "6379" {
+			return ""
+		}
 		return host
 	}
-	if i := strings.LastIndex(address, ":"); i >= 0 {
-		return strings.Trim(address[:i], "[]")
+	// INFO sentinel renders IPv6 without brackets. Accept that wire format,
+	// but never discard an absent or different port when counting a vote.
+	if i := strings.LastIndex(address, ":"); i >= 0 && address[i+1:] == "6379" {
+		host := address[:i]
+		if net.ParseIP(host) != nil {
+			return host
+		}
 	}
-	return address
+	return ""
 }
 
 func (r *Reconciler) sentinelPassword(ctx context.Context, inst *rrvb2.RedisReplication) (string, error) {
