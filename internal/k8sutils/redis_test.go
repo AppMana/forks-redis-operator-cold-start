@@ -1171,6 +1171,10 @@ func Test_checkRedisServerRole(t *testing.T) {
 		shouldFail     bool
 		expectedResult string
 	}{
+		{name: "unknown role", podName: "pod", infoReturn: "role:unknown\r\n", shouldFail: true},
+		{name: "duplicate role", podName: "pod", infoReturn: "role:master\r\nrole:slave\r\n", shouldFail: true},
+		{name: "identical duplicate", podName: "pod", infoReturn: "role:master\r\nrole:master\r\n", shouldFail: true},
+		{name: "LF replica", podName: "pod", infoReturn: "# Replication\nrole:slave\n", expectedResult: "slave"},
 		{
 			name:    "redis master role",
 			podName: "pod1",
@@ -1241,12 +1245,11 @@ func Test_checkRedisServerRole(t *testing.T) {
 			}
 
 			role, err := checkRedisServerRole(ctx, client, tt.podName)
-			if err != nil {
-				assert.Error(t, err)
-			}
 			if tt.shouldFail {
+				assert.Error(t, err)
 				assert.Empty(t, role, "Test case: "+tt.name)
 			} else {
+				assert.NoError(t, err)
 				assert.Equal(t, tt.expectedResult, role, "Test case: "+tt.name)
 			}
 			if err := mock.ExpectationsWereMet(); err != nil {

@@ -1147,23 +1147,35 @@ func observeRedisReplicationRoles(ctx context.Context, cl kubernetes.Interface, 
 	return roles, nil
 }
 
-// Check the Redis Server Role i.e. master, slave and sentinel
+// Observe a data-server role. Unknown observations must not enter Service labels
+// or be considered a complete replication topology.
 func checkRedisServerRole(ctx context.Context, redisClient *redis.Client, podName string) (string, error) {
 	info, err := redisClient.Info(ctx, "Replication").Result()
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to Get the role Info of the", "redis pod", podName)
-		return "", err
+		return "", fmt.Errorf("cannot observe Redis role for pod %s", podName)
 	}
-	lines := strings.Split(info, "\r\n")
+	return parseReplicationRole(info)
+}
+
+// Shared by cluster and replication discovery so both reject incomplete or
+// contradictory INFO replies. Never include untrusted response text in errors.
+func parseReplicationRole(info string) (string, error) {
+	lines := strings.Split(strings.ReplaceAll(info, "\r\n", "\n"), "\n")
+	var role string
+	seen := false
 	for _, line := range lines {
 		if strings.HasPrefix(line, "role:") {
-			role := strings.TrimPrefix(line, "role:")
-			log.FromContext(ctx).V(1).Info("Role of the Redis Pod", "pod", podName, "role", role)
-			return role, nil
+			if seen {
+				return "", fmt.Errorf("redis role observation is ambiguous")
+			}
+			seen = true
+			role = strings.TrimPrefix(line, "role:")
 		}
 	}
-	log.FromContext(ctx).Error(err, "Failed to find role from Info # Replication in", "redis pod", podName)
-	return "", err
+	if role != "master" && role != "slave" {
+		return "", fmt.Errorf("redis role observation is missing or unknown")
+	}
+	return role, nil
 }
 
 func checkRedisOffset(ctx context.Context, redisClient *redis.Client, podName string) (int64, error) {

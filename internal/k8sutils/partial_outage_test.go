@@ -39,9 +39,13 @@ func TestPartialOutageRoleObservation(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		pending bool
+		reply   string
 	}{
 		{name: "pending replica", pending: true},
 		{name: "unreachable replica"},
+		{name: "missing role", reply: "connected_slaves:0\r\n"},
+		{name: "unknown role", reply: "role:unknown\r\n"},
+		{name: "contradictory role", reply: "role:master\r\nrole:slave\r\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cr, k8s := partialOutageReplication(tc.pending)
@@ -60,7 +64,11 @@ func TestPartialOutageRoleObservation(t *testing.T) {
 				case 1:
 					m.ExpectInfo("Replication").SetVal("role:slave\r\n")
 				default:
-					m.ExpectInfo("Replication").SetErr(errors.New("replica unreachable"))
+					if tc.reply != "" {
+						m.ExpectInfo("Replication").SetVal(tc.reply)
+					} else {
+						m.ExpectInfo("Replication").SetErr(errors.New("replica unreachable"))
+					}
 				}
 			}
 			roles, err := observeRedisReplicationRoles(context.Background(), k8s, cr, func(name string) *redis.Client {
@@ -85,6 +93,35 @@ func TestPartialOutageRoleObservation(t *testing.T) {
 		require.False(t, topology.Complete())
 		require.Empty(t, topology.Masters)
 	})
+}
+
+func TestContradictoryRoleCannotCompleteTopology(t *testing.T) {
+	cr, kube := partialOutageReplication(false)
+	pods, err := kube.CoreV1().Pods(cr.Namespace).List(context.Background(), metav1.ListOptions{})
+	require.NoError(t, err)
+	for _, pod := range pods.Items {
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		_, err := kube.CoreV1().Pods(cr.Namespace).UpdateStatus(context.Background(), &pod, metav1.UpdateOptions{})
+		require.NoError(t, err)
+	}
+	topology, err := getRedisReplicationTopology(context.Background(), kube, cr, func(ctx context.Context, pod *corev1.Pod) (string, error) {
+		c, m := redismock.NewClientMock()
+		defer c.Close()
+		t.Cleanup(func() { require.NoError(t, m.ExpectationsWereMet()) })
+		response := map[string]string{
+			"redis-test-0": "role:master\r\n",
+			"redis-test-1": "role:slave\r\n",
+			"redis-test-2": "role:master\r\nrole:slave\r\n",
+		}[pod.Name]
+		m.ExpectInfo("Replication").SetVal(response)
+		return checkRedisServerRole(ctx, c, pod.Name)
+	})
+	require.NoError(t, err)
+	require.False(t, topology.Complete(), "ambiguous replica must block topology mutation")
+	require.Equal(t, []string{"redis-test-0"}, topology.Masters)
+	require.Equal(t, []string{"redis-test-1"}, topology.Slaves)
+	require.Equal(t, []string{"redis-test-2"}, topology.Unobserved)
 }
 
 // A hung or partitioned old primary accepts TCP but never answers. Its probe

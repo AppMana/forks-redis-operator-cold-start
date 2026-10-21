@@ -643,22 +643,8 @@ func verifyLeaderPodInfo(ctx context.Context, redisClient *redis.Client, podName
 		return false, fmt.Errorf("cannot observe Redis role for pod %s", podName)
 	}
 
-	lines := strings.Split(strings.ReplaceAll(info, "\r\n", "\n"), "\n")
-	var role string
-	seen := false
-	for _, line := range lines {
-		if strings.HasPrefix(line, "role:") {
-			if seen {
-				return false, fmt.Errorf("redis role observation is ambiguous")
-			}
-			seen = true
-			role = strings.TrimPrefix(line, "role:")
-		}
-	}
-	if role != "master" && role != "slave" {
-		return false, fmt.Errorf("redis role observation is missing or unknown")
-	}
-	return role == "master", nil
+	role, err := parseReplicationRole(info)
+	return role == "master", err
 }
 
 func ClusterFailover(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32) error {
