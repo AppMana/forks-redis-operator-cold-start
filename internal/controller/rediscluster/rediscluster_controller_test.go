@@ -218,6 +218,23 @@ var _ = Describe("Redis Cluster Controller", func() {
 				ReadyFollowerReplicas: 3,
 			}))
 
+			By("recovering bootstrap state when ready counts were recorded before readiness converged")
+			Eventually(func() error {
+				rc := &rcvb2.RedisCluster{}
+				if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: degradedName, Namespace: ns}, rc); err != nil {
+					return err
+				}
+				rc.Status.State = rcvb2.RedisClusterInitializing
+				rc.Status.Reason = rcvb2.InitializingClusterFollowerReason
+				return k8sClient.Status().Update(context.Background(), rc)
+			}, timeout, interval).Should(Succeed())
+			Eventually(getClusterStatus, timeout, interval).Should(Equal(rcvb2.RedisClusterStatus{
+				State:                 rcvb2.RedisClusterBootstrap,
+				Reason:                rcvb2.BootstrapClusterReason,
+				ReadyLeaderReplicas:   3,
+				ReadyFollowerReplicas: 3,
+			}))
+
 			By("simulating a cluster that has reached the Ready state")
 			Eventually(func() error {
 				rc := &rcvb2.RedisCluster{}

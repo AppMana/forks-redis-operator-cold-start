@@ -251,8 +251,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return intctrlutil.RequeueAfter(ctx, time.Second*10, "StatefulSet is not ready yet")
 	}
 
-	// Mark the cluster status as bootstrapping if all the leader and follower nodes are ready
-	if instance.Status.ReadyLeaderReplicas != leaderReplicas || instance.Status.ReadyFollowerReplicas != followerReplicas {
+	// Ready counts can already match while the StatefulSet rollout is still
+	// initializing. Once readiness converges, advance the state independently
+	// of those counts, without regressing an already Ready cluster.
+	if instance.Status.State == rcvb2.RedisClusterInitializing ||
+		instance.Status.ReadyLeaderReplicas != leaderReplicas || instance.Status.ReadyFollowerReplicas != followerReplicas {
 		requeue, err := r.updateStatus(ctx, instance, rcvb2.RedisClusterStatus{
 			State:                 rcvb2.RedisClusterBootstrap,
 			Reason:                rcvb2.BootstrapClusterReason,
