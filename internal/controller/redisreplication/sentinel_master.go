@@ -99,6 +99,13 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 	if len(groups) == 0 {
 		return "", false
 	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(rr.Namespace), client.MatchingLabels(
+		common.GetRedisLabels(rr.Name, common.SetupTypeReplication, "replication", nil),
+	)); err != nil {
+		logger.Error(err, "list Redis pods")
+		return "", true
+	}
 	checker := redishealer.NewChecker(r.K8sClient)
 	redisClient := redis.NewClient()
 	elected := ""
@@ -136,7 +143,7 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 				}
 				answer := ""
 				if monitored {
-					answer = net.JoinHostPort(host, port)
+					answer = canonicalSentinelAddress(pods.Items, net.JoinHostPort(host, port))
 				}
 				mu.Lock()
 				answers = append(answers, answer)
@@ -162,13 +169,6 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 		return "", false
 	}
 
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(rr.Namespace), client.MatchingLabels(
-		common.GetRedisLabels(rr.Name, common.SetupTypeReplication, "replication", nil),
-	)); err != nil {
-		logger.Error(err, "list Redis pods")
-		return "", true
-	}
 	return podForAddress(pods.Items, elected), true
 }
 
@@ -187,6 +187,20 @@ func sentinelsUnconfigured(answers []string, size int32) bool {
 		}
 	}
 	return true
+}
+
+func canonicalSentinelAddress(pods []corev1.Pod, addr string) string {
+	// Normalize only exact aliases validated against the current namespace's
+	// live pods. Never resolve arbitrary DNS or conflate different ports.
+	name := podForAddress(pods, addr)
+	if name != "" {
+		for _, pod := range pods {
+			if pod.Name == name {
+				return net.JoinHostPort(pod.Status.PodIP, "6379")
+			}
+		}
+	}
+	return addr
 }
 
 // majorityAddress returns the address that more than half of a Sentinel

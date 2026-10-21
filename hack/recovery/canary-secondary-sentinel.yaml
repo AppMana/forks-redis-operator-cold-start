@@ -1,0 +1,22 @@
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisSentinel
+metadata:
+  name: secondary
+  namespace: redis-upgrade-canary-quorum-bootstrap
+spec:
+  clusterSize: 1
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+  redisSentinelConfig:
+    redisReplicationName: upgrade
+    masterGroupName: upgrade-secondary
+    resolveHostnames: "no"
+    announceHostnames: "no"
+    quorum: "1"
+  kubernetesConfig:
+    image: quay.io/opstree/redis-sentinel:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits: {memory: 128Mi}
