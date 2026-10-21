@@ -53,10 +53,13 @@ func TestPodForAddress(t *testing.T) {
 	now := metav1.Now()
 	pods := []corev1.Pod{
 		{ObjectMeta: metav1.ObjectMeta{Name: "redis-repl-1", DeletionTimestamp: &now}, Status: corev1.PodStatus{PodIP: "10.0.0.11"}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "redis-repl-2"}, Status: corev1.PodStatus{PodIP: "10.0.0.12"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "redis-repl-2", Namespace: "team-a"}, Status: corev1.PodStatus{PodIP: "10.0.0.12"}},
 	}
 	require.Equal(t, "redis-repl-2", podForAddress(pods, "10.0.0.12:6379"))
 	require.Equal(t, "redis-repl-2", podForAddress(pods, "redis-repl-2.redis-repl-headless.team-a.svc.cluster.local:6379"))
+	require.Empty(t, podForAddress(pods, "redis-repl-2.redis-repl-headless.team-b.svc.cluster.local:6379"))
+	require.Empty(t, podForAddress(pods, "redis-repl-2.unrelated.example:6379"))
+	require.Empty(t, podForAddress(pods, "10.0.0.12:26379"))
 	// The terminating old primary, or an address no pod holds, maps to nothing.
 	require.Equal(t, "", podForAddress(pods, "10.0.0.11:6379"))
 	require.Equal(t, "", podForAddress(pods, "10.0.0.99:6379"))

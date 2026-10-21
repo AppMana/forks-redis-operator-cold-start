@@ -13,6 +13,7 @@ import (
 	rsvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redissentinel/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
 	redishealer "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -181,15 +182,16 @@ func majorityAddress(answers []string, size int32) (string, bool) {
 // podForAddress maps a Sentinel master address (pod IP, or pod FQDN with
 // resolve-hostnames) to the live Redis pod that holds it.
 func podForAddress(pods []corev1.Pod, addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || port != "6379" {
 		return ""
 	}
 	for _, pod := range pods {
 		if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
 			continue
 		}
-		if pod.Status.PodIP == host || strings.HasPrefix(host, fmt.Sprintf("%s.", pod.Name)) {
+		fqdn := fmt.Sprintf("%s.%s.%s.svc.%s", pod.Name, common.GetHeadlessServiceNameFromPodName(pod.Name), pod.Namespace, envs.GetServiceDNSDomain())
+		if pod.Status.PodIP == host || strings.TrimSuffix(host, ".") == fqdn {
 			return pod.Name
 		}
 	}

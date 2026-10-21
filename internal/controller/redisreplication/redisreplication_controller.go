@@ -253,6 +253,17 @@ func (r *Reconciler) configureReplicationSentinel(ctx context.Context, instance 
 
 // Read PR description for context: https://github.com/OT-CONTAINER-KIT/redis-operator/pull/1843
 func (r *Reconciler) observedRedisReplicationMaster(ctx context.Context, instance *rrvb2.RedisReplication, topology k8sutils.RedisReplicationTopology) (string, bool) {
+	// External RedisSentinel resources elect primaries too. Replica attachment
+	// can lag an election, so it must not let the former primary overrule a
+	// Sentinel majority and reverse a failover.
+	if r.Client != nil || r.SentinelElectedMaster != nil {
+		if elected, ok := r.sentinelElectedMaster(ctx, instance); ok {
+			if slices.Contains(topology.Masters, elected) {
+				return elected, true
+			}
+			return "", false
+		}
+	}
 	switch len(topology.Masters) {
 	case 0:
 		return "", false
@@ -525,6 +536,11 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 	masterNodes, slaveNodes := topology.Masters, topology.Slaves
 	observedPods := topology.Observed()
 	incompleteTopology := !topology.Complete()
+	if r.Client != nil || r.SentinelElectedMaster != nil {
+		if elected, ok := r.sentinelElectedMaster(ctx, instance); ok && elected != "" && !slices.Contains(masterNodes, elected) {
+			return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "waiting for Sentinel-elected primary to report master")
+		}
+	}
 	realMaster, masterPositivelyIdentified := r.observedRedisReplicationMaster(ctx, instance, topology)
 	if !incompleteTopology && (len(masterNodes) == 0 || (len(masterNodes) > 1 && realMaster == "")) {
 		candidates := masterNodes
