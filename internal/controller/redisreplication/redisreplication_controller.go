@@ -416,6 +416,10 @@ func (r *Reconciler) configureSentinelPods(ctx context.Context, redisClient redi
 		if err := r.configureSentinelPod(ctx, redisClient, inst, pod, monitorAddr, masterPassword); err != nil {
 			log.FromContext(ctx).Error(err, "failed to configure sentinel pod", "pod", pod.Name)
 			failures = append(failures, fmt.Errorf("configure sentinel %s: %w", pod.Name, err))
+			var mutationErr *redis.SentinelMonitorMutationError
+			if errors.As(err, &mutationErr) {
+				return errors.Join(failures...)
+			}
 		}
 	}
 	return errors.Join(failures...)

@@ -178,3 +178,33 @@ func TestSentinelMonitorRejectsInvalidReplacementBeforeRedisAccess(t *testing.T)
 		})
 	}
 }
+
+func TestSentinelMonitorClassifiesUncertainMutation(t *testing.T) {
+	for _, stage := range []string{"remove", "monitor", "authenticate new monitor"} {
+		t.Run(stage, func(t *testing.T) {
+			db, mock := redismock.NewClientMock()
+			svc := &service{redisClient: db}
+			failure := errors.New("connection lost")
+			mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1", "port": "6379"})
+			remove := mock.ExpectDo("SENTINEL", "REMOVE", "upgrade")
+			if stage == "remove" {
+				remove.SetErr(failure)
+			} else {
+				remove.SetVal(true)
+				monitor := mock.ExpectDo("SENTINEL", "MONITOR", "upgrade", "10.0.0.2", "6379", "2")
+				if stage == "monitor" {
+					monitor.SetErr(failure)
+				} else {
+					monitor.SetVal(true)
+					mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", "").SetErr(failure)
+				}
+			}
+			err := svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, "upgrade", "2")
+			var mutationErr *SentinelMonitorMutationError
+			require.ErrorAs(t, err, &mutationErr)
+			require.Equal(t, stage, mutationErr.Stage)
+			require.ErrorIs(t, err, failure)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}

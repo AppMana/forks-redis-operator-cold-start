@@ -641,6 +641,15 @@ func TestSentinelMonitorSkipsUnreadySentinelsAndReportsUnreachableOnes(t *testin
 	assert.Equal(t, []string{"10.0.1.11"}, redisClient.monitorHosts)
 }
 
+func TestSentinelMonitorStopsAfterUncertainMutation(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
+	failure := &redisservice.SentinelMonitorMutationError{Stage: "monitor", Err: errors.New("connection lost")}
+	redisClient := &fakeRedisClient{errByHost: map[string]error{"10.0.1.10": failure}}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorIs(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"), failure)
+	assert.Empty(t, redisClient.monitorHosts, "later Sentinels must remain untouched")
+}
+
 func TestIsConnectivityError(t *testing.T) {
 	tests := []struct {
 		name string

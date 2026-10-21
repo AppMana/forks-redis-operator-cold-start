@@ -391,6 +391,7 @@ func (f *fakeSentinelRedisService) SentinelGetMasterAddrByName(context.Context, 
 }
 
 type fakeSentinelRedisService struct {
+	monitorError    error
 	monitoredQuorum string
 	hostnameError   error
 	hostnameCalls   []string
@@ -413,7 +414,21 @@ func (f *fakeSentinelRedisService) SentinelMonitor(_ context.Context, master *re
 	f.monitoredQuorum = quorum
 	f.hostnameCalls = append(f.hostnameCalls, "monitor")
 	f.monitoredMaster = master
-	return nil
+	return f.monitorError
+}
+
+func TestEmbeddedSentinelStopsAfterUncertainMutation(t *testing.T) {
+	inst := &rrvb2.RedisReplication{Spec: rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3)), Sentinel: &rrvb2.Sentinel{Size: 3}}}
+	failure := &redis.SentinelMonitorMutationError{Stage: "monitor", Err: errors.New("connection lost")}
+	client := &fakeSentinelRedisClient{svc: &fakeSentinelRedisService{monitorError: failure}}
+	r := &Reconciler{K8sClient: fake.NewSimpleClientset()}
+	pods := []corev1.Pod{
+		{Status: corev1.PodStatus{PodIP: "10.0.1.10"}},
+		{Status: corev1.PodStatus{PodIP: "10.0.1.11"}},
+		{Status: corev1.PodStatus{PodIP: "10.0.1.12"}},
+	}
+	require.ErrorIs(t, r.configureSentinelPods(context.Background(), client, inst, pods, "10.0.0.10", ""), failure)
+	require.Len(t, client.connections, 1, "later Sentinels must remain untouched")
 }
 
 func TestEmbeddedSentinelHonorsConfiguredQuorum(t *testing.T) {

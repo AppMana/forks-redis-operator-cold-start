@@ -477,6 +477,10 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 				return ctxErr
 			}
 			errs = append(errs, fmt.Errorf("sentinel monitor on pod %s: %w", pod.Name, err))
+			var mutationErr *redis.SentinelMonitorMutationError
+			if errors.As(err, &mutationErr) {
+				return errors.Join(errs...)
+			}
 		}
 	}
 

@@ -19,6 +19,20 @@ const (
 
 var errConnectionInfoNotSet = errors.New("redis connection info is not set")
 
+// SentinelMonitorMutationError means a mutating command was attempted but its
+// intended outcome was not confirmed. Callers must not advance a multi-pod
+// replacement after this error; the affected monitor needs re-observation.
+type SentinelMonitorMutationError struct {
+	Stage string
+	Err   error
+}
+
+func (e *SentinelMonitorMutationError) Error() string {
+	return fmt.Sprintf("sentinel monitor may have changed during %s: %v", e.Stage, e.Err)
+}
+
+func (e *SentinelMonitorMutationError) Unwrap() error { return e.Err }
+
 type ConnectionInfo struct {
 	// Host is the IP address or hostname for connection
 	Host string
@@ -361,23 +375,26 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 		cmd = rediscli.NewBoolCmd(ctx, "SENTINEL", "REMOVE", masterGroupName)
 		err = client.Process(ctx, cmd)
 		if err != nil {
-			return err
+			return &SentinelMonitorMutationError{Stage: "remove", Err: err}
 		}
 		if err = cmd.Err(); err != nil {
-			return err
+			return &SentinelMonitorMutationError{Stage: "remove", Err: err}
 		}
 	}
 
 	cmd = rediscli.NewBoolCmd(ctx, "SENTINEL", "MONITOR", masterGroupName, master.Host, master.Port, quorum)
 	err = client.Process(ctx, cmd)
 	if err != nil {
-		return err
+		return &SentinelMonitorMutationError{Stage: "monitor", Err: err}
 	}
 	if err = cmd.Err(); err != nil {
-		return err
+		return &SentinelMonitorMutationError{Stage: "monitor", Err: err}
 	}
 
-	return setSentinelMasterAuth(ctx, client, masterGroupName, master.Password)
+	if err := setSentinelMasterAuth(ctx, client, masterGroupName, master.Password); err != nil {
+		return &SentinelMonitorMutationError{Stage: "authenticate new monitor", Err: err}
+	}
+	return nil
 }
 
 // Reconcile credentials even when the monitored address is unchanged. Empty
