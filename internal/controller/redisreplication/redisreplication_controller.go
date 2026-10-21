@@ -2,6 +2,7 @@ package redisreplication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -339,6 +340,19 @@ func (r *Reconciler) reconcileResources(ctx context.Context, instance *rrvb2.Red
 	if err := r.validateSentinelConfigStorage(ctx, instance); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "Sentinel storage migration required before resource changes")
 	}
+	if instance.EnableSentinel() {
+		svc := newSentinelService(instance)
+		if _, err := service.Reconcile(ctx, r.Client, svc, instance); err != nil {
+			return intctrlutil.RequeueE(ctx, err, "")
+		}
+		sts, err := statefulset.Reconcile(ctx, r.Client, newSentinelStatefulSet(instance, svc.Name), instance)
+		if err != nil {
+			return intctrlutil.RequeueE(ctx, err, "")
+		}
+		if err := r.prepareSentinelHostnameMigration(ctx, instance, sts); err != nil {
+			return intctrlutil.RequeueE(ctx, err, "Sentinel hostname migration must complete before rolling Redis")
+		}
+	}
 	if err := k8sutils.CreateReplicationRedis(ctx, instance, r.K8sClient, r.Client); err != nil {
 		return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 	}
@@ -347,18 +361,6 @@ func (r *Reconciler) reconcileResources(ctx context.Context, instance *rrvb2.Red
 	}
 	if err := k8sutils.ReconcileReplicationPodDisruptionBudget(ctx, instance, instance.Spec.PodDisruptionBudget, r.K8sClient); err != nil {
 		return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
-	}
-	if instance.EnableSentinel() {
-		svc := newSentinelService(instance)
-		_, err := service.Reconcile(ctx, r.Client, svc, instance)
-		if err != nil {
-			return intctrlutil.RequeueE(ctx, err, "")
-		}
-		sts := newSentinelStatefulSet(instance, svc.Name)
-		_, err = statefulset.Reconcile(ctx, r.Client, sts, instance)
-		if err != nil {
-			return intctrlutil.RequeueE(ctx, err, "")
-		}
 	}
 	return intctrlutil.Reconciled()
 }
@@ -392,19 +394,25 @@ func (r *Reconciler) configureSentinel(ctx context.Context, inst *rrvb2.RedisRep
 		return fmt.Errorf("get sentinel pods: %w", err)
 	}
 
-	if len(sentinelPods.Items) == 0 {
-		return nil
-	}
+	return r.configureSentinelPods(ctx, redis.NewClient(), inst, sentinelPods.Items, monitorAddr, masterPassword)
+}
 
-	redisClient := redis.NewClient()
-	for _, pod := range sentinelPods.Items {
-		if err := r.configureSentinelPod(ctx, redisClient, inst, pod, monitorAddr, masterPassword); err != nil {
-			log.FromContext(ctx).Error(err, "failed to configure sentinel pod", "pod", pod.Name)
+func (r *Reconciler) configureSentinelPods(ctx context.Context, redisClient redis.Client, inst *rrvb2.RedisReplication, pods []corev1.Pod, monitorAddr, masterPassword string) error {
+	if len(pods) < int(inst.Spec.Sentinel.Size) {
+		return fmt.Errorf("not all configured Sentinel pods are available")
+	}
+	var failures []error
+	for _, pod := range pods {
+		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+			failures = append(failures, fmt.Errorf("sentinel pod %s is not available", pod.Name))
 			continue
 		}
+		if err := r.configureSentinelPod(ctx, redisClient, inst, pod, monitorAddr, masterPassword); err != nil {
+			log.FromContext(ctx).Error(err, "failed to configure sentinel pod", "pod", pod.Name)
+			failures = append(failures, fmt.Errorf("configure sentinel %s: %w", pod.Name, err))
+		}
 	}
-
-	return nil
+	return errors.Join(failures...)
 }
 
 func (r *Reconciler) getSentinelPods(ctx context.Context, inst *rrvb2.RedisReplication) (*corev1.PodList, error) {
