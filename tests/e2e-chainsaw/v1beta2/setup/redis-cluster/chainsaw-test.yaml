@@ -147,25 +147,38 @@ spec:
                 done
               }
               before="$(pod_uids)"
+              original_config="$(kubectl -n "${NAMESPACE}" get rediscluster "$cluster" -o json | jq -c '.spec.redisConfig.dynamicConfig')"
               for desired in 6000 5000; do
+                patch="$(printf '%s' "$original_config" | jq -c --arg value "$desired" \
+                  '{spec:{redisConfig:{dynamicConfig:map(if startswith("slowlog-log-slower-than ") then "slowlog-log-slower-than " + $value else . end)}}}')"
                 kubectl -n "${NAMESPACE}" patch rediscluster "$cluster" --type=merge \
-                  -p "{\"spec\":{\"redisConfig\":{\"dynamicConfig\":[\"slowlog-log-slower-than $desired\"]}}}"
+                  -p "$patch"
                 deadline=$(($(date +%s)+50))
                 converged=false
                 while [ "$(date +%s)" -lt "$deadline" ]; do
                   converged=true
                   for role in leader follower; do
                     for ordinal in 0 1 2; do
-                      value="$(kubectl -n "${NAMESPACE}" exec "$cluster-$role-$ordinal" -c "$cluster-$role" -- \
-                        redis-cli --raw --tls --cacert /tls/ca.crt CONFIG GET slowlog-log-slower-than | tail -n1)"
-                      [ "$value" = "$desired" ] || converged=false
+                      pod="$cluster-$role-$ordinal"
+                      if output="$(kubectl -n "${NAMESPACE}" exec "$pod" -c "$cluster-$role" -- \
+                        redis-cli --raw --tls --cacert /tls/ca.crt CONFIG GET slowlog-log-slower-than)"; then
+                        value="$(printf '%s\n' "$output" | tail -n1)"
+                        if [ "$value" != "$desired" ]; then
+                          converged=false
+                          case "$value" in ''|*[!0-9]*) value=non-numeric-response;; esac
+                          echo "waiting: $pod slowlog threshold=$value expected=$desired"
+                        fi
+                      else
+                        converged=false
+                        echo "waiting: $pod CONFIG GET exec failed"
+                      fi
                     done
                   done
                   [ "$converged" = true ] && break
                   sleep 2
                 done
-                [ "$converged" = true ]
-                [ "$(pod_uids)" = "$before" ]
+                [ "$converged" = true ] || { echo "FAIL: threshold $desired did not converge on all six nodes within 50s"; exit 1; }
+                [ "$(pod_uids)" = "$before" ] || { echo "FAIL: pods were replaced during threshold $desired update"; exit 1; }
               done
               echo 'PASS: Ready cluster configuration updated and restored without pod replacement'
             check:
