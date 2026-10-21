@@ -2,6 +2,7 @@ package redissentinel
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ func TestReconcileSentinelRequeuesWithoutTouchingSentinelsWhenNoReachableMaster(
 		Spec:       rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3))},
 	}
 	instance := &rsvb2.RedisSentinel{
-		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default", UID: "sentinel-test-uid"},
 		Spec: rsvb2.RedisSentinelSpec{
 			Size: ptr.To(int32(3)),
 			RedisSentinelConfig: &rsvb2.RedisSentinelConfig{
@@ -52,14 +53,21 @@ func TestReconcileSentinelRequeuesWithoutTouchingSentinelsWhenNoReachableMaster(
 	require.NoError(t, err)
 	assert.Equal(t, 10*time.Second, result.RequeueAfter)
 	assert.Empty(t, healer.monitoredMasters)
+
+	ambiguous := errors.New("multiple Redis masters observed")
+	r.Checker = &fakeChecker{err: ambiguous}
+	_, err = r.reconcileSentinel(context.Background(), instance)
+	require.ErrorIs(t, err, ambiguous)
+	assert.Empty(t, healer.monitoredMasters, "ambiguous Redis roles must not reset a Sentinel election")
 }
 
 type fakeChecker struct {
 	master corev1.Pod
+	err    error
 }
 
 func (f *fakeChecker) GetMasterFromReplication(context.Context, *rrvb2.RedisReplication) (corev1.Pod, error) {
-	return f.master, nil
+	return f.master, f.err
 }
 
 func (f *fakeChecker) GetPassword(context.Context, string, *commonapi.ExistingPasswordSecret) (string, error) {

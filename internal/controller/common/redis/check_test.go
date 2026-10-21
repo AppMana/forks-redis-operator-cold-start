@@ -72,6 +72,24 @@ func TestGetMasterFromReplicationSkipsUnreachableAndUnreadyPods(t *testing.T) {
 	assert.NotContains(t, redisClient.connectHosts, "10.0.0.12")
 }
 
+func TestGetMasterFromReplicationRejectsCompetingMasters(t *testing.T) {
+	for _, counts := range []map[string]int{
+		{"10.0.0.10": 2, "10.0.0.11": 0},
+		{"10.0.0.10": 0, "10.0.0.11": 2},
+		{"10.0.0.10": 1, "10.0.0.11": 1},
+	} {
+		rr, objects := newReplicationFixture("10.0.0.10", "10.0.0.11", "10.0.0.12")
+		redisClient := &fakeRedisClient{
+			isMasterByHost: map[string]bool{"10.0.0.10": true, "10.0.0.11": true},
+			replicasByHost: counts,
+		}
+		c := &checker{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+		master, err := c.GetMasterFromReplication(context.Background(), rr)
+		require.ErrorContains(t, err, "multiple Redis masters")
+		require.Empty(t, master.Name, "replica count must not override a Sentinel election during transition")
+	}
+}
+
 func TestGetReplicationKeyCountsSkipsUnprobeableAndFailedPods(t *testing.T) {
 	rr, objects := newReplicationFixture("10.0.0.10", "10.0.0.11")
 	labels := map[string]string{"app": rr.GetStatefulSetName()}

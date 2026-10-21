@@ -97,6 +97,13 @@ func (c *checker) GetMasterFromReplication(ctx context.Context, rr *rr.RedisRepl
 		}
 	}
 
+	// Replica links can lag behind a Sentinel promotion. Picking the first
+	// master with attached replicas could re-MONITOR the old primary, erasing
+	// Sentinel's newer election. Let the replication reconciler resolve roles
+	// using Sentinel authority instead of making another election here.
+	if len(masterPods) > 1 {
+		return corev1.Pod{}, errors.New("multiple Redis masters observed; refusing to select a Sentinel monitor target by replica count")
+	}
 	var realMasterPod corev1.Pod
 	for _, pod := range masterPods {
 		connInfo := createConnectionInfo(ctx, pod, password, rr.Spec.TLS, c.k8s, rr.Namespace, "6379")
