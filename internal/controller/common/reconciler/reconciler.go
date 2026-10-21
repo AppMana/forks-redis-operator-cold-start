@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -27,12 +26,12 @@ type Params struct {
 
 func Reconcile(ctx context.Context, params Params) (client.Object, error) {
 	if params.Owner != nil {
-		if err := controllerutil.SetControllerReference(params.Owner, params.Expected, scheme.Scheme); err != nil {
+		if err := controllerutil.SetControllerReference(params.Owner, params.Expected, params.Client.Scheme()); err != nil {
 			return nil, err
 		}
 	}
 
-	gvk, err := apiutil.GVKForObject(params.Expected, scheme.Scheme)
+	gvk, err := apiutil.GVKForObject(params.Expected, params.Client.Scheme())
 	if err != nil {
 		return nil, err
 	}

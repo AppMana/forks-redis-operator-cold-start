@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/reconciler"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util/maps"
@@ -27,7 +28,14 @@ func Reconcile(
 			update(&expected, existed.(*corev1.Service))
 		},
 	})
-	return *reconciled.(*corev1.Service), err
+	if err != nil {
+		return expected, err
+	}
+	svc, ok := reconciled.(*corev1.Service)
+	if !ok || svc == nil {
+		return expected, fmt.Errorf("service reconciliation returned no service")
+	}
+	return *svc, nil
 }
 
 func needUpdate(expected, existed *corev1.Service) bool {
