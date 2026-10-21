@@ -668,7 +668,12 @@ func RedisClusterStatusHealth(ctx context.Context, client kubernetes.Interface, 
 		)
 
 		if err == nil {
-			// Successfully verified cluster health from this node
+			if err := clusterNodesServing(ctx, cr, func(pod string) *redis.Client {
+				return configureRedisClient(ctx, client, cr, pod)
+			}); err != nil {
+				logger.V(1).Info("Cluster is not serving on every node", "error", err)
+				return false
+			}
 			logger.V(1).Info("Cluster health check passed", "pod", podName)
 			return true
 		}
@@ -682,6 +687,50 @@ func RedisClusterStatusHealth(ctx context.Context, client kubernetes.Interface, 
 		logger.Error(lastErr, "Cluster health check failed from all leader nodes")
 	}
 	return false
+}
+
+// Slot topology can pass redis-cli --cluster check while Redis still returns
+// CLUSTERDOWN (for example during the post-restart cluster-state delay).
+func clusterNodesServing(ctx context.Context, cr *rcvb2.RedisCluster, makeClient func(string) *redis.Client) error {
+	for _, role := range []string{"leader", "follower"} {
+		for i := int32(0); i < cr.Spec.GetReplicaCounts(role); i++ {
+			pod := fmt.Sprintf("%s-%s-%d", cr.Name, role, i)
+			client := makeClient(pod)
+			info, err := client.ClusterInfo(ctx).Result()
+			_ = client.Close()
+			if err != nil {
+				return fmt.Errorf("cluster serving state unavailable for %s", pod)
+			}
+			if err := validateClusterServingInfo(info); err != nil {
+				return fmt.Errorf("cluster not serving on %s: %w", pod, err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateClusterServingInfo(info string) error {
+	wanted := map[string]string{
+		"cluster_state": "ok", "cluster_slots_assigned": "16384",
+		"cluster_slots_ok": "16384", "cluster_slots_pfail": "0", "cluster_slots_fail": "0",
+	}
+	seen := make(map[string]bool, len(wanted))
+	for _, line := range strings.Split(info, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSuffix(line, "\r"), ":")
+		if !ok {
+			continue
+		}
+		if expected, required := wanted[key]; required {
+			if seen[key] || value != expected {
+				return fmt.Errorf("invalid or unhealthy %s", key)
+			}
+			seen[key] = true
+		}
+	}
+	if len(seen) != len(wanted) {
+		return fmt.Errorf("incomplete cluster serving state")
+	}
+	return nil
 }
 
 // clusterCheckExecTimeout bounds a single `redis-cli --cluster check` exec.
@@ -720,7 +769,7 @@ func checkClusterHealth(ctx context.Context, client kubernetes.Interface, cr *rc
 
 	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, podName)
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
+		return fmt.Errorf("cluster health authentication configuration unavailable")
 	}
 	cmd := clusterCheckCommand(*cr.Spec.Port, authArgs, getRedisTLSArgs(cr.Spec.TLS, podName))
 

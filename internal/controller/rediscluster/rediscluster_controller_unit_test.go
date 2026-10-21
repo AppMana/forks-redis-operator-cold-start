@@ -17,6 +17,21 @@ type fakeChecker struct {
 	called        bool
 }
 
+func TestClusterServingStatusWithdrawsReady(t *testing.T) {
+	ready := rcvb2.RedisClusterStatus{State: rcvb2.RedisClusterReady}
+	next := clusterServingStatus(ready, false)
+	if assert.NotNil(t, next) {
+		assert.Equal(t, rcvb2.RedisClusterBootstrap, next.State)
+	}
+	assert.Nil(t, clusterServingStatus(ready, true))
+	bootstrap := rcvb2.RedisClusterStatus{State: rcvb2.RedisClusterBootstrap}
+	assert.Nil(t, clusterServingStatus(bootstrap, false))
+	next = clusterServingStatus(bootstrap, true)
+	if assert.NotNil(t, next) {
+		assert.Equal(t, rcvb2.RedisClusterReady, next.State)
+	}
+}
+
 func (f *fakeChecker) CheckClusterSlotsAssigned(ctx context.Context, cr *rcvb2.RedisCluster) (bool, error) {
 	f.called = true
 	return f.slotsAssigned, f.err

@@ -419,11 +419,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "failed to set dynamic config")
 	}
-	// Avoid redundant status writes, not configuration convergence.
-	if ready && instance.Status.State != rcvb2.RedisClusterReady {
+	// Avoid redundant status writes, but withdraw Ready when serving checks fail.
+	if next := clusterServingStatus(instance.Status, ready); next != nil {
 		requeue, err := r.updateStatus(ctx, instance, rcvb2.RedisClusterStatus{
-			State:                 rcvb2.RedisClusterReady,
-			Reason:                rcvb2.ReadyClusterReason,
+			State:                 next.State,
+			Reason:                next.Reason,
 			ReadyLeaderReplicas:   leaderReplicas,
 			ReadyFollowerReplicas: followerReplicas,
 		})
@@ -443,6 +443,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	return intctrlutil.RequeueAfter(ctx, time.Second*10, "")
+}
+
+func clusterServingStatus(current rcvb2.RedisClusterStatus, ready bool) *rcvb2.RedisClusterStatus {
+	if ready && current.State != rcvb2.RedisClusterReady {
+		return &rcvb2.RedisClusterStatus{State: rcvb2.RedisClusterReady, Reason: rcvb2.ReadyClusterReason}
+	}
+	if !ready && current.State == rcvb2.RedisClusterReady {
+		return &rcvb2.RedisClusterStatus{State: rcvb2.RedisClusterBootstrap, Reason: "Waiting for all Redis nodes to serve cluster requests"}
+	}
+	return nil
 }
 
 func configureHealthyCluster(instance *rcvb2.RedisCluster, healthy func() bool, apply func() error) (bool, error) {

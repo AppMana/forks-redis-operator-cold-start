@@ -65,6 +65,8 @@ jobs:
         run: go test -race ./... -count=1
       - name: Test data assertion CLI against Redis
         run: bash hack/recovery/check-data-assert.sh
+      - name: Test Redis cluster serving readiness
+        run: bash hack/recovery/check-cluster-serving.sh
       - name: Test Sentinel quorum reconciliation against Redis
         run: bash hack/recovery/check-sentinel-quorum.sh
       - name: Upload coverage to Codecov
