@@ -230,7 +230,7 @@ func waitForClusterNoOpenSlots(ctx context.Context, client kubernetes.Interface,
 // ReshardRedisCluster transfer the slots from the last node to the provided transfer node.
 //
 // NOTE: when all slot been transferred, the node become slave of the transfer node.
-func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32, transferNodeIdx int32, remove bool) {
+func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32, transferNodeIdx int32, remove bool) error {
 	transferNodeName := fmt.Sprintf("%s-leader-%d", cr.Name, transferNodeIdx)
 	redisClient := configureRedisClient(ctx, client, cr, transferNodeName)
 	defer redisClient.Close()
@@ -251,7 +251,7 @@ func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *r
 	cmd = append(cmd, getEndpoint(ctx, client, cr, transferPOD))
 	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, transferNodeName)
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
+		return fmt.Errorf("cannot reshard: authentication configuration unavailable")
 	}
 	cmd = append(cmd, authArgs...)
 
@@ -266,27 +266,89 @@ func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *r
 
 	// Transfer Node
 	transferNodeID := getRedisNodeID(ctx, client, cr, transferPOD)
+	if removeNodeID == "" || transferNodeID == "" || removeNodeID == transferNodeID {
+		return fmt.Errorf("cannot reshard: source and target must have distinct known identities")
+	}
 	cmd = append(cmd, "--cluster-to")
 	cmd = append(cmd, transferNodeID)
 
-	// Cluster Slots
-	slots := getRedisClusterSlots(ctx, redisClient, removeNodeID)
-	if slots == "0" || slots == "" {
-		log.FromContext(ctx).Info("skipping the execution cmd because no slots found", "Cmd", cmd)
-		return
-	}
-	cmd = append(cmd, "--cluster-slots")
-	cmd = append(cmd, slots)
-
-	cmd = append(cmd, "--cluster-yes")
-
-	log.FromContext(ctx).Info(fmt.Sprintf("transferring %s slots from shard %d to shard %d", slots, shardIdx, transferNodeIdx))
-	executeCommand(ctx, client, cr, cmd, transferNodeName)
-	log.FromContext(ctx).Info(fmt.Sprintf("transferring %s slots from shard %d to shard %d completed", slots, shardIdx, transferNodeIdx))
-
+	var removeNode func() error
 	if remove {
-		RemoveRedisNodeFromCluster(ctx, client, cr, removePOD)
+		removeNode = func() error { return RemoveRedisNodeFromCluster(ctx, client, cr, removeNodeID) }
 	}
+	return reshardBeforeRemoval(func() (int, error) {
+		return ownedRedisClusterSlots(ctx, redisClient, removeNodeID)
+	}, func(slots int) error {
+		transferCmd := append(cmd, "--cluster-slots", strconv.Itoa(slots), "--cluster-yes")
+		if _, err := executeCommand1(ctx, client, cr, transferCmd, transferNodeName); err != nil {
+			return fmt.Errorf("reshard execution failed; retaining source node")
+		}
+		return nil
+	}, removeNode)
+}
+
+// A successful CLI exit alone does not prove that it is safe to remove a shard.
+// Observe primary slot ownership again, including when retrying an empty source.
+func reshardBeforeRemoval(observe func() (int, error), transfer func(int) error, remove func() error) error {
+	slots, err := observe()
+	if err != nil {
+		return err
+	}
+	if slots < 0 || slots > 16384 {
+		return fmt.Errorf("invalid source slot count")
+	}
+	if slots > 0 {
+		if err := transfer(slots); err != nil {
+			return err
+		}
+	}
+	remaining, err := observe()
+	if err != nil {
+		return err
+	}
+	if remaining != 0 {
+		return fmt.Errorf("source still owns slots after reshard; retaining source node")
+	}
+	if remove != nil {
+		return remove()
+	}
+	return nil
+}
+
+func ownedRedisClusterSlots(ctx context.Context, client *redis.Client, nodeID string) (int, error) {
+	if nodeID == "" {
+		return 0, fmt.Errorf("source identity is unavailable")
+	}
+	slots, err := client.ClusterSlots(ctx).Result()
+	if err != nil {
+		return 0, fmt.Errorf("source slot inventory is unavailable")
+	}
+	if len(slots) == 0 {
+		return 0, fmt.Errorf("cluster slot inventory is empty")
+	}
+	total := 0
+	var covered [16384]bool
+	coverage := 0
+	for _, slot := range slots {
+		if slot.Start < 0 || slot.End < slot.Start || slot.End >= 16384 || len(slot.Nodes) == 0 || slot.Nodes[0].ID == "" {
+			return 0, fmt.Errorf("cluster slot inventory is invalid")
+		}
+		for i := slot.Start; i <= slot.End; i++ {
+			if covered[i] {
+				return 0, fmt.Errorf("cluster slot inventory overlaps")
+			}
+			covered[i] = true
+			coverage++
+		}
+		// Only the first node owns the slots; following nodes are replicas.
+		if slot.Nodes[0].ID == nodeID {
+			total += slot.End - slot.Start + 1
+		}
+	}
+	if coverage != len(covered) {
+		return 0, fmt.Errorf("cluster slot inventory is incomplete")
+	}
+	return total, nil
 }
 
 func getRedisClusterSlots(ctx context.Context, redisClient *redis.Client, nodeID string) string {
@@ -558,23 +620,27 @@ func RemoveRedisFollowerNodesFromCluster(ctx context.Context, client kubernetes.
 }
 
 // Remove redis cluster node would remove last node to the existing redis cluster using redis-cli
-func RemoveRedisNodeFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, removePod RedisDetails) {
-	redisClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
-	defer redisClient.Close()
+func RemoveRedisNodeFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, nodeID string) error {
+	if nodeID == "" {
+		return fmt.Errorf("cannot remove node: identity is unavailable")
+	}
 	existingPod := RedisDetails{
 		PodName:   cr.Name + "-leader-0",
 		Namespace: cr.Namespace,
 	}
 	cmd := []string{"redis-cli", "--cluster", "del-node"}
 	cmd = append(cmd, getEndpoint(ctx, client, cr, existingPod))
-	cmd = append(cmd, getRedisNodeID(ctx, client, cr, removePod))
+	cmd = append(cmd, nodeID)
 	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, cr.Name+"-leader-0")
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
+		return fmt.Errorf("cannot remove node: authentication configuration unavailable")
 	}
 	cmd = append(cmd, authArgs...)
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
-	executeCommand(ctx, client, cr, cmd, cr.Name+"-leader-0")
+	if _, err := executeCommand1(ctx, client, cr, cmd, cr.Name+"-leader-0"); err != nil {
+		return fmt.Errorf("cluster node removal failed")
+	}
+	return nil
 }
 
 // verifyLeaderPod return true if the pod is leader/master

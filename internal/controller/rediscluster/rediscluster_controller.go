@@ -131,7 +131,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				// and makes the subsequent rebalancing step more efficient.
 				// TODO: consider doing the resharding in parallel
 				shardMoveNodeIdx := shardIdx % leaderReplicas
-				k8sutils.ReshardRedisCluster(ctx, r.K8sClient, instance, shardIdx, shardMoveNodeIdx, true)
+				if err := k8sutils.ReshardRedisCluster(ctx, r.K8sClient, instance, shardIdx, shardMoveNodeIdx, true); err != nil {
+					return intctrlutil.RequeueE(ctx, err, "failed to reshard source node")
+				}
 				monitoring.RedisClusterReshardTotal.WithLabelValues(instance.Namespace, instance.Name).Inc()
 			}
 			// Step 3 Rebalance the cluster. With a single remaining leader there is
