@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Isolated storage-loss rehearsal. Retain the old PV/data and archive metadata;
-# replace only one synthetic replica's claim with a newly provisioned claim.
+# replace one synthetic node's claim with a newly provisioned claim.
 set -euo pipefail
 config="${1:?qualified local kubeconfig required}"
+mode="${2:-replica}"
+[[ "$mode" == replica || "$mode" == primary ]]
+archive_prefix=empty-disk-original
+[[ "$mode" != primary ]] || archive_prefix=empty-disk-primary-original
 namespace=redis-upgrade-canary-empty-disk
 [[ "$(kubectl --kubeconfig "$config" config current-context)" == kind-redis-recovery-qualified-20261021 ]]
 [[ "$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" == https://127.0.0.1:* ]]
@@ -14,8 +18,10 @@ unset CANARY_SENTINEL_COUNT CANARY_RECOVERY_SENTINEL_SELECTOR
 health() { bash "$dir/check.sh" "$config" preserved-empty-disk-20261021; }
 health
 primary="$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')"
+[[ "$primary" == upgrade-[012] ]]
 victim=upgrade-0
 [[ "$primary" != "$victim" ]] || victim=upgrade-1
+[[ "$mode" != primary ]] || victim="$primary"
 [[ "$("${operator[@]}" get deployment redis-operator -o jsonpath='{.spec.replicas}')" == 1 ]]
 pod="$("${k[@]}" get pod "$victim" -o json)"
 claim="$(jq -r '.spec.volumes[]|select(.name=="upgrade")|.persistentVolumeClaim.claimName' <<<"$pod")"
@@ -26,7 +32,7 @@ old_pv="$("${k[@]}" get pvc "$claim" -o jsonpath='{.spec.volumeName}')"
 other_claims="$("${k[@]}" get pvc -o json | jq -Sc --arg name "$claim" '[.items[]|select(.metadata.name!=$name)|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)')"
 # create (not apply) prevents overwriting evidence from an earlier attempt.
 for resource in statefulset/upgrade "pvc/$claim" "pv/$old_pv"; do
-  case "$resource" in statefulset/*) archive=empty-disk-original-sts;; pvc/*) archive=empty-disk-original-pvc;; pv/*) archive=empty-disk-original-pv;; esac
+  case "$resource" in statefulset/*) archive="$archive_prefix-sts";; pvc/*) archive="$archive_prefix-pvc";; pv/*) archive="$archive_prefix-pv";; esac
   "${k[@]}" get "$resource" -o json | "${k[@]}" create configmap "$archive" --from-file=object.json=/dev/stdin
 done
 "${k[@]}" patch pv "$old_pv" --type=merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
@@ -40,8 +46,8 @@ trap 'exit 130' INT TERM
 "${k[@]}" delete pod "$victim" --wait=true --timeout=45s
 # Only disposable claim metadata is removed. The original data volume is Retain.
 "${k[@]}" delete pvc "$claim" --wait=true --timeout=45s
-"${k[@]}" get configmap empty-disk-original-pvc -o json | jq '.data["object.json"]|fromjson|del(.status,.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.managedFields,.metadata.finalizers,.metadata.ownerReferences,.metadata.annotations,.spec.volumeName)' | "${k[@]}" create -f -
-"${k[@]}" get configmap empty-disk-original-sts -o json | jq '.data["object.json"]|fromjson|del(.status,.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.managedFields)' | "${k[@]}" create -f -
+"${k[@]}" get configmap "$archive_prefix-pvc" -o json | jq '.data["object.json"]|fromjson|del(.status,.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.managedFields,.metadata.finalizers,.metadata.ownerReferences,.metadata.annotations,.spec.volumeName)' | "${k[@]}" create -f -
+"${k[@]}" get configmap "$archive_prefix-sts" -o json | jq '.data["object.json"]|fromjson|del(.status,.metadata.uid,.metadata.resourceVersion,.metadata.creationTimestamp,.metadata.managedFields)' | "${k[@]}" create -f -
 restore_operator
 trap - EXIT
 "${operator[@]}" rollout status deployment/redis-operator --timeout=120s
@@ -51,10 +57,13 @@ while ((SECONDS<deadline)); do
   sleep 2
 done
 [[ "$recovered" == true ]]
+if [[ "$mode" == primary ]]; then
+  [[ "$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')" != "$victim" ]]
+fi
 [[ "$("${k[@]}" get pvc "$claim" -o jsonpath='{.metadata.uid}')" != "$old_uid" ]]
 [[ "$("${k[@]}" get pvc "$claim" -o jsonpath='{.spec.volumeName}')" != "$old_pv" ]]
 [[ "$("${k[@]}" get pv "$old_pv" -o jsonpath='{.spec.persistentVolumeReclaimPolicy}')" == Retain ]]
 [[ "$("${k[@]}" get pv "$old_pv" -o jsonpath='{.status.phase}')" == Released ]]
 [[ "$("${k[@]}" get pvc -o json | jq -Sc --arg name "$claim" '[.items[]|select(.metadata.name!=$name)|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)')" == "$other_claims" ]]
 health
-echo "PASS: $victim recovered onto a new PVC/PV; original volume $old_pv and archived claim metadata retained"
+echo "PASS: $mode $victim recovered onto a new PVC/PV; original volume $old_pv and archived claim metadata retained"
