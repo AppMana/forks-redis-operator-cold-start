@@ -355,6 +355,14 @@ func Test_validateACLDefaultUser(t *testing.T) {
 		{name: "sha256 hash matches", acl: "user default on #2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b ~* &* +@all\n", password: "secret"},
 		{name: "rotation overlap retains both password hashes", acl: "user default on #cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4 #2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b ~* &* +@all\n", password: "secret"},
 		{name: "trailing newline from secret is trimmed", acl: "user default on >secret ~* &* +@all\n", password: "secret\n"},
+		{name: "reset then enable and set password", acl: "user default reset on >secret ~* &* +@all\n", password: "secret"},
+		{name: "resetpass then set password", acl: "user default on >old resetpass >secret ~* &* +@all\n", password: "secret"},
+		{name: "retire old password", acl: "user default on >old >secret <old ~* &* +@all\n", password: "secret"},
+		{name: "remove and restore password", acl: "user default on >secret <secret >secret ~* &* +@all\n", password: "secret"},
+		{name: "remove hash added as plaintext", acl: "user default on >old >secret !cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4 ~* &* +@all\n", password: "secret"},
+		{name: "off then on", acl: "user default off on >secret ~* &* +@all\n", password: "secret"},
+		{name: "case insensitive flags", acl: "user default RESET ON >secret ~* &* +@all\n", password: "secret"},
+		{name: "password clears nopass", acl: "user default on nopass >secret ~* &* +@all\n", password: "secret"},
 		{name: "quoted arguments skip password comparison", acl: "user default on \">my secret\" ~* &* +@all\n", password: "other"},
 		{name: "empty password skips validation", acl: "user alice on >alicepass ~* &* +@all\n", password: ""},
 		{name: "file missing", password: "secret", wantErr: "not readable"},
@@ -365,6 +373,10 @@ func Test_validateACLDefaultUser(t *testing.T) {
 		{name: "password mismatch", acl: "user default on >wrong ~* &* +@all\n", password: "secret", wantErr: "does not match"},
 		{name: "resetpass after password", acl: "user default on >secret resetpass ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
 		{name: "password removed again", acl: "user default on >secret <secret ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "on then off", acl: "user default on >secret off ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "nopass after password", acl: "user default on >secret nopass ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "hash removal removes plaintext password", acl: "user default on >secret !2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b ~* &* +@all\n", password: "secret", wantErr: "must define the default user as on with a password"},
+		{name: "removing missing password is invalid", acl: "user default on >secret <absent ~* &* +@all\n", password: "secret", wantErr: "removes an unknown password"},
 	}
 
 	for _, tt := range tests {

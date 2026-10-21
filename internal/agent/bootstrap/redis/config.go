@@ -260,16 +260,58 @@ func validateACLDefaultUser(path, password string) error {
 		if len(rules) < 2 || rules[0] != "user" || rules[1] != "default" {
 			continue
 		}
-		if !slices.Contains(rules, "on") || slices.ContainsFunc(rules, func(r string) bool {
-			return r == "off" || r == "nopass" || r == "reset" || r == "resetpass" || r[0] == '<' || r[0] == '!'
-		}) {
-			return fmt.Errorf("ACL file %s must define the default user as on with a password; the operator authenticates as default with the redisSecret password", path)
-		}
 		if strings.ContainsAny(line, `"'`) {
+			// Preserve the existing quoted-rule handling until Redis-compatible
+			// tokenization is available; Fields cannot evaluate these rules.
+			if !slices.Contains(rules, "on") || slices.ContainsFunc(rules, func(r string) bool {
+				return r == "off" || r == "nopass" || r == "reset" || r == "resetpass" || r[0] == '<' || r[0] == '!'
+			}) {
+				return fmt.Errorf("ACL file %s must define the default user as on with a password; the operator authenticates as default with the redisSecret password", path)
+			}
 			log.Printf("Warning: ACL file %s defines the default user with quoted arguments; skipping password comparison", path)
 			return nil
 		}
-		if slices.Contains(rules, ">"+password) || slices.Contains(rules, hash) {
+		// Redis applies ACL rules left-to-right, including resets and removal
+		// of old rotation credentials. Evaluate final authentication state,
+		// not the presence of any individual disabling token.
+		enabled, nopass := false, false
+		passwords := make(map[string]bool)
+		for _, rule := range rules[2:] {
+			switch strings.ToLower(rule) {
+			case "on":
+				enabled = true
+			case "off":
+				enabled = false
+			case "reset":
+				enabled, nopass = false, false
+				clear(passwords)
+			case "resetpass", "nopass":
+				nopass = strings.EqualFold(rule, "nopass")
+				clear(passwords)
+			default:
+				if !strings.ContainsRune("><#!", rune(rule[0])) {
+					continue
+				}
+				key := rule[1:]
+				if rule[0] == '>' || rule[0] == '<' {
+					digest := sha256.Sum256([]byte(key))
+					key = hex.EncodeToString(digest[:])
+				}
+				if rule[0] == '>' || rule[0] == '#' {
+					passwords[key] = true
+					nopass = false
+				} else {
+					if !passwords[key] {
+						return fmt.Errorf("ACL file %s removes an unknown password", path)
+					}
+					delete(passwords, key)
+				}
+			}
+		}
+		if !enabled || nopass || len(passwords) == 0 {
+			return fmt.Errorf("ACL file %s must define the default user as on with a password; the operator authenticates as default with the redisSecret password", path)
+		}
+		if passwords[strings.TrimPrefix(hash, "#")] {
 			return nil
 		}
 		return fmt.Errorf("ACL file %s defines the default user with a password that does not match redisSecret; add >password or #sha256 for the redisSecret password", path)
