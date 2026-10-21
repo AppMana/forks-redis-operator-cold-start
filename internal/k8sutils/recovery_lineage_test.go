@@ -2,8 +2,9 @@ package k8sutils
 
 import (
 	"fmt"
-	"github.com/stretchr/testify/require"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestRecoveryLineage(t *testing.T) {

@@ -36,7 +36,7 @@ type RedisSentinelService struct {
 // Redis Sentinel Create the Redis Sentinel Setup
 func CreateRedisSentinel(ctx context.Context, client kubernetes.Interface, cr *rsvb2.RedisSentinel, cl kubernetes.Interface, ctrlClient client.Client) error {
 	if cr.Spec.ConfigVolumeClaimTemplate != nil && !features.Enabled(features.GenerateConfigInInitContainer) {
-		return fmt.Errorf("Sentinel config persistence requires GenerateConfigInInitContainer; legacy entrypoints overwrite election state")
+		return fmt.Errorf("sentinel config persistence requires GenerateConfigInInitContainer; legacy entrypoints overwrite election state")
 	}
 	prop := RedisSentinelSTS{
 		RedisStateFulType:             "sentinel",

@@ -3,12 +3,13 @@ package redisreplication
 import (
 	"context"
 	"errors"
+	"testing"
+
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-	"testing"
 )
 
 func TestTopologyRepairHonorsExternalSentinelElection(t *testing.T) {
