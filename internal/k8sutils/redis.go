@@ -161,6 +161,10 @@ func checkRedisCLIAuthInEnv(ctx context.Context, client kubernetes.Interface, cr
 
 func getRedisClusterAuthArgs(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, podName string) ([]string, error) {
 	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
+		ref := cr.Spec.KubernetesConfig.ExistingPasswordSecret
+		if ref.Name == nil || ref.Key == nil || *ref.Name == "" || *ref.Key == "" {
+			return nil, errors.New("password secret reference requires a non-empty name and key")
+		}
 		passwordInEnv, err := checkRedisCLIAuthInEnv(ctx, client, cr, podName, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
 		if err != nil {
 			return []string{}, fmt.Errorf("error checking pod authentication config: %w", err)
@@ -772,19 +776,38 @@ func nodeFailedOrDisconnected(node clusterNodesResponse) bool {
 	return strings.Contains(node[2], "fail") || strings.Contains(node[7], "disconnected")
 }
 
+// Preserve the legacy client-returning API while preventing every network
+// operation when credentials could not be resolved. Returning nil would make
+// existing callers panic; an empty-password client would fail open.
+func credentialFailureClient(cause error) *redis.Client {
+	err := fmt.Errorf("resolve Redis credentials: %w", cause)
+	return redis.NewClient(&redis.Options{
+		MaxRetries: -1,
+		Dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, err
+		},
+	})
+}
+
+func passwordFromReference(ctx context.Context, client kubernetes.Interface, namespace string, ref *commonapi.ExistingPasswordSecret) (string, error) {
+	if ref == nil {
+		return "", nil
+	}
+	if ref.Name == nil || ref.Key == nil || *ref.Name == "" || *ref.Key == "" {
+		return "", errors.New("password secret reference requires a non-empty name and key")
+	}
+	return getRedisPassword(ctx, client, namespace, *ref.Name, *ref.Key)
+}
+
 // configureRedisClient will configure the Redis Client
 func configureRedisClient(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, podName string) *redis.Client {
 	redisInfo := RedisDetails{
 		PodName:   podName,
 		Namespace: cr.Namespace,
 	}
-	var err error
-	var pass string
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err = getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
+	pass, err := passwordFromReference(ctx, client, cr.Namespace, cr.Spec.KubernetesConfig.ExistingPasswordSecret)
+	if err != nil {
+		return credentialFailureClient(err)
 	}
 	opts := &redis.Options{
 		Addr:         getRedisServerAddress(ctx, client, redisInfo, *cr.Spec.Port),
@@ -805,13 +828,9 @@ func configureRedisStandaloneClient(ctx context.Context, client kubernetes.Inter
 		PodName:   podName,
 		Namespace: cr.Namespace,
 	}
-	var err error
-	var pass string
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err = getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
+	pass, err := passwordFromReference(ctx, client, cr.Namespace, cr.Spec.KubernetesConfig.ExistingPasswordSecret)
+	if err != nil {
+		return credentialFailureClient(err)
 	}
 	opts := &redis.Options{
 		Addr:     getRedisServerAddress(ctx, client, redisInfo, common.RedisPort),
@@ -964,13 +983,9 @@ func configureRedisReplicationClientForPod(ctx context.Context, client kubernete
 }
 
 func configureRedisReplicationClientForAddress(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, redisInfo RedisDetails, podIP string) *redis.Client {
-	var err error
-	var pass string
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err = getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
+	pass, err := passwordFromReference(ctx, client, cr.Namespace, cr.Spec.KubernetesConfig.ExistingPasswordSecret)
+	if err != nil {
+		return credentialFailureClient(err)
 	}
 	var addr string
 	if cr.Spec.TLS != nil {
