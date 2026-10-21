@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/go-redis/redismock/v9"
 	"github.com/stretchr/testify/require"
@@ -84,6 +85,8 @@ func TestSentinelBatchRepairsInterruptedMonitorBeforeHealthyPeers(t *testing.T) 
 
 func TestSentinelBatchWaitsForObservedHealthAfterAcknowledgement(t *testing.T) {
 	for _, observationError := range []bool{false, true} {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
 		var calls []string
 		changed := false
 		peers := []SentinelMonitorPeer{
@@ -98,9 +101,27 @@ func TestSentinelBatchWaitsForObservedHealthAfterAcknowledgement(t *testing.T) {
 				Reconcile: func(context.Context) error { calls = append(calls, "b"); return nil },
 			},
 		}
-		require.Error(t, ReconcileSentinelMonitorBatch(context.Background(), peers))
+		require.Error(t, ReconcileSentinelMonitorBatch(ctx, peers))
 		require.Equal(t, []string{"a"}, calls)
 	}
+}
+
+func TestSentinelBatchReconnectionDoesNotReplayMutation(t *testing.T) {
+	var mutations []string
+	probes := 0
+	peers := []SentinelMonitorPeer{
+		{Name: "a", Healthy: func(context.Context) (bool, error) {
+			probes++
+			return probes == 1 || probes >= 3, nil
+		}, Reconcile: func(context.Context) error { mutations = append(mutations, "a"); return nil }},
+		{
+			Name: "b", Healthy: func(context.Context) (bool, error) { return true, nil },
+			Reconcile: func(context.Context) error { mutations = append(mutations, "b"); return nil },
+		},
+	}
+	require.NoError(t, ReconcileSentinelMonitorBatch(context.Background(), peers))
+	require.Equal(t, []string{"a", "b"}, mutations)
+	require.Equal(t, 3, probes)
 }
 
 func TestSentinelBatchObservesWholeInventoryBeforeMutation(t *testing.T) {

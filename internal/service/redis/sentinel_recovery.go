@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	rediscli "github.com/redis/go-redis/v9"
 )
@@ -99,13 +100,34 @@ func ReconcileSentinelMonitorBatch(ctx context.Context, peers []SentinelMonitorP
 		if err := peer.Reconcile(ctx); err != nil {
 			return fmt.Errorf("reconcile Sentinel %s: %w", peer.Name, err)
 		}
+		if err := waitForSentinelMonitorHealth(ctx, peer); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// A Sentinel monitor can be transiently unhealthy after reconciliation.
+// Returning immediately on that transient can repeatedly replay mutations on
+// the first peer, delaying the remaining peers. Observe recovery without mutating
+// again, with one bounded budget and the caller's cancellation honored.
+func waitForSentinelMonitorHealth(ctx context.Context, peer SentinelMonitorPeer) error {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	for {
 		healthy, err := peer.Healthy(ctx)
 		if err != nil {
 			return fmt.Errorf("verify Sentinel %s after reconciliation: %w", peer.Name, err)
 		}
-		if !healthy {
-			return fmt.Errorf("waiting for Sentinel %s monitor to become healthy", peer.Name)
+		if healthy {
+			return nil
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("waiting for Sentinel %s monitor health: %w", peer.Name, ctx.Err())
+		case <-timer.C:
 		}
 	}
-	return nil
 }
