@@ -594,12 +594,12 @@ func TestSentinelResetSkipsSentinelsStillDiscoveringTopology(t *testing.T) {
 	assert.Empty(t, redisClient.resetHosts)
 }
 
-func TestSentinelResetResetsSentinelsWithStaleEntries(t *testing.T) {
+func TestSentinelResetPreservesSurplusMembersWithoutRetirementEvidence(t *testing.T) {
 	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
 	redisClient := &fakeRedisClient{
 		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
 			"10.0.1.10": sentinelInfo(3, 3),
-			"10.0.1.11": sentinelInfo(2, 4),
+			"10.0.1.11": sentinelInfo(2, 7),
 			"10.0.1.12": sentinelInfo(2, 3),
 		},
 	}
@@ -607,7 +607,7 @@ func TestSentinelResetResetsSentinelsWithStaleEntries(t *testing.T) {
 
 	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
 
-	assert.ElementsMatch(t, []string{"10.0.1.10", "10.0.1.11"}, redisClient.resetHosts)
+	assert.Empty(t, redisClient.resetHosts, "surplus peers or replicas do not prove that any member can be safely forgotten")
 }
 
 func TestSentinelResetSkipsSentinelsWithoutMasterGroup(t *testing.T) {
@@ -623,7 +623,7 @@ func TestSentinelResetSkipsSentinelsWithoutMasterGroup(t *testing.T) {
 
 	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
 
-	assert.Equal(t, []string{"10.0.1.12"}, redisClient.resetHosts)
+	assert.Empty(t, redisClient.resetHosts)
 }
 
 func TestExternalSentinelEnablesHostnameSettingsBeforeMonitor(t *testing.T) {

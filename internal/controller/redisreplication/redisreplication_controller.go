@@ -555,14 +555,14 @@ func (r *Reconciler) sentinelResetIfNeed(ctx context.Context, inst *rrvb2.RedisR
 	if !masterInfo.HasStaleEntries(expectedSlaves, expectedSentinels) {
 		return nil
 	}
-	logger.Info("Sentinel has stale topology entries, reset needed",
+	// Surplus entries may be live recovery voters or partitioned members.
+	// Their count alone cannot authorize clearing election state or reducing
+	// the failover majority. Preserve them until explicit safe retirement.
+	logger.Info("Sentinel has surplus topology entries; preserving membership pending explicit retirement",
 		"expectedSlaves", expectedSlaves,
 		"slaves", masterInfo.Slaves,
 		"expectedSentinels", expectedSentinels,
 		"sentinels", masterInfo.Sentinels)
-	if err := redisService.SentinelReset(ctx, masterGroupName); err != nil {
-		return fmt.Errorf("reset sentinel: %w", err)
-	}
 
 	return nil
 }

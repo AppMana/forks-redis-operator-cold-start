@@ -35,6 +35,8 @@ type Healer interface {
 	// SentinelSet sets the config for a specific master
 	// See: https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#reconfiguring-sentinel-at-runtime
 	SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, master string) error
+	// SentinelReset retains its historical interface name but only observes
+	// surplus topology. Counts alone never authorize a destructive RESET.
 	SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel, rr *rrvb2.RedisReplication) error
 
 	// UpdatePodRoleLabel connect to all redis pods and update pod role label `redis-role` to `master` or `slave` according to their role.
@@ -409,19 +411,16 @@ func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel, rr 
 		if !masterInfo.HasStaleEntries(expectedSlaves, expectedSentinels) {
 			continue
 		}
-		log.FromContext(ctx).Info("sentinel has stale topology entries, resetting",
+		// Counts cannot distinguish recovery voters or partitioned members from
+		// retired ones. RESET changes the election denominator and clears state;
+		// retirement requires a separately verified, coordinated procedure.
+		log.FromContext(ctx).Info("sentinel has surplus topology entries; preserving membership pending explicit retirement",
 			"pod", pod.Name,
 			"expectedSlaves", expectedSlaves,
 			"slaves", masterInfo.Slaves,
 			"expectedSentinels", expectedSentinels,
 			"sentinels", masterInfo.Sentinels,
 		)
-		if err := sentinel.SentinelReset(ctx, masterGroupName); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			errs = append(errs, fmt.Errorf("sentinel reset on pod %s: %w", pod.Name, err))
-		}
 	}
 	return errors.Join(errs...)
 }
