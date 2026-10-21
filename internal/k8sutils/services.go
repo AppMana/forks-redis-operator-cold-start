@@ -15,6 +15,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
+const (
+	// redisClientPortName and redisBusPortName are the port names used on every
+	// Redis service. They are matched by name when reading back allocated node
+	// ports, because the order of ServicePort entries is not part of the API
+	// contract.
+	redisClientPortName    = "redis-client"
+	redisBusPortName       = "redis-bus"
+	sentinelClientPortName = "sentinel-client"
+)
+
 // exporterPortProvider return the exporter port if bool is true
 type exporterPortProvider func() (port int, enable bool)
 
@@ -26,9 +36,9 @@ var disableMetrics exporterPortProvider = func() (int, bool) {
 func generateServiceDef(serviceMeta metav1.ObjectMeta, epp exporterPortProvider, ownerDef metav1.OwnerReference, headless bool, serviceType string, port int, extra ...corev1.ServicePort) *corev1.Service {
 	var PortName string
 	if serviceMeta.Labels["role"] == "sentinel" {
-		PortName = "sentinel-client"
+		PortName = sentinelClientPortName
 	} else {
-		PortName = "redis-client"
+		PortName = redisClientPortName
 	}
 	service := &corev1.Service{
 		TypeMeta:   generateMetaInformation("Service", "v1"),
@@ -90,7 +100,7 @@ func generateServiceType(k8sServiceType string) corev1.ServiceType {
 
 // createService is a method to create service is Kubernetes
 func createService(ctx context.Context, kusClient kubernetes.Interface, namespace string, service *corev1.Service) error {
-	_, err := kusClient.CoreV1().Services(namespace).Create(context.TODO(), service, metav1.CreateOptions{})
+	_, err := kusClient.CoreV1().Services(namespace).Create(ctx, service, metav1.CreateOptions{})
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Redis service creation is failed")
 		return err
@@ -101,7 +111,7 @@ func createService(ctx context.Context, kusClient kubernetes.Interface, namespac
 
 // updateService is a method to update service is Kubernetes
 func updateService(ctx context.Context, k8sClient kubernetes.Interface, namespace string, service *corev1.Service) error {
-	_, err := k8sClient.CoreV1().Services(namespace).Update(context.TODO(), service, metav1.UpdateOptions{})
+	_, err := k8sClient.CoreV1().Services(namespace).Update(ctx, service, metav1.UpdateOptions{})
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Redis service update failed")
 		return err
@@ -115,7 +125,7 @@ func getService(ctx context.Context, k8sClient kubernetes.Interface, namespace s
 	getOpts := metav1.GetOptions{
 		TypeMeta: generateMetaInformation("Service", "v1"),
 	}
-	serviceInfo, err := k8sClient.CoreV1().Services(namespace).Get(context.TODO(), name, getOpts)
+	serviceInfo, err := k8sClient.CoreV1().Services(namespace).Get(ctx, name, getOpts)
 	if err != nil {
 		log.FromContext(ctx).V(1).Info("Redis service get action is failed")
 		return nil, err

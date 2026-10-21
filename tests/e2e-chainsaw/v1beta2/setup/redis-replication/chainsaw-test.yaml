@@ -35,11 +35,45 @@ spec:
 
               # maxmemory should not equal to 0
               MAXMEMORY=$(kubectl exec -n ${NAMESPACE} redis-replication-0 -c redis-replication -- redis-cli --no-auth-warning -a Opstree1234 config get maxmemory | grep -A1 "maxmemory" | tail -n1)
-              if [ "$MAXMEMORY" == "0" ]; then
+              if [ "$MAXMEMORY" = "0" ]; then
                 echo "maxmemory value is $MAXMEMORY, expected not 0"
                 exit 1
               fi
               exit 0
+
+    - name: Assert dynamic config
+      description: dynamicConfig is applied at runtime via CONFIG SET to every replica without a restart
+      try:
+        - script:
+            timeout: 120s
+            content: |
+              #!/bin/bash
+              set -e
+
+              # The operator applies dynamicConfig on a reconcile after the pods are
+              # ready, so poll until every replica reflects the CONFIG SET values.
+              for i in $(seq 1 30); do
+                ALL_OK=true
+                for POD in redis-replication-0 redis-replication-1 redis-replication-2; do
+                  CMD="kubectl exec -n ${NAMESPACE} ${POD} -c redis-replication -- redis-cli --no-auth-warning -a Opstree1234"
+                  POLICY=$(${CMD} config get maxmemory-policy | grep -A1 "maxmemory-policy" | tail -n1)
+                  SLOWLOG=$(${CMD} config get slowlog-log-slower-than | grep -A1 "slowlog-log-slower-than" | tail -n1)
+                  if [ "$POLICY" != "allkeys-lru" ] || [ "$SLOWLOG" != "5000" ]; then
+                    echo "attempt ${i}: ${POD} maxmemory-policy=${POLICY} slowlog-log-slower-than=${SLOWLOG}, waiting..."
+                    ALL_OK=false
+                    break
+                  fi
+                done
+                if [ "$ALL_OK" = "true" ]; then
+                  echo "all replicas have correct dynamic configuration"
+                  exit 0
+                fi
+                sleep 3
+              done
+              echo "timed out waiting for dynamic configuration to be applied"
+              exit 1
+            check:
+              (contains($stdout, 'all replicas have correct dynamic configuration')): true
 
 
     - name: Resize pvc
@@ -52,6 +86,59 @@ spec:
         - assert:
             timeout: 300s
             file: ready-pvc-resized.yaml
+
+    - name: Assert sentinel discovered the replicas
+      try:
+        - script:
+            timeout: 90s
+            content: |
+              ./wait-for.sh 60 2 "kubectl -n ${NAMESPACE} exec redis-replication-s-0 -c sentinel -- redis-cli -p 26379 sentinel replicas mymaster | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$'"
+            check:
+              (contains($stdout, 'matched')): true
+
+    - name: Assert every sentinel has a usable quorum
+      try:
+        - script:
+            timeout: 210s
+            content: |
+              set -eu
+              for ordinal in 0 1 2; do
+                ./wait-for.sh 60 1 "kubectl --request-timeout=5s -n ${NAMESPACE} exec redis-replication-s-${ordinal} -c sentinel -- redis-cli -p 26379 SENTINEL CKQUORUM mymaster | grep -c '^OK 3 usable Sentinels'"
+              done
+              echo 'PASS:all three Sentinels have usable quorum'
+            check:
+              ($error == null): true
+              (contains($stdout, 'PASS:all three Sentinels have usable quorum')): true
+
+    - name: Assert hostname announcements are off by default
+      try:
+        - script:
+            timeout: 60s
+            content: |
+              ./wait-for.sh 30 no "kubectl -n ${NAMESPACE} exec redis-replication-s-0 -c sentinel -- redis-cli -p 26379 sentinel config get resolve-hostnames | tail -1"
+            check:
+              (contains($stdout, 'matched')): true
+        - script:
+            timeout: 60s
+            content: |
+              ./wait-for.sh 30 "" "kubectl -n ${NAMESPACE} exec redis-replication-0 -c redis-replication -- redis-cli -a Opstree1234 --no-auth-warning config get replica-announce-ip | tail -1"
+            check:
+              (contains($stdout, 'matched')): true
+
+    - name: Wait for data assertion helper
+      try:
+        - script:
+            timeout: 190s
+            content: |
+              set -eu
+              if ! kubectl -n "${NAMESPACE}" wait pod/data-assert --for=condition=Ready --timeout=180s; then
+                columns='PHASE:.status.phase,WAITING:.status.containerStatuses[*].state.waiting.reason'
+                columns="$columns,TERMINATED:.status.containerStatuses[*].state.terminated.reason"
+                columns="$columns,EXIT:.status.containerStatuses[*].state.terminated.exitCode,RESTARTS:.status.containerStatuses[*].restartCount"
+                kubectl -n "${NAMESPACE}" get pod/data-assert -o "custom-columns=$columns"
+                exit 1
+              fi
+              kubectl -n "${NAMESPACE}" exec data-assert -c data-assert -- test -s /go/src/data-assert/main.go
 
     - name: Put data
       try:
@@ -67,24 +154,15 @@ spec:
             check:
               (contains($stdout, 'OK')): true
 
-    - name: Hange the master
+    - name: Fail over a paused primary
       try:
         - script:
-            timeout: 60s
+            timeout: 150s
             content: |
-              kubectl exec --namespace ${NAMESPACE} redis-replication-0 -- redis-cli -p 6379  -a Opstree1234 EVAL "while true do end" 0
-
-    - name: Check master changed
-      try:
-        - sleep:
-            duration: 60s
-        - script:
-            timeout: 10s
-            content: |
-              export MASTER_POD_FROM_STATUS=$(kubectl -n ${NAMESPACE} get redisreplication redis-replication -o jsonpath='{.status.masterNode}');
-              echo "$MASTER_POD_FROM_STATUS"
+              KIND_CLUSTER_NAME=kind NAMESPACE="${NAMESPACE}" sh ./pause-primary.sh
             check:
-              (contains($stdout, 'redis-replication-0')): false
+              ($error == null): true
+              (contains($stdout, 'PASS:paused-primary')): true
 
     - name: Assert data
       try:
@@ -99,6 +177,37 @@ spec:
                        --password Opstree1234"
             check:
               (contains($stdout, 'OK')): true
+
+    - name: Enable hostname announcements
+      try:
+        - apply:
+            resource:
+              apiVersion: redis.redis.opstreelabs.in/v1beta2
+              kind: RedisReplication
+              metadata:
+                name: redis-replication
+              spec:
+                sentinel:
+                  resolveHostnames: "yes"
+                  announceHostnames: "yes"
+        - assert:
+            timeout: 5m
+            file: hostname-announce-on.yaml
+
+    - name: Assert the replica announces its FQDN
+      try:
+        - script:
+            timeout: 120s
+            content: |
+              ./wait-for.sh 90 "redis-replication-0.redis-replication-headless.${NAMESPACE}.svc.cluster.local" "kubectl -n ${NAMESPACE} exec redis-replication-0 -c redis-replication -- redis-cli -a Opstree1234 --no-auth-warning config get replica-announce-ip | tail -1"
+            check:
+              (contains($stdout, 'matched')): true
+        - script:
+            timeout: 120s
+            content: |
+              ./wait-for.sh 90 2 "kubectl -n ${NAMESPACE} exec redis-replication-s-0 -c sentinel -- redis-cli -p 26379 sentinel replicas mymaster | grep -cE '^redis-replication-[0-9]+\.redis-replication-headless\.${NAMESPACE}\.svc\.cluster\.local:[0-9]+$'"
+            check:
+              (contains($stdout, 'matched')): true
 
     - name: redis-replication-uninstall
       description: Uninstall Redis Replication

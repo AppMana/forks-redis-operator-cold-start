@@ -6,6 +6,7 @@
 *.so
 *.dylib
 bin
+/operator
 testbin/*
 
 # Test binary, build with `go test -c`
@@ -32,3 +33,6 @@ coverage.html
 docs/build
 kubeconfig
 CLAUDE.md
+coverage.txt
+
+.claude

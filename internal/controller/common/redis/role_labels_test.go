@@ -2,13 +2,17 @@ package redis
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func replicationPod(name, ip, role string, deleting bool) *corev1.Pod {
@@ -37,6 +41,46 @@ func roleLabels(t *testing.T, k8s *fake.Clientset) map[string]string {
 		roles[pod.Name] = pod.Labels[common.RedisRoleLabelKey]
 	}
 	return roles
+}
+
+func TestEmptyUnsafeMasterLosesExistingLabelWithoutReplacement(t *testing.T) {
+	k8s := fake.NewSimpleClientset(replicationPod("redis-repl-0", "10.0.0.10", "master", false))
+	h := NewHealer(k8s)
+	require.NoError(t, h.PublishReplicationRoleLabels(context.Background(), "team-a", map[string]string{"app": "redis-repl"},
+		map[string]string{"redis-repl-0": UnsafeMasterRole}, ""))
+	require.Empty(t, roleLabels(t, k8s)["redis-repl-0"])
+}
+
+func TestPublishReplicationRoleLabelsWithdrawsBeforePublishing(t *testing.T) {
+	for _, failWithdrawal := range []bool{false, true} {
+		t.Run(fmt.Sprint(failWithdrawal), func(t *testing.T) {
+			// The new primary sorts first in the API list: ordering matters.
+			k8s := fake.NewSimpleClientset(
+				replicationPod("redis-repl-0", "10.0.0.10", "slave", false),
+				replicationPod("redis-repl-2", "10.0.0.12", "master", false),
+			)
+			var patches []string
+			k8s.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				name := action.(k8stesting.PatchAction).GetName()
+				patches = append(patches, name)
+				if failWithdrawal && name == "redis-repl-2" {
+					return true, nil, errors.New("denied")
+				}
+				return false, nil, nil
+			})
+			h := NewHealer(k8s)
+			err := h.PublishReplicationRoleLabels(context.Background(), "team-a", map[string]string{"app": "redis-repl"},
+				map[string]string{"redis-repl-0": "master", "redis-repl-2": "master"}, "redis-repl-0")
+			if failWithdrawal {
+				require.Error(t, err)
+				require.Equal(t, []string{"redis-repl-2"}, patches)
+				require.Equal(t, "slave", roleLabels(t, k8s)["redis-repl-0"])
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, []string{"redis-repl-2", "redis-repl-0"}, patches)
+			}
+		})
+	}
 }
 
 // A drain of the primary's node: Sentinel promotes redis-repl-2 within seconds

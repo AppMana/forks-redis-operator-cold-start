@@ -1,0 +1,11 @@
+---
+# Local qualification fixture: runtime dynamicConfig alone has a startup gap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: upgrade-write-policy
+  namespace: redis-upgrade-canary-migration
+data:
+  redis-additional.conf: |
+    min-replicas-to-write 1
+    min-replicas-max-lag 5

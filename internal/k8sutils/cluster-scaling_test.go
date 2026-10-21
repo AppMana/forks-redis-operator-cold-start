@@ -10,6 +10,38 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestObserveEmptyMastersRejectsIncompleteInventory(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		nodes     [][2]string
+		wantEmpty bool
+		wantError bool
+	}{
+		{name: "missing inventory", wantError: true},
+		{name: "unknown identity", nodes: [][2]string{{"", "0"}}, wantError: true},
+		{name: "slot lookup failed", nodes: [][2]string{{"node-a", ""}}, wantError: true},
+		{name: "later lookup failed", nodes: [][2]string{{"node-a", "0"}, {"node-b", ""}}, wantError: true},
+		{name: "negative slot count", nodes: [][2]string{{"node-a", "-1"}}, wantError: true},
+		{name: "invalid slot count", nodes: [][2]string{{"node-a", "invalid"}}, wantError: true},
+		{name: "excess slot count", nodes: [][2]string{{"node-a", "16385"}}, wantError: true},
+		{name: "duplicate identity", nodes: [][2]string{{"node-a", "0"}, {"node-a", "16384"}}, wantError: true},
+		{name: "confirmed empty node", nodes: [][2]string{{"node-a", "0"}, {"node-b", "16384"}}, wantEmpty: true},
+		{name: "all have slots", nodes: [][2]string{{"node-a", "8192"}, {"node-b", "8192"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			empty, err := observeEmptyMasters(int32(len(tt.nodes)), func(i int32) (string, string) {
+				return tt.nodes[i][0], tt.nodes[i][1]
+			})
+			assert.Equal(t, tt.wantEmpty, empty)
+			if tt.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func Test_clusterHasEmptyMasters_WhenConnectedMasterHasNoSlots_ReturnsTrue(t *testing.T) {
 	nodes := []clusterNodesResponse{
 		// master with slots assigned
@@ -499,11 +531,12 @@ func Test_clusterStableNoOpenSlots_ReturnsFalse(t *testing.T) {
 
 func Test_verifyLeaderPodInfo(t *testing.T) {
 	tests := []struct {
-		name         string
-		section      string
-		response     string
-		err          error
-		expectedBool bool
+		name          string
+		section       string
+		response      string
+		err           error
+		expectedBool  bool
+		expectedError bool
 	}{
 		{
 			name:         "is master",
@@ -518,11 +551,17 @@ func Test_verifyLeaderPodInfo(t *testing.T) {
 			expectedBool: false,
 		},
 		{
-			name:         "redis info error",
-			section:      "replication",
-			err:          redis.ErrClosed,
-			expectedBool: false,
+			name:          "redis info error",
+			section:       "replication",
+			err:           redis.ErrClosed,
+			expectedBool:  false,
+			expectedError: true,
 		},
+		{name: "missing role", section: "replication", response: "connected_slaves:1\r\n", expectedError: true},
+		{name: "unknown role", section: "replication", response: "role:unknown\r\n", expectedError: true},
+		{name: "duplicate role", section: "replication", response: "role:master\r\nrole:slave\r\n", expectedError: true},
+		{name: "duplicate identical role", section: "replication", response: "role:slave\r\nrole:slave\r\n", expectedError: true},
+		{name: "LF role", section: "replication", response: "# Replication\nrole:master\n", expectedBool: true},
 	}
 
 	for _, tt := range tests {
@@ -536,7 +575,12 @@ func Test_verifyLeaderPodInfo(t *testing.T) {
 				mock.ExpectInfo(tt.section).SetVal(tt.response)
 			}
 
-			result := verifyLeaderPodInfo(ctx, client, "test-pod")
+			result, err := verifyLeaderPodInfo(ctx, client, "test-pod")
+			if tt.expectedError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 
 			assert.Equal(t, tt.expectedBool, result, "Test case: "+tt.name)
 
@@ -686,10 +730,19 @@ func Test_getAttachedFollowerNodeIDs(t *testing.T) {
 			if tt.clusterSlavesErr != nil {
 				mock.ExpectClusterSlaves(tt.masterNodeID).SetErr(tt.clusterSlavesErr)
 			} else {
-				mock.ExpectClusterSlaves(tt.masterNodeID).SetVal(tt.slaveNodeIDs)
+				var rows []string
+				for _, id := range tt.slaveNodeIDs {
+					rows = append(rows, fmt.Sprintf("%s addr slave %s 0 0 1 connected", id, tt.masterNodeID))
+				}
+				mock.ExpectClusterSlaves(tt.masterNodeID).SetVal(rows)
 			}
 
-			result := getAttachedFollowerNodeIDs(ctx, client, tt.masterNodeID)
+			result, err := getAttachedFollowerNodeIDs(ctx, client, tt.masterNodeID)
+			if tt.clusterSlavesErr != nil {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 
 			assert.ElementsMatch(t, tt.expectedslaveNodeIDs, result, "Test case: "+tt.name)
 

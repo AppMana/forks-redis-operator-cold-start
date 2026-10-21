@@ -122,8 +122,9 @@ func TestReconcileStatusPublishesElectedMaster(t *testing.T) {
 			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(instance).WithStatusSubresource(instance).Build()
 			h := &recordingRoleHealer{}
 			r := &Reconciler{
-				Client: c,
-				Healer: h,
+				Client:  c,
+				Healer:  h,
+				Checker: keyCountsOf(map[string]int64{"redis-repl-0": 10, "redis-repl-1": 10, "redis-repl-2": 10}),
 				ObserveRoles: func(context.Context, *rrvb2.RedisReplication) (map[string]string, error) {
 					roles := map[string]string{}
 					for _, pod := range tc.masters {

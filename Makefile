@@ -3,7 +3,7 @@
 # ===========================
 
 # Current Operator version
-VERSION ?= 0.23.0
+VERSION ?= 0.27.0
 
 # Default bundle image tag
 BUNDLE_IMG ?= controller-bundle:$(VERSION)
@@ -70,8 +70,10 @@ all: manager
 
 # Run tests
 .PHONY: test
-test: generate fmt vet manifests
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" go test ./... -coverprofile cover.out
+test: envtest generate fmt vet manifests
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use --use-deprecated-gcs=false $(ENVTEST_K8S_VERSION) -p path)" && \
+	test -n "$$KUBEBUILDER_ASSETS" && export KUBEBUILDER_ASSETS && \
+	go test ./... -coverprofile cover.out
 
 # Build manager binary
 .PHONY: manager
@@ -291,4 +293,3 @@ GOBIN=$(LOCALBIN) go install $${package} ;\
 mv "$$(echo "$(1)" | sed "s/-$(3)$$//")" $(1) ;\
 }
 endef
-

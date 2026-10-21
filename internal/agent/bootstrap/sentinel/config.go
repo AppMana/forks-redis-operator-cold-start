@@ -2,11 +2,27 @@ package bootstrap
 
 import (
 	"fmt"
-	"os"
+	"log"
+	"strings"
 
 	agentutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/agent/util"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/consts"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util"
+	"github.com/Showmax/go-fqdn"
 )
+
+var fqdnHostname = fqdn.FqdnHostname
+
+func announceHostname() (string, error) {
+	name, err := fqdnHostname()
+	if err != nil {
+		return "", err
+	}
+	if !strings.Contains(name, ".") {
+		return "", fmt.Errorf("hostname %q is not fully qualified", name)
+	}
+	return name, nil
+}
 
 // defaultSentinelConfig from https://github.com/OT-CONTAINER-KIT/redis/blob/master/sentinel.conf
 const defaultSentinelConfig = `
@@ -28,13 +44,24 @@ sentinel deny-scripts-reconfig yes
 `
 
 func GenerateConfig() error {
-	cfg := agentutil.NewConfig("/etc/redis/sentinel.conf", defaultSentinelConfig)
+	confPath, _ := util.CoalesceEnv("SENTINEL_CONFIG_FILE", "/etc/redis/sentinel.conf")
+	var monitor []string
+	var election [][]string
+	persistent := util.CoalesceEnv1("SENTINEL_PERSISTENCE_ENABLED", "false") == "true"
+	if persistent {
+		var err error
+		monitor, election, err = retainedElection(confPath, util.CoalesceEnv1("MASTER_GROUP_NAME", "mymaster"))
+		if err != nil {
+			return err
+		}
+	}
+	cfg := agentutil.NewConfig(confPath, defaultSentinelConfig)
 
 	// set_sentinel_password
 	{
 		if val, ok := util.CoalesceEnv("REDIS_PASSWORD", ""); ok {
-			cfg.Append("masterauth", val)
-			cfg.Append("requirepass", val)
+			cfg.Append("masterauth", agentutil.QuoteConfigArgument(val))
+			cfg.Append("requirepass", agentutil.QuoteConfigArgument(val))
 			cfg.Append("protected-mode", "yes")
 		} else {
 			fmt.Println("Sentinel is running without password which is not recommended")
@@ -53,30 +80,49 @@ func GenerateConfig() error {
 		failoverTimeout, _ := util.CoalesceEnv("FAILOVER_TIMEOUT", "180000")
 		resolveHostnames, _ := util.CoalesceEnv("RESOLVE_HOSTNAMES", "no")
 		announceHostnames, _ := util.CoalesceEnv("ANNOUNCE_HOSTNAMES", "no")
+		// A requested transition to IP mode must not make retained election
+		// state unparsable. Keep DNS resolution until the running controller
+		// has migrated the monitor and discovered peers to IP addresses. This
+		// does not enable hostname announcements or discard any election state.
+		if retainedElectionNeedsResolver(monitor, election) {
+			resolveHostnames = "yes"
+		}
 
-		cfg.Append("sentinel monitor", masterGroupName, ip, port, quorum)
+		// DNS must be enabled before Redis parses a retained hostname monitor.
+		cfg.Append("sentinel resolve-hostnames", resolveHostnames)
+		cfg.Append("sentinel announce-hostnames", announceHostnames)
+		if monitor != nil {
+			cfg.Append("sentinel monitor", masterGroupName, monitor[3], monitor[4], quorum)
+		} else {
+			cfg.Append("sentinel monitor", masterGroupName, ip, port, quorum)
+		}
 		cfg.Append("sentinel down-after-milliseconds", masterGroupName, downAfterMilliseconds)
 		cfg.Append("sentinel parallel-syncs", masterGroupName, parallelSyncs)
 		cfg.Append("sentinel failover-timeout", masterGroupName, failoverTimeout)
-		cfg.Append("sentinel resolve-hostnames", resolveHostnames)
-		cfg.Append("sentinel announce-hostnames", announceHostnames)
 
 		// If master password is set
 		if masterPassword, ok := util.CoalesceEnv("MASTER_PASSWORD", ""); ok {
-			cfg.Append("sentinel auth-pass", masterGroupName, masterPassword)
+			cfg.Append("sentinel auth-pass", masterGroupName, agentutil.QuoteConfigArgument(masterPassword))
 		}
 
 		// If sentinel ID is set
-		if sentinelID, ok := util.CoalesceEnv("SENTINEL_ID", ""); ok {
+		if sentinelID, ok := util.CoalesceEnv("SENTINEL_ID", ""); ok && monitor == nil {
 			// Note: We should use SHA1 hash here, but since we don't have a direct SHA1 function,
 			// we're simply using the sentinelID as myid
 			// In a real application, SHA1 hash functionality should be implemented
 			cfg.Append("sentinel myid", sentinelID)
 		}
 
-		// If resolveHostnames is set to yes, then we need to announce the hostnames
+		// If resolveHostnames is set to yes, then we need to announce the hostnames.
+		// Note the pre-existing `sentinel monitor` line above still renders the
+		// unset IP env as 0.0.0.0; the operator repairs it with SENTINEL MONITOR
+		// once it knows the master. See #1806.
 		if announceHostnames == "yes" && resolveHostnames == "yes" {
-			cfg.Append("sentinel announce-ip", ip)
+			if fqdnName, err := announceHostname(); err != nil {
+				log.Printf("Warning: Failed to get FQDN for sentinel announce-ip: %v", err)
+			} else {
+				cfg.Append("sentinel announce-ip", fqdnName)
+			}
 		}
 	}
 
@@ -109,7 +155,9 @@ func GenerateConfig() error {
 			cfg.Append("tls-port", "26379")
 			cfg.Append("tls-cert-file", redisTLSCert)
 			cfg.Append("tls-key-file", redisTLSCertKey)
-			cfg.Append("tls-ca-cert-file", redisTLSCACert)
+			if redisTLSCACert != "" {
+				cfg.Append("tls-ca-cert-file", redisTLSCACert)
+			}
 			cfg.Append("tls-auth-clients", "optional")
 			// Sentinel should use tls for replication connection.
 			cfg.Append("tls-replication", "yes")
@@ -120,21 +168,23 @@ func GenerateConfig() error {
 
 	// If external config file exists, include it
 	externalConfigFile, _ := util.CoalesceEnv("EXTERNAL_CONFIG_FILE", "/etc/redis/external.conf.d/redis-sentinel-additional.conf")
-	if fileExists(externalConfigFile) {
-		cfg.Append("include", externalConfigFile)
+	if err := agentutil.ValidateRequiredExternalConfig(externalConfigFile); err != nil {
+		return err
+	}
+	expandExternal, _ := util.CoalesceEnv(consts.ENV_KEY_EXPAND_EXTERNAL_CONFIG, "false")
+	cfg.AppendExternalConfig(externalConfigFile, expandExternal == "true")
+	for _, fields := range election {
+		cfg.Append(fields...)
 	}
 
 	// Commit configuration
+	if persistent {
+		return cfg.CommitAtomic()
+	}
 	if err := cfg.Commit(); err != nil {
 		return err
 	}
 
 	fmt.Println("Starting sentinel service .....")
 	return nil
-}
-
-// fileExists checks if a file exists
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }

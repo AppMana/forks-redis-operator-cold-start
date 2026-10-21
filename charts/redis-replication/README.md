@@ -47,6 +47,7 @@ helm delete <my-release> --namespace <namespace>
 | TLS.ca | string | `"ca.crt"` |  |
 | TLS.cert | string | `"tls.crt"` |  |
 | TLS.key | string | `"tls.key"` |  |
+| TLS.secret.defaultMode | int | `288` |  |
 | TLS.secret.secretName | string | `""` |  |
 | acl.secret.secretName | string | `""` |  |
 | affinity | object | `{}` |  |
@@ -69,6 +70,7 @@ helm delete <my-release> --namespace <namespace>
 | pdb.enabled | bool | `false` |  |
 | pdb.maxUnavailable | string | `nil` |  |
 | pdb.minAvailable | int | `1` |  |
+| podManagementPolicy | string | `"OrderedReady"` |  |
 | podSecurityContext.fsGroup | int | `1000` |  |
 | podSecurityContext.runAsUser | int | `1000` |  |
 | priorityClassName | string | `""` |  |
@@ -80,12 +82,13 @@ helm delete <my-release> --namespace <namespace>
 | redisExporter.securityContext | object | `{}` |  |
 | redisExporter.tag | string | `"v1.44.0"` |  |
 | redisReplication.clusterSize | int | `3` |  |
+| redisReplication.dynamicConfig | list | `[]` | DynamicConfig is a list of "key value" Redis parameters applied at runtime    via CONFIG SET (without triggering a rolling restart). Note: CONFIG SET is    not persisted to disk, so values are not retained across pod restarts unless    they are also provided through externalConfig.    Example:    dynamicConfig:      - "maxmemory-policy allkeys-lru"      - "slowlog-log-slower-than 5000" |
 | redisReplication.ignoreAnnotations | list | `[]` |  |
 | redisReplication.image | string | `"quay.io/opstree/redis"` |  |
 | redisReplication.imagePullPolicy | string | `"IfNotPresent"` |  |
 | redisReplication.imagePullSecrets | list | `[]` |  |
 | redisReplication.livenessProbe | object | `{}` |  |
-| redisReplication.maxMemoryPercentOfLimit | int | `0` | MaxMemoryPercentOfLimit is the percentage of the Redis container memory limit to be used as maxmemory.    When a memory limit exists, the operator also exposes the computed value via the REDIS_MAX_MEMORY env var.    Default is 0 (disabled). |
+| redisReplication.maxMemoryPercentOfLimit | int | `0` | MaxMemoryPercentOfLimit is the percentage of the Redis container memory limit to be used as maxmemory.    When a memory limit exists, the operator also exposes the computed value via the REDIS_MAX_MEMORY env var.    Requires the operator to run with the GenerateConfigInInitContainer feature gate enabled    (featureGates.GenerateConfigInInitContainer=true in the redis-operator chart); otherwise maxmemory stays 0.    Default is 0 (disabled). |
 | redisReplication.minReadySeconds | int | `0` |  |
 | redisReplication.name | string | `""` |  |
 | redisReplication.persistentVolumeClaimRetentionPolicy | object | `{}` |  |
@@ -97,12 +100,22 @@ helm delete <my-release> --namespace <namespace>
 | redisReplication.serviceType | string | `"ClusterIP"` |  |
 | redisReplication.tag | string | `"v7.0.15"` |  |
 | securityContext | object | `{}` |  |
-| sentinel | object | `{"announceHostnames":"no","downAfterMilliseconds":"5000","enabled":false,"failoverTimeout":"10000","ignoreAnnotations":[],"image":"quay.io/opstree/redis-sentinel","imagePullPolicy":"IfNotPresent","minReadySeconds":0,"parallelSyncs":"1","persistentVolumeClaimRetentionPolicy":{},"resolveHostnames":"no","resources":{},"size":3,"tag":"v7.0.15"}` | Sentinel configuration for automatic failover. When enabled, the operator creates a Sentinel StatefulSet alongside the replication pods. The operator queries Sentinel for the current master instead of forcing master-by-ordinal. |
+| sentinel | object | `{"affinity":{},"announceHostnames":"no","downAfterMilliseconds":"5000","enabled":false,"failoverTimeout":"10000","ignoreAnnotations":[],"image":"quay.io/opstree/redis-sentinel","imagePullPolicy":"IfNotPresent","minReadySeconds":0,"nodeSelector":{},"parallelSyncs":"1","persistentVolumeClaimRetentionPolicy":{},"podSecurityContext":{},"priorityClassName":"","redisSecret":{"secretKey":"","secretName":""},"resolveHostnames":"no","resources":{},"securityContext":{},"serviceAccountName":"","size":3,"tag":"v7.0.15","terminationGracePeriodSeconds":null,"tolerations":[],"topologySpreadConstraints":[]}` | Sentinel configuration for automatic failover. When enabled, the operator creates a Sentinel StatefulSet alongside the replication pods. The operator queries Sentinel for the current master instead of forcing master-by-ordinal. |
+| sentinel.affinity | object | `{}` | Affinity rules for Sentinel pods, e.g. anti-affinity to keep them off the Redis nodes. |
 | sentinel.announceHostnames | string | `"no"` | Whether Sentinel announces hostnames instead of IPs to clients |
 | sentinel.downAfterMilliseconds | string | `"5000"` | Time in milliseconds before master is considered down |
 | sentinel.failoverTimeout | string | `"10000"` | Failover timeout in milliseconds |
+| sentinel.nodeSelector | object | `{}` | Node selector for scheduling Sentinel pods. |
 | sentinel.parallelSyncs | string | `"1"` | Number of replicas to reconfigure in parallel during failover |
+| sentinel.podSecurityContext | object | `{}` | Pod-level security context for Sentinel pods. |
+| sentinel.priorityClassName | string | `""` | PriorityClass name for Sentinel pods. |
+| sentinel.redisSecret | object | `{"secretKey":"","secretName":""}` | Secret holding the Sentinel password (requirepass on port 26379). The password Sentinel uses towards Redis always comes from redisReplication.redisSecret. |
 | sentinel.resolveHostnames | string | `"no"` | Use hostnames instead of IPs for Sentinel monitoring. WARNING: the operator does not pass RESOLVE_HOSTNAMES env var to sentinel pods, so setting this to "yes" will cause SENTINEL MONITOR to fail. Keep as "no". |
+| sentinel.securityContext | object | `{}` | Container-level security context for the Sentinel container. |
+| sentinel.serviceAccountName | string | `""` | ServiceAccount name for Sentinel pods. |
+| sentinel.terminationGracePeriodSeconds | string | `nil` | Termination grace period (in seconds) for Sentinel pods. |
+| sentinel.tolerations | list | `[]` | Tolerations for Sentinel pods. |
+| sentinel.topologySpreadConstraints | list | `[]` | Topology spread constraints for Sentinel pods. |
 | serviceAccountName | string | `""` |  |
 | serviceMonitor.enabled | bool | `false` |  |
 | serviceMonitor.extraLabels | object | `{}` | extraLabels are added to the servicemonitor when enabled set to true |

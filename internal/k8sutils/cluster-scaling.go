@@ -230,7 +230,7 @@ func waitForClusterNoOpenSlots(ctx context.Context, client kubernetes.Interface,
 // ReshardRedisCluster transfer the slots from the last node to the provided transfer node.
 //
 // NOTE: when all slot been transferred, the node become slave of the transfer node.
-func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32, transferNodeIdx int32, remove bool) {
+func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32, transferNodeIdx int32, remove bool) error {
 	transferNodeName := fmt.Sprintf("%s-leader-%d", cr.Name, transferNodeIdx)
 	redisClient := configureRedisClient(ctx, client, cr, transferNodeName)
 	defer redisClient.Close()
@@ -249,15 +249,11 @@ func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *r
 	}
 	cmd = []string{"redis-cli", "--cluster", "reshard"}
 	cmd = append(cmd, getEndpoint(ctx, client, cr, transferPOD))
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "error in getting redis password")
-			return
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
+	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, transferNodeName)
+	if err != nil {
+		return fmt.Errorf("cannot reshard: authentication configuration unavailable")
 	}
+	cmd = append(cmd, authArgs...)
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, transferNodeName)...)
 
@@ -270,27 +266,98 @@ func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *r
 
 	// Transfer Node
 	transferNodeID := getRedisNodeID(ctx, client, cr, transferPOD)
+	if removeNodeID == "" || transferNodeID == "" || removeNodeID == transferNodeID {
+		return fmt.Errorf("cannot reshard: source and target must have distinct known identities")
+	}
 	cmd = append(cmd, "--cluster-to")
 	cmd = append(cmd, transferNodeID)
 
-	// Cluster Slots
-	slots := getRedisClusterSlots(ctx, redisClient, removeNodeID)
-	if slots == "0" || slots == "" {
-		log.FromContext(ctx).Info("skipping the execution cmd because no slots found", "Cmd", cmd)
-		return
-	}
-	cmd = append(cmd, "--cluster-slots")
-	cmd = append(cmd, slots)
-
-	cmd = append(cmd, "--cluster-yes")
-
-	log.FromContext(ctx).Info(fmt.Sprintf("transferring %s slots from shard %d to shard %d", slots, shardIdx, transferNodeIdx))
-	executeCommand(ctx, client, cr, cmd, transferNodeName)
-	log.FromContext(ctx).Info(fmt.Sprintf("transferring %s slots from shard %d to shard %d completed", slots, shardIdx, transferNodeIdx))
-
+	var removeNode func() error
 	if remove {
-		RemoveRedisNodeFromCluster(ctx, client, cr, removePOD)
+		followers, err := retiringFollowerIDs(ctx, client, cr, redisClient, removeNodeID)
+		if err != nil {
+			return err
+		}
+		removeNode = func() error {
+			if err := RemoveRedisFollowerNodesFromCluster(ctx, client, cr, followers); err != nil {
+				return err
+			}
+			return RemoveRedisNodeFromCluster(ctx, client, cr, removeNodeID)
+		}
 	}
+	return reshardBeforeRemoval(func() (int, error) {
+		return ownedRedisClusterSlots(ctx, redisClient, removeNodeID)
+	}, func(slots int) error {
+		transferCmd := append(cmd, "--cluster-slots", strconv.Itoa(slots), "--cluster-yes")
+		if _, err := executeCommand1(ctx, client, cr, transferCmd, transferNodeName); err != nil {
+			return fmt.Errorf("reshard execution failed; retaining source node")
+		}
+		return nil
+	}, removeNode)
+}
+
+// A successful CLI exit alone does not prove that it is safe to remove a shard.
+// Observe primary slot ownership again, including when retrying an empty source.
+func reshardBeforeRemoval(observe func() (int, error), transfer func(int) error, remove func() error) error {
+	slots, err := observe()
+	if err != nil {
+		return err
+	}
+	if slots < 0 || slots > 16384 {
+		return fmt.Errorf("invalid source slot count")
+	}
+	if slots > 0 {
+		if err := transfer(slots); err != nil {
+			return err
+		}
+	}
+	remaining, err := observe()
+	if err != nil {
+		return err
+	}
+	if remaining != 0 {
+		return fmt.Errorf("source still owns slots after reshard; retaining source node")
+	}
+	if remove != nil {
+		return remove()
+	}
+	return nil
+}
+
+func ownedRedisClusterSlots(ctx context.Context, client *redis.Client, nodeID string) (int, error) {
+	if nodeID == "" {
+		return 0, fmt.Errorf("source identity is unavailable")
+	}
+	slots, err := client.ClusterSlots(ctx).Result()
+	if err != nil {
+		return 0, fmt.Errorf("source slot inventory is unavailable")
+	}
+	if len(slots) == 0 {
+		return 0, fmt.Errorf("cluster slot inventory is empty")
+	}
+	total := 0
+	var covered [16384]bool
+	coverage := 0
+	for _, slot := range slots {
+		if slot.Start < 0 || slot.End < slot.Start || slot.End >= 16384 || len(slot.Nodes) == 0 || slot.Nodes[0].ID == "" {
+			return 0, fmt.Errorf("cluster slot inventory is invalid")
+		}
+		for i := slot.Start; i <= slot.End; i++ {
+			if covered[i] {
+				return 0, fmt.Errorf("cluster slot inventory overlaps")
+			}
+			covered[i] = true
+			coverage++
+		}
+		// Only the first node owns the slots; following nodes are replicas.
+		if slot.Nodes[0].ID == nodeID {
+			total += slot.End - slot.Start + 1
+		}
+	}
+	if coverage != len(covered) {
+		return 0, fmt.Errorf("cluster slot inventory is incomplete")
+	}
+	return total, nil
 }
 
 func getRedisClusterSlots(ctx context.Context, redisClient *redis.Client, nodeID string) string {
@@ -351,18 +418,16 @@ func FixRedisCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 	}
 	cmd := []string{"redis-cli", "--cluster", "fix"}
 	cmd = append(cmd, getEndpoint(ctx, client, cr, pod))
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
+	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, cr.Name+"-leader-0")
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
+		return err
 	}
+	cmd = append(cmd, authArgs...)
 	cmd = append(cmd, "--cluster-yes")
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
 
-	_, err := executeCommand1(ctx, client, cr, cmd, cr.Name+"-leader-0")
+	_, err = executeCommand1(ctx, client, cr, cmd, cr.Name+"-leader-0")
 	return err
 }
 
@@ -373,7 +438,7 @@ func RebalanceRedisClusterEmptyMasters(ctx context.Context, client kubernetes.In
 		return
 	}
 
-	// cmd = redis-cli --cluster rebalance <redis>:<port> --cluster-use-empty-masters -a <pass>
+	// cmd = redis-cli --cluster rebalance <redis>:<port> --cluster-use-empty-masters
 	var cmd []string
 	pod := RedisDetails{
 		PodName:   cr.Name + "-leader-1",
@@ -382,44 +447,72 @@ func RebalanceRedisClusterEmptyMasters(ctx context.Context, client kubernetes.In
 	cmd = []string{"redis-cli", "--cluster", "rebalance"}
 	cmd = append(cmd, getEndpoint(ctx, client, cr, pod))
 	cmd = append(cmd, "--cluster-use-empty-masters")
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
+	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, cr.Name+"-leader-0")
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
 	}
+	cmd = append(cmd, authArgs...)
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
 
 	executeCommand(ctx, client, cr, cmd, cr.Name+"-leader-1")
 }
 
-func CheckIfEmptyMasters(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) {
+func CheckIfEmptyMasters(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
 	totalRedisLeaderNodes := CheckRedisNodeCount(ctx, client, cr, "leader")
+	if totalRedisLeaderNodes != cr.Spec.GetReplicaCounts("leader") {
+		return fmt.Errorf("cannot inspect empty masters: observed leader count does not match desired count")
+	}
 	redisClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
 	defer redisClient.Close()
 
-	for i := 0; i < int(totalRedisLeaderNodes); i++ {
+	empty, err := observeEmptyMasters(totalRedisLeaderNodes, func(i int32) (string, string) {
 		pod := RedisDetails{
-			PodName:   cr.Name + "-leader-" + strconv.Itoa(i),
+			PodName:   cr.Name + "-leader-" + strconv.Itoa(int(i)),
 			Namespace: cr.Namespace,
 		}
 		podNodeID := getRedisNodeID(ctx, client, cr, pod)
-		podSlots := getRedisClusterSlots(ctx, redisClient, podNodeID)
-
-		if podSlots == "0" || podSlots == "" {
-			log.FromContext(ctx).V(1).Info("Found Empty Redis Leader Node", "pod", pod)
-			RebalanceRedisClusterEmptyMasters(ctx, client, cr)
-			break
+		if podNodeID == "" {
+			return "", ""
 		}
+		podSlots := getRedisClusterSlots(ctx, redisClient, podNodeID)
+		return podNodeID, podSlots
+	})
+	if err != nil {
+		return err
 	}
+	if empty {
+		RebalanceRedisClusterEmptyMasters(ctx, client, cr)
+	}
+	return nil
+}
+
+// Complete the inventory before permitting a rebalance. Empty strings from the
+// legacy observation helpers mean lookup failure, not a node with zero slots.
+func observeEmptyMasters(count int32, observe func(int32) (string, string)) (bool, error) {
+	if count <= 0 {
+		return false, fmt.Errorf("cannot inspect empty masters: no leaders observed")
+	}
+	seen := make(map[string]bool, count)
+	empty := false
+	for i := int32(0); i < count; i++ {
+		nodeID, slots := observe(i)
+		if nodeID == "" || seen[nodeID] {
+			return false, fmt.Errorf("cannot inspect empty masters: missing or duplicate node identity at ordinal %d", i)
+		}
+		seen[nodeID] = true
+		n, err := strconv.ParseUint(slots, 10, 15)
+		if err != nil || n > 16384 {
+			return false, fmt.Errorf("cannot inspect empty masters: missing or invalid slot count at ordinal %d", i)
+		}
+		empty = empty || n == 0
+	}
+	return empty, nil
 }
 
 // Rebalance Redis Cluster Would Rebalance the Redis Cluster without using the empty masters
 func RebalanceRedisCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) {
-	// cmd = redis-cli --cluster rebalance <redis>:<port> -a <pass>
+	// cmd = redis-cli --cluster rebalance <redis>:<port>
 	var cmd []string
 	pod := RedisDetails{
 		PodName:   cr.Name + "-leader-1",
@@ -427,14 +520,11 @@ func RebalanceRedisCluster(ctx context.Context, client kubernetes.Interface, cr 
 	}
 	cmd = []string{"redis-cli", "--cluster", "rebalance"}
 	cmd = append(cmd, getEndpoint(ctx, client, cr, pod))
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
+	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, cr.Name+"-leader-0")
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
 	}
+	cmd = append(cmd, authArgs...)
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
 
@@ -470,14 +560,11 @@ func AddRedisNodeToCluster(ctx context.Context, client kubernetes.Interface, cr 
 	}
 	cmd = append(cmd, getEndpoint(ctx, client, cr, newPod))
 	cmd = append(cmd, getEndpoint(ctx, client, cr, existingPod))
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
+	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, cr.Name+"-leader-0")
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
 	}
+	cmd = append(cmd, authArgs...)
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
 
@@ -489,86 +576,60 @@ func AddRedisNodeToCluster(ctx context.Context, client kubernetes.Interface, cr 
 }
 
 // getAttachedFollowerNodeIDs would return a slice of redis followers attached to a redis leader
-func getAttachedFollowerNodeIDs(ctx context.Context, redisClient *redis.Client, masterNodeID string) []string {
+func getAttachedFollowerNodeIDs(ctx context.Context, redisClient *redis.Client, masterNodeID string) ([]string, error) {
 	// 3acb029fead40752f432c84f9bed2e639119a573 192.168.84.239:6379@16379,redis-cluster-v1beta2-follower-5 slave e3299968586dd457a8dba04fc6c747cecd38510f 0 1713595736542 6 connected
 	slaveNodes, err := redisClient.ClusterSlaves(ctx, masterNodeID).Result()
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to get attached follower node IDs", "masterNodeID", masterNodeID)
-		return nil
+		return nil, fmt.Errorf("attached follower inventory is unavailable")
 	}
 	slaveIDs := make([]string, 0, len(slaveNodes))
+	seen := map[string]bool{}
 	for _, slave := range slaveNodes {
-		stringSlice := strings.Split(slave, " ")
-		slaveIDs = append(slaveIDs, stringSlice[0])
+		fields := strings.Fields(slave)
+		if len(fields) < 8 || !hasFlag(fields[2], "slave") || fields[3] != masterNodeID || seen[fields[0]] {
+			return nil, fmt.Errorf("attached follower inventory is malformed or ambiguous")
+		}
+		seen[fields[0]] = true
+		slaveIDs = append(slaveIDs, fields[0])
 	}
-	log.FromContext(ctx).V(1).Info("Slaves Nodes attached to", "node", masterNodeID, "are", slaveIDs)
-	return slaveIDs
+	return slaveIDs, nil
 }
 
-// Remove redis follower node would remove all follower nodes of last leader node using redis-cli
-func RemoveRedisFollowerNodesFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32) {
-	var cmd []string
+// Retire only previously identified obsolete followers, after slot transfer.
+func RemoveRedisFollowerNodesFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, ids []string) error {
 	redisClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
 	defer redisClient.Close()
-
-	existingPod := RedisDetails{
-		PodName:   cr.Name + "-leader-0",
-		Namespace: cr.Namespace,
-	}
-	lastLeaderPod := RedisDetails{
-		PodName:   cr.Name + "-leader-" + strconv.Itoa(int(shardIdx)),
-		Namespace: cr.Namespace,
-	}
-
-	cmd = []string{"redis-cli"}
-
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
-	}
-	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
-
-	lastLeaderPodNodeID := getRedisNodeID(ctx, client, cr, lastLeaderPod)
-	followerNodeIDs := getAttachedFollowerNodeIDs(ctx, redisClient, lastLeaderPodNodeID)
-
-	cmd = append(cmd, "--cluster", "del-node")
-	cmd = append(cmd, getEndpoint(ctx, client, cr, existingPod))
-	for _, followerNodeID := range followerNodeIDs {
-		cmd = append(cmd, followerNodeID)
-		executeCommand(ctx, client, cr, cmd, cr.Name+"-leader-0")
-		cmd = cmd[:len(cmd)-1]
-	}
+	return retireEmptyFollowers(ids, func(id string) (int, error) {
+		return ownedRedisClusterSlots(ctx, redisClient, id)
+	}, func(id string) error { return RemoveRedisNodeFromCluster(ctx, client, cr, id) })
 }
 
 // Remove redis cluster node would remove last node to the existing redis cluster using redis-cli
-func RemoveRedisNodeFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, removePod RedisDetails) {
-	redisClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
-	defer redisClient.Close()
+func RemoveRedisNodeFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, nodeID string) error {
+	if nodeID == "" {
+		return fmt.Errorf("cannot remove node: identity is unavailable")
+	}
 	existingPod := RedisDetails{
 		PodName:   cr.Name + "-leader-0",
 		Namespace: cr.Namespace,
 	}
 	cmd := []string{"redis-cli", "--cluster", "del-node"}
 	cmd = append(cmd, getEndpoint(ctx, client, cr, existingPod))
-	cmd = append(cmd, getRedisNodeID(ctx, client, cr, removePod))
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
+	cmd = append(cmd, nodeID)
+	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, cr.Name+"-leader-0")
+	if err != nil {
+		return fmt.Errorf("cannot remove node: authentication configuration unavailable")
 	}
+	cmd = append(cmd, authArgs...)
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
-	executeCommand(ctx, client, cr, cmd, cr.Name+"-leader-0")
+	if _, err := executeCommand1(ctx, client, cr, cmd, cr.Name+"-leader-0"); err != nil {
+		return fmt.Errorf("cluster node removal failed")
+	}
+	return nil
 }
 
 // verifyLeaderPod return true if the pod is leader/master
-func VerifyLeaderPod(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, leadIndex int32) bool {
+func VerifyLeaderPod(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, leadIndex int32) (bool, error) {
 	podName := cr.Name + "-leader-" + strconv.Itoa(int(leadIndex))
 
 	redisClient := configureRedisClient(ctx, client, cr, podName)
@@ -576,27 +637,19 @@ func VerifyLeaderPod(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 	return verifyLeaderPodInfo(ctx, redisClient, podName)
 }
 
-func verifyLeaderPodInfo(ctx context.Context, redisClient *redis.Client, podName string) bool {
+func verifyLeaderPodInfo(ctx context.Context, redisClient *redis.Client, podName string) (bool, error) {
 	info, err := redisClient.Info(ctx, "replication").Result()
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to Get the role Info of the", "redis pod", podName)
-		return false
+		return false, fmt.Errorf("cannot observe Redis role for pod %s", podName)
 	}
 
-	lines := strings.Split(info, "\r\n")
-	var role string
-	for _, line := range lines {
-		if strings.HasPrefix(line, "role:") {
-			role = strings.TrimPrefix(line, "role:")
-			return role == "master"
-		}
-	}
-	return false
+	role, err := parseReplicationRole(info)
+	return role == "master", err
 }
 
 func ClusterFailover(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32) error {
 	slavePodName := cr.Name + "-leader-" + strconv.Itoa(int(shardIdx))
-	// cmd = redis-cli cluster failover  -a <pass>
+	// cmd = redis-cli cluster failover
 	var cmd []string
 	pod := RedisDetails{
 		PodName:   slavePodName,
@@ -609,23 +662,26 @@ func ClusterFailover(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 	}
 	host, port := endpoint[:lastColon], endpoint[lastColon+1:]
 	cmd = []string{"redis-cli", "-h", host, "-p", port}
-	if cr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		pass, err := getRedisPassword(ctx, client, cr.Namespace, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Name, *cr.Spec.KubernetesConfig.ExistingPasswordSecret.Key)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "Error in getting redis password")
-		}
-		cmd = append(cmd, "-a")
-		cmd = append(cmd, pass)
+	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, slavePodName)
+	if err != nil {
+		return fmt.Errorf("cannot initiate failover: authentication configuration unavailable")
 	}
+	cmd = append(cmd, authArgs...)
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, slavePodName)...)
 	cmd = append(cmd, "cluster", "failover")
 
-	log.FromContext(ctx).V(1).Info("Redis cluster failover command is", "Command", cmd)
+	log.FromContext(ctx).V(1).Info("Requesting Redis cluster failover", "Pod", slavePodName)
 	execOut, err := executeCommand1(ctx, client, cr, cmd, slavePodName)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "Could not execute command", "Command", cmd, "Output", execOut)
-		return err
+	return validateFailoverAcknowledgement(execOut, err)
+}
+
+// redis-cli may exit successfully for a Redis error reply. Only an exact OK
+// acknowledges this request; acknowledgement is not proof of completed failover.
+func validateFailoverAcknowledgement(output string, err error) error {
+	if err != nil || strings.TrimSpace(output) != "OK" {
+		// CLI arguments and output may contain credentials; keep this error static.
+		return fmt.Errorf("redis cluster failover was not acknowledged")
 	}
 	return nil
 }

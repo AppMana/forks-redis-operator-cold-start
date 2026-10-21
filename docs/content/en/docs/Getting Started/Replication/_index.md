@@ -148,3 +148,11 @@ spec:
 | `parallelSyncs` | "1" | Number of replicas that can sync with master in parallel during failover |
 | `failoverTimeout` | "10000" | Failover timeout in milliseconds |
 | `downAfterMilliseconds` | "5000" | Time in ms before a master is considered down |
+
+The operator honors `quorum` in both bootstrap and runtime reconciliation. The API
+defaults it to `"2"`; it is not automatically increased when `size` changes.
+For a single-Sentinel test deployment, explicitly set `quorum: "1"`. Legacy
+objects with an empty quorum retain the size-based fallback (`size / 2 + 1`).
+Quorum controls failure detection; it does not replace Sentinel's majority
+requirement for failover authorization or the operator's majority-agreement
+check when selecting a recovery primary.

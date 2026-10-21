@@ -23,7 +23,7 @@
   </a>
 </p>
 
-A Golang-based Redis operator that will make/oversee Redis standalone and cluster mode setup on top of Kubernetes. It can create a Redis cluster setup with best practices on Cloud as well as the bare metal environment. Also, it provides an in-built monitoring capability using redis-exporter.
+A Golang-based Redis operator that will make/oversee Redis standalone, cluster, replication, and sentinel mode setup on top of Kubernetes. It can create Redis setups with best practices on Cloud as well as the bare metal environment. Also, it provides an in-built monitoring capability using redis-exporter.
 
 For documentation, please refer to <https://redis-operator.opstree.dev/>
 
@@ -34,7 +34,7 @@ This operator only supports versions of Redis `>=6`.
 ## Architecture
 
 <div align="center">
-    <img src="./static/updated-redis-operator-architecture-using-meshery.jpg">
+    <img src="./static/redis-operator-architecture-v0.25.0.png">
 </div>
 
 ## Purpose
@@ -45,7 +45,7 @@ There are multiple problems that people face while setting up Redis setup on Kub
 
 Here are the features which are supported by this operator:
 
-- Redis cluster and standalone mode setup
+- Redis standalone, cluster, replication, and sentinel mode setup
 - Redis cluster failover and recovery
 - Inbuilt monitoring with redis exporter
 - Password and password-less setup of Redis
@@ -76,6 +76,12 @@ To monitor Redis performance we will be using Prometheus. In any case, extra Pro
 ```
 
 In addition to the annotations you have the possibility to deploy a `ServiceMonitor` for each of the Redis installations (configurable via Helm values file).
+
+#### Grafana Dashboard Integration
+
+The operator supports a detailed Grafana dashboard (ID 16056) for visualizing Redis metrics collected by Prometheus. For manual import, download the JSON from [Grafana.com](https://grafana.com/grafana/dashboards/16056-redis-dashboard-opstree/).
+
+For automated deployment of this dashboard as a ConfigMap (auto-imported via the kube-prometheus-stack sidecar), consider the community Helm chart: [redis-grafana-dashboard](https://github.com/Emrin/redis-grafana-dashboard) (also available on [Artifact Hub](https://artifacthub.io/packages/helm/redis-grafana-dashboard/redis-grafana-dashboard)).
 
 ## Contribution
 

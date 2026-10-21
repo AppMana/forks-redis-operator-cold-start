@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - main
+      - cold-start-bootstrap
   push:
     branches:
       - main
@@ -25,7 +26,7 @@ jobs:
         swap-storage: false
 
     - name: Checkout code
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6
 
     - uses: actions/setup-go@v5
       with:

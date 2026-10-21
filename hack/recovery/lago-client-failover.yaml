@@ -1,0 +1,34 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lago-client-service
+  namespace: redis-upgrade-canary-empty-disk
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 180
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: getlago/api:v1.55.0
+          imagePullPolicy: Never
+          command: [ruby, /qualification/lago-client-failover.rb]
+          env:
+            - name: CANARY_LAGO_TEST
+              value: redis-upgrade-canary-empty-disk
+            - name: CANARY_LAGO_MODE
+              value: service
+          resources:
+            requests: {cpu: 25m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - name: qualification
+              mountPath: /qualification
+              readOnly: true
+      volumes:
+        - name: qualification
+          configMap:
+            name: lago-client-qualification

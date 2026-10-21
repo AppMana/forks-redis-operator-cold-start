@@ -1,0 +1,15 @@
+# Dedicated migration lab only. Large shared host filesystem is above 90%
+# used despite hundreds of GiB free; do not inherit percentage eviction here.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.35.1
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    evictionHard:
+      nodefs.available: "500Mi"
+      imagefs.available: "500Mi"
+      nodefs.inodesFree: "1%"
+    imageGCHighThresholdPercent: 100

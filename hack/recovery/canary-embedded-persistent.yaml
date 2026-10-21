@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: redis-upgrade-canary-embedded-persistent
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisReplication
+metadata:
+  name: upgrade
+  namespace: redis-upgrade-canary-embedded-persistent
+spec:
+  clusterSize: 3
+  podSecurityContext: {runAsUser: 1000, fsGroup: 1000}
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits: {memory: 256Mi}
+  storage:
+    volumeClaimTemplate:
+      spec:
+        storageClassName: standard
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}
+  sentinel:
+    size: 3
+    image: quay.io/opstree/redis-sentinel:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resolveHostnames: "yes"
+    announceHostnames: "yes"
+    podSecurityContext: {runAsUser: 1000, fsGroup: 1000}
+    resources:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits: {memory: 128Mi}
+    configVolumeClaimTemplate:
+      spec:
+        storageClassName: standard
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 128Mi}

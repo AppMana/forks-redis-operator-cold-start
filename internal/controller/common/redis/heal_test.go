@@ -1,0 +1,934 @@
+package redis
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"testing"
+	"time"
+
+	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
+	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
+	rsvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redissentinel/v1beta2"
+	common "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
+	redisservice "github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
+)
+
+func TestUpdateRedisRoleLabelSkipsUnprobeablePods(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	clientset := k8sfake.NewSimpleClientset(
+		newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true),
+		newLabeledRedisPod("redis-1", labels, "", corev1.PodRunning, true),
+		newLabeledRedisPod("redis-2", labels, "10.0.0.12", corev1.PodRunning, false),
+		newLabeledRedisPod("redis-3", labels, "", corev1.PodPending, false),
+	)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.10": true,
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"10.0.0.10"}, redisClient.connectHosts)
+
+	readyPod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, readyPod.Labels[common.RedisRoleLabelKey])
+
+	for _, podName := range []string{"redis-1", "redis-2", "redis-3"} {
+		pod, getErr := clientset.CoreV1().Pods("default").Get(context.Background(), podName, metav1.GetOptions{})
+		require.NoError(t, getErr)
+		assert.Empty(t, pod.Labels[common.RedisRoleLabelKey])
+	}
+}
+
+func TestUpdateRedisRoleLabelRemovesStaleMasterLabelWhenAMasterWithReplicasIsConfirmed(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	staleMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	staleMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	newMaster := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+
+	clientset := k8sfake.NewSimpleClientset(staleMaster, newMaster)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": true,
+		},
+		replicasByHost: map[string]int{
+			"10.0.0.11": 1,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+
+	unreachablePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, unreachablePod.Labels, common.RedisRoleLabelKey)
+
+	masterPod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, masterPod.Labels[common.RedisRoleLabelKey])
+
+	// A merge patch with a null value is idempotent, unlike a JSON Patch "remove"
+	// op, which returns 422 once the label is gone.
+	var removePatches int
+	for _, action := range clientset.Actions() {
+		patchAction, ok := action.(k8stesting.PatchAction)
+		if !ok || patchAction.GetName() != "redis-0" {
+			continue
+		}
+		removePatches++
+		assert.Equal(t, types.MergePatchType, patchAction.GetPatchType())
+		assert.JSONEq(t, `{"metadata":{"labels":{"redis-role":null}}}`, string(patchAction.GetPatch()))
+	}
+	assert.Equal(t, 1, removePatches)
+}
+
+func TestUpdateRedisRoleLabelKeepsStaleMasterLabelWhenNoMasterIsConfirmed(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	unreachableMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	unreachableMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	healthySlave := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+
+	clientset := k8sfake.NewSimpleClientset(unreachableMaster, healthySlave)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": false,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+
+	unreachablePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, unreachablePod.Labels[common.RedisRoleLabelKey])
+
+	healthyPod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelSlave, healthyPod.Labels[common.RedisRoleLabelKey])
+}
+
+// An operator-side fault - a rotated password, a TLS change, a network policy -
+// fails every probe while the pods stay Ready and keep serving. Stripping their
+// labels would take the master and replica services to zero endpoints.
+func TestUpdateRedisRoleLabelKeepsRoleLabelsWhenEveryProbeFails(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	master := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	master.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	slave := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+	slave.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelSlave
+
+	clientset := k8sfake.NewSimpleClientset(master, slave)
+	redisClient := &fakeRedisClient{
+		errByHost: map[string]error{
+			"10.0.0.10": redisServerError("WRONGPASS invalid username-password pair"),
+			"10.0.0.11": redisServerError("WRONGPASS invalid username-password pair"),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+
+	for podName, role := range map[string]string{
+		"redis-0": common.RedisRoleLabelMaster,
+		"redis-1": common.RedisRoleLabelSlave,
+	} {
+		pod, getErr := clientset.CoreV1().Pods("default").Get(context.Background(), podName, metav1.GetOptions{})
+		require.NoError(t, getErr)
+		assert.Equal(t, role, pod.Labels[common.RedisRoleLabelKey])
+	}
+}
+
+// A stale slave label is never removed: doing so on an operator-side fault would
+// empty the replica service, and a genuinely dead pod leaves that service once
+// the node lifecycle controller marks it NotReady.
+func TestUpdateRedisRoleLabelKeepsSlaveLabelOnUnreachablePod(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	unreachableSlave := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	unreachableSlave.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelSlave
+	master := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+	master.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+
+	clientset := k8sfake.NewSimpleClientset(unreachableSlave, master)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": true,
+		},
+		replicasByHost: map[string]int{
+			"10.0.0.11": 1,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+
+	unreachablePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelSlave, unreachablePod.Labels[common.RedisRoleLabelKey])
+}
+
+// The pods this branch exists for are the ones most likely to be deleted between
+// the List and the Patch. A deleted pod took its label with it, so it is passed
+// over without abandoning the rest and without failing the reconcile.
+func TestUpdateRedisRoleLabelPassesOverPodDeletedBeforeStaleLabelRemoval(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	goneMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	goneMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	staleMaster := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+	staleMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	newMaster := newLabeledRedisPod("redis-2", labels, "10.0.0.12", corev1.PodRunning, true)
+
+	clientset := k8sfake.NewSimpleClientset(goneMaster, staleMaster, newMaster)
+	clientset.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.PatchAction).GetName() == "redis-0" {
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "pods"}, "redis-0")
+		}
+		return false, nil, nil
+	})
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.12": true,
+		},
+		replicasByHost: map[string]int{
+			"10.0.0.12": 1,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+			"10.0.0.11": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+
+	stillLabelled, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, stillLabelled.Labels, common.RedisRoleLabelKey)
+}
+
+// Any other failure leaves a dead pod behind the master service, so it must fail
+// the reconcile - after the remaining removals have still been attempted.
+func TestUpdateRedisRoleLabelReturnsErrorWhenStaleLabelRemovalFails(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	forbiddenMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	forbiddenMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	staleMaster := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+	staleMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	newMaster := newLabeledRedisPod("redis-2", labels, "10.0.0.12", corev1.PodRunning, true)
+
+	clientset := k8sfake.NewSimpleClientset(forbiddenMaster, staleMaster, newMaster)
+	clientset.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.PatchAction).GetName() == "redis-0" {
+			return true, nil, apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "redis-0", errors.New("patch denied"))
+		}
+		return false, nil, nil
+	})
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.12": true,
+		},
+		replicasByHost: map[string]int{
+			"10.0.0.12": 1,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+			"10.0.0.11": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.Error(t, err)
+	assert.True(t, apierrors.IsForbidden(err), "expected the API error to be preserved, got %v", err)
+	assert.ErrorContains(t, err, "redis-0")
+
+	stillForbidden, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, stillForbidden.Labels[common.RedisRoleLabelKey])
+
+	removed, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, removed.Labels, common.RedisRoleLabelKey)
+
+	masterPod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-2", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, masterPod.Labels[common.RedisRoleLabelKey])
+}
+
+// dialError is what an unreachable pod actually produces: a dial failure or, for
+// a blackholed node, a timeout. Both satisfy net.Error.
+func dialError() error {
+	return &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+}
+
+// netDialTimeoutError returns the error net.Dialer reports for its own dial
+// timeout, obtained deterministically by dialing with an already-expired
+// deadline. Its inner error satisfies errors.Is(err, context.DeadlineExceeded)
+// even though no caller context expired, which is what makes it worth pinning.
+func netDialTimeoutError(t *testing.T) error {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	_, err := (&net.Dialer{}).DialContext(ctx, "tcp", "127.0.0.1:1")
+	require.Error(t, err)
+	var opErr *net.OpError
+	require.True(t, errors.As(err, &opErr), "expected *net.OpError, got %T", err)
+	require.Equal(t, "dial", opErr.Op)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	return err
+}
+
+// redisServerError stands in for a reply from a reachable Redis, which is what
+// go-redis returns for WRONGPASS/NOAUTH/NOPERM/LOADING.
+type redisServerError string
+
+func (e redisServerError) Error() string { return string(e) }
+
+func (e redisServerError) RedisError() {}
+
+// An auth failure means the pod answered, so it is not evidence that the pod is
+// unreachable - even when another pod does report itself as master.
+func TestUpdateRedisRoleLabelKeepsMasterLabelOnAuthFailure(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	staleMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	staleMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	otherMaster := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+
+	clientset := k8sfake.NewSimpleClientset(staleMaster, otherMaster)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": true,
+		},
+		replicasByHost: map[string]int{
+			"10.0.0.11": 1,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": redisServerError("WRONGPASS invalid username-password pair"),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+
+	unreachablePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, unreachablePod.Labels[common.RedisRoleLabelKey])
+}
+
+// A replica pod recreated while the master is unreachable boots as a standalone
+// master, because replication is only attached at runtime. It answers as master
+// but has no replicas, so it is not evidence that the unreachable master was
+// replaced; stripping the label would route the master service to an empty pod.
+func TestUpdateRedisRoleLabelKeepsMasterLabelWhenOnlyAStandaloneMasterAnswers(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	unreachableMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	unreachableMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	standalone := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+	standalone.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelSlave
+
+	clientset := k8sfake.NewSimpleClientset(unreachableMaster, standalone)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": true,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+	// One connection per pod: the replica count is read on the handle that
+	// answered the role probe.
+	assert.Equal(t, []string{"10.0.0.10", "10.0.0.11"}, redisClient.connectHosts)
+
+	unreachablePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, unreachablePod.Labels[common.RedisRoleLabelKey])
+
+	standalonePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, standalonePod.Labels[common.RedisRoleLabelKey])
+}
+
+// After a two-pod failover the promoted survivor has no replica left to attach,
+// so it cannot prove itself here. The controller has confirmed it through
+// Sentinel, and passes it in; the lost master's label is then stale and removed.
+func TestUpdateRedisRoleLabelRemovesStaleMasterLabelWhenTheIdentifiedMasterHasNoReplicas(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	lostMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	lostMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	survivor := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+	survivor.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelSlave
+
+	clientset := k8sfake.NewSimpleClientset(lostMaster, survivor)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": true,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "redis-1")
+
+	require.NoError(t, err)
+
+	lostPod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, lostPod.Labels, common.RedisRoleLabelKey)
+
+	survivorPod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-1", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, survivorPod.Labels[common.RedisRoleLabelKey])
+}
+
+// The identified master only counts once it answers as master here; naming a
+// pod that cannot be reached changes nothing.
+func TestUpdateRedisRoleLabelKeepsMasterLabelWhenTheIdentifiedMasterDoesNotAnswer(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	unreachableMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	unreachableMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	standalone := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+
+	clientset := k8sfake.NewSimpleClientset(unreachableMaster, standalone)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": true,
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "redis-0")
+
+	require.NoError(t, err)
+
+	unreachablePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, unreachablePod.Labels[common.RedisRoleLabelKey])
+}
+
+// A master whose replica count cannot be read is not evidence either way.
+func TestUpdateRedisRoleLabelKeepsMasterLabelWhenReplicaCountCannotBeRead(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	unreachableMaster := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	unreachableMaster.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	otherMaster := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+
+	clientset := k8sfake.NewSimpleClientset(unreachableMaster, otherMaster)
+	redisClient := &fakeRedisClient{
+		isMasterByHost: map[string]bool{
+			"10.0.0.11": true,
+		},
+		replicaErrByHost: map[string]error{
+			"10.0.0.11": errors.New("read tcp: i/o timeout"),
+		},
+		errByHost: map[string]error{
+			"10.0.0.10": dialError(),
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+
+	err := h.UpdateRedisRoleLabel(context.Background(), "default", labels, nil, nil, "")
+
+	require.NoError(t, err)
+
+	unreachablePod, err := clientset.CoreV1().Pods("default").Get(context.Background(), "redis-0", metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, common.RedisRoleLabelMaster, unreachablePod.Labels[common.RedisRoleLabelKey])
+}
+
+// A cancelled reconcile - a manager shutdown, say - fails every probe. That is
+// not evidence about any pod, so the sweep must abort and report it rather than
+// deciding labels from a view it could not build.
+func TestUpdateRedisRoleLabelPropagatesContextCancellation(t *testing.T) {
+	labels := map[string]string{"app": "redis"}
+	master := newLabeledRedisPod("redis-0", labels, "10.0.0.10", corev1.PodRunning, true)
+	master.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelMaster
+	slave := newLabeledRedisPod("redis-1", labels, "10.0.0.11", corev1.PodRunning, true)
+	slave.Labels[common.RedisRoleLabelKey] = common.RedisRoleLabelSlave
+
+	clientset := k8sfake.NewSimpleClientset(master, slave)
+	ctx, cancel := context.WithCancel(context.Background())
+	redisClient := &fakeRedisClient{
+		errByHost: map[string]error{
+			"10.0.0.10": context.Canceled,
+			"10.0.0.11": context.Canceled,
+		},
+	}
+	h := &healer{
+		k8s:   clientset,
+		redis: redisClient,
+	}
+	cancel()
+
+	err := h.UpdateRedisRoleLabel(ctx, "default", labels, nil, nil, "")
+
+	require.ErrorIs(t, err, context.Canceled)
+
+	for podName, role := range map[string]string{
+		"redis-0": common.RedisRoleLabelMaster,
+		"redis-1": common.RedisRoleLabelSlave,
+	} {
+		pod, getErr := clientset.CoreV1().Pods("default").Get(context.Background(), podName, metav1.GetOptions{})
+		require.NoError(t, getErr)
+		assert.Equal(t, role, pod.Labels[common.RedisRoleLabelKey])
+	}
+}
+
+func TestSentinelResetSkipsSentinelsWithCompleteTopology(t *testing.T) {
+	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	redisClient := &fakeRedisClient{
+		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
+			"10.0.1.10": sentinelInfo(2, 3),
+			"10.0.1.11": sentinelInfo(2, 3),
+			"10.0.1.12": sentinelInfo(2, 3),
+		},
+	}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+
+	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
+
+	assert.Empty(t, redisClient.resetHosts)
+}
+
+func TestSentinelResetSkipsSentinelsStillDiscoveringTopology(t *testing.T) {
+	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	redisClient := &fakeRedisClient{
+		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
+			"10.0.1.10": sentinelInfo(0, 1),
+			"10.0.1.11": sentinelInfo(1, 3),
+			"10.0.1.12": sentinelInfo(2, 2),
+		},
+	}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+
+	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
+
+	assert.Empty(t, redisClient.resetHosts)
+}
+
+func TestSentinelResetPreservesSurplusMembersWithoutRetirementEvidence(t *testing.T) {
+	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	redisClient := &fakeRedisClient{
+		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
+			"10.0.1.10": sentinelInfo(3, 3),
+			"10.0.1.11": sentinelInfo(2, 7),
+			"10.0.1.12": sentinelInfo(2, 3),
+		},
+	}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+
+	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
+
+	assert.Empty(t, redisClient.resetHosts, "surplus peers or replicas do not prove that any member can be safely forgotten")
+}
+
+func TestSentinelResetSkipsSentinelsWithoutMasterGroup(t *testing.T) {
+	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	redisClient := &fakeRedisClient{
+		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
+			"10.0.1.10": nil,
+			"10.0.1.11": {Masters: []redisservice.SentinelMasterInfo{{Name: "other", Slaves: 5, Sentinels: 5}}},
+			"10.0.1.12": sentinelInfo(3, 3),
+		},
+	}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+
+	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
+
+	assert.Empty(t, redisClient.resetHosts)
+}
+
+func TestExternalSentinelEnablesHostnameSettingsBeforeMonitor(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "yes"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "yes"
+	remote := &fakeRedisClient{}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.NoError(t, h.SentinelMonitor(context.Background(), rs, "redis.test.svc.cluster.local"))
+	require.Equal(t, []string{"resolve-hostnames=yes", "announce-hostnames=yes", "monitor"}, remote.monitorConfigOrder)
+}
+
+func TestExternalSentinelPreservesMonitorOnHostnameConfigFailure(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "yes"
+	remote := &fakeRedisClient{configErr: errors.New("configuration rejected")}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorContains(t, h.SentinelMonitor(context.Background(), rs, "redis.test.svc.cluster.local"), "configuration rejected")
+	require.Empty(t, remote.monitorHosts)
+}
+
+func TestExternalSentinelDisablesHostnameSettingsAfterMonitor(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "no"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "no"
+	remote := &fakeRedisClient{}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.NoError(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"))
+	require.Equal(t, []string{"monitor", "announce-hostnames=no", "resolve-hostnames=no"}, remote.monitorConfigOrder)
+}
+
+func TestExternalSentinelDoesNotDisableResolverAfterFailedMonitor(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "no"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "no"
+	remote := &fakeRedisClient{errByHost: map[string]error{"10.0.1.10": errors.New("monitor failed")}}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorContains(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"), "monitor failed")
+	require.Equal(t, []string{"monitor"}, remote.monitorConfigOrder)
+}
+
+func TestExternalSentinelStopsPeersAfterDisableFailure(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "no"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "no"
+	remote := &fakeRedisClient{configErr: errors.New("configuration rejected")}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorContains(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"), "configuration rejected")
+	require.Equal(t, []string{"10.0.1.10"}, remote.monitorHosts)
+	require.Equal(t, []string{"monitor", "announce-hostnames=no"}, remote.monitorConfigOrder)
+}
+
+func TestSentinelMonitorPreservesPeersWhenInventoryIsUnready(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
+	labels := map[string]string{"app": rs.GetStatefulSetName()}
+	objects = append(objects, newLabeledRedisPod(rs.GetStatefulSetName()+"-2", labels, "10.0.1.12", corev1.PodRunning, false))
+	redisClient := &fakeRedisClient{
+		errByHost: map[string]error{"10.0.1.10": errors.New("dial tcp 10.0.1.10:26379: i/o timeout")},
+	}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+
+	err := h.SentinelMonitor(context.Background(), rs, "10.0.0.10")
+
+	require.ErrorContains(t, err, rs.GetStatefulSetName()+"-2")
+	assert.Empty(t, redisClient.monitorHosts, "unobserved peers block monitor replacement")
+}
+
+func TestSentinelMonitorStopsAfterUncertainMutation(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
+	failure := &redisservice.SentinelMonitorMutationError{Stage: "monitor", Err: errors.New("connection lost")}
+	redisClient := &fakeRedisClient{errByHost: map[string]error{"10.0.1.10": failure}}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorIs(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"), failure)
+	assert.Empty(t, redisClient.monitorHosts, "later Sentinels must remain untouched")
+}
+
+func TestSentinelMonitorRepairsPersistedGapBeforeHealthyPeers(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	remote := &fakeRedisClient{sentinelHealthByHost: map[string]bool{
+		"10.0.1.10": true, "10.0.1.11": false, "10.0.1.12": true,
+	}}
+	kube := k8sfake.NewSimpleClientset(objects...)
+	first := &healer{redis: remote, k8s: kube}
+	require.ErrorContains(t, first.SentinelMonitor(context.Background(), rs, "10.0.0.10"), "waiting to verify")
+	require.Equal(t, []string{"10.0.1.11"}, remote.monitorHosts)
+	remote.monitorHosts = nil
+	// No coordinator state survives. Only the remote monitor observations do.
+	restarted := &healer{redis: remote, k8s: kube}
+	require.NoError(t, restarted.SentinelMonitor(context.Background(), rs, "10.0.0.10"))
+	require.Equal(t, []string{"10.0.1.10", "10.0.1.11", "10.0.1.12"}, remote.monitorHosts)
+}
+
+func TestIsConnectivityError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"dial failure", dialError(), true},
+		{"timeout", &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}, true},
+		// net.Dialer reports its own dial timeout with an inner error that
+		// satisfies errors.Is(err, context.DeadlineExceeded); the OpError has to
+		// win over the context check or a blackholed node is never recognised.
+		{"dial timeout reported by net.Dialer", netDialTimeoutError(t), true},
+		{"connection reset", &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}, true},
+		{"dns failure", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host"}}, true},
+		{"socket deadline", os.ErrDeadlineExceeded, true},
+		{"eof", io.EOF, true},
+		// Context errors belong to the reconcile, not the pod; the caller handles
+		// them before any label decision is made.
+		{"context deadline", context.DeadlineExceeded, false},
+		{"context cancelled", context.Canceled, false},
+		{"wrong password", redisServerError("WRONGPASS invalid username-password pair"), false},
+		{"no auth", redisServerError("NOAUTH Authentication required."), false},
+		{"loading", redisServerError("LOADING Redis is loading the dataset in memory"), false},
+		{"wrapped server reply", fmt.Errorf("probe: %w", redisServerError("NOPERM")), false},
+		{"unknown certificate authority", x509.UnknownAuthorityError{}, false},
+		{"certificate verification", &tls.CertificateVerificationError{Err: errors.New("expired")}, false},
+		// crypto/tls surfaces a TLS alert sent by the peer, and a handshake it
+		// aborted itself, as *net.OpError; both mean the pod answered on the socket.
+		{"remote tls alert", &net.OpError{Op: "remote error", Net: "tcp", Err: errors.New("tls: bad certificate")}, false},
+		{"wrapped remote tls alert", fmt.Errorf("probe: %w", &net.OpError{Op: "remote error", Net: "tcp", Err: errors.New("tls: unknown certificate authority")}), false},
+		{"local tls handshake abort", &net.OpError{Op: "local error", Net: "tcp", Err: errors.New("tls: handshake failure")}, false},
+		{"unrecognised error is inconclusive", errors.New("something went wrong"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isConnectivityError(tt.err))
+		})
+	}
+}
+
+type fakeRedisClient struct {
+	monitorConfigOrder   []string
+	configErr            error
+	sentinelHealthByHost map[string]bool
+	connectHosts         []string
+	isMasterByHost       map[string]bool
+	replicasByHost       map[string]int
+	errByHost            map[string]error
+	replicaErrByHost     map[string]error
+	keyCountByHost       map[string]int64
+	keyCountErrByHost    map[string]error
+	sentinelInfoByHost   map[string]*redisservice.InfoSentinelResult
+	monitorHosts         []string
+	setHosts             []string
+	resetHosts           []string
+}
+
+func (f *fakeRedisClient) Connect(info *redisservice.ConnectionInfo) redisservice.Service {
+	f.connectHosts = append(f.connectHosts, info.Host)
+	return &fakeRedisService{client: f, host: info.Host}
+}
+
+func (f *fakeRedisService) SentinelMyID(context.Context) (string, error) { return "", nil }
+
+func (f *fakeRedisService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
+	return "", "", false, nil
+}
+
+func (f *fakeRedisService) SentinelMonitorHealthy(context.Context, string) (bool, error) {
+	if f.client.sentinelHealthByHost != nil {
+		return f.client.sentinelHealthByHost[f.host], nil
+	}
+	return true, nil
+}
+
+type fakeRedisService struct {
+	client *fakeRedisClient
+	host   string
+}
+
+func (f *fakeRedisService) IsMaster(context.Context) (bool, error) {
+	if err := f.client.errByHost[f.host]; err != nil {
+		return false, err
+	}
+	return f.client.isMasterByHost[f.host], nil
+}
+
+func (f *fakeRedisService) GetAttachedReplicaCount(context.Context) (int, error) {
+	if err := f.client.replicaErrByHost[f.host]; err != nil {
+		return 0, err
+	}
+	return f.client.replicasByHost[f.host], nil
+}
+
+func (f *fakeRedisService) GetKeyCount(context.Context) (int64, error) {
+	if err := f.client.keyCountErrByHost[f.host]; err != nil {
+		return 0, err
+	}
+	return f.client.keyCountByHost[f.host], nil
+}
+
+func (f *fakeRedisService) SentinelMonitor(context.Context, *redisservice.ConnectionInfo, string, string) error {
+	f.client.monitorConfigOrder = append(f.client.monitorConfigOrder, "monitor")
+	if err := f.client.errByHost[f.host]; err != nil {
+		return err
+	}
+	f.client.monitorHosts = append(f.client.monitorHosts, f.host)
+	if f.client.sentinelHealthByHost != nil {
+		f.client.sentinelHealthByHost[f.host] = true
+	}
+	return nil
+}
+
+func (f *fakeRedisService) SentinelConfigSet(_ context.Context, key, value string) error {
+	f.client.monitorConfigOrder = append(f.client.monitorConfigOrder, key+"="+value)
+	return f.client.configErr
+}
+
+func (f *fakeRedisService) SentinelSet(context.Context, string, string, string) error {
+	if err := f.client.errByHost[f.host]; err != nil {
+		return err
+	}
+	f.client.setHosts = append(f.client.setHosts, f.host)
+	return nil
+}
+
+func (f *fakeRedisService) SentinelReset(context.Context, string) error {
+	if err := f.client.errByHost[f.host]; err != nil {
+		return err
+	}
+	f.client.resetHosts = append(f.client.resetHosts, f.host)
+	return nil
+}
+
+func (f *fakeRedisService) GetInfoSentinel(context.Context) (*redisservice.InfoSentinelResult, error) {
+	if err := f.client.errByHost[f.host]; err != nil {
+		return nil, err
+	}
+	if info, ok := f.client.sentinelInfoByHost[f.host]; ok {
+		return info, nil
+	}
+	return &redisservice.InfoSentinelResult{}, nil
+}
+
+func (f *fakeRedisService) GetClusterInfo(context.Context) (*redisservice.ClusterStatus, error) {
+	return &redisservice.ClusterStatus{}, nil
+}
+
+func sentinelInfo(slaves, sentinels int) *redisservice.InfoSentinelResult {
+	return &redisservice.InfoSentinelResult{
+		Masters: []redisservice.SentinelMasterInfo{{Name: "myMaster", Status: "ok", Slaves: slaves, Sentinels: sentinels}},
+	}
+}
+
+func newSentinelFixture(podIPs ...string) (*rsvb2.RedisSentinel, *rrvb2.RedisReplication, []runtime.Object) {
+	rs := &rsvb2.RedisSentinel{
+		ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "default"},
+		Spec: rsvb2.RedisSentinelSpec{
+			Size: ptr.To(int32(len(podIPs))),
+			RedisSentinelConfig: &rsvb2.RedisSentinelConfig{
+				RedisSentinelConfig: commonapi.RedisSentinelConfig{
+					RedisReplicationName: "example-replication",
+					MasterGroupName:      "myMaster",
+					SentinelConfig:       commonapi.SentinelConfig{Quorum: "2"},
+				},
+			},
+		},
+	}
+	rr := &rrvb2.RedisReplication{
+		ObjectMeta: metav1.ObjectMeta{Name: "example-replication", Namespace: "default"},
+		Spec:       rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3))},
+	}
+	labels := map[string]string{"app": rs.GetStatefulSetName()}
+	objects := []runtime.Object{
+		&appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: rs.GetStatefulSetName(), Namespace: "default"},
+			Spec:       appsv1.StatefulSetSpec{Selector: &metav1.LabelSelector{MatchLabels: labels}},
+		},
+	}
+	for i, podIP := range podIPs {
+		objects = append(objects, newLabeledRedisPod(fmt.Sprintf("%s-%d", rs.GetStatefulSetName(), i), labels, podIP, corev1.PodRunning, true))
+	}
+	return rs, rr, objects
+}
+
+func newLabeledRedisPod(name string, labels map[string]string, podIP string, phase corev1.PodPhase, ready bool) *corev1.Pod {
+	podLabels := map[string]string{}
+	for key, value := range labels {
+		podLabels[key] = value
+	}
+
+	readyStatus := corev1.ConditionFalse
+	if ready {
+		readyStatus = corev1.ConditionTrue
+	}
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels:    podLabels,
+		},
+		Status: corev1.PodStatus{
+			Phase: phase,
+			PodIP: podIP,
+			Conditions: []corev1.PodCondition{
+				{
+					Type:   corev1.PodReady,
+					Status: readyStatus,
+				},
+			},
+		},
+	}
+}

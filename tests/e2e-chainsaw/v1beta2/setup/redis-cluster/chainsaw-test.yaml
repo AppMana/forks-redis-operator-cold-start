@@ -54,7 +54,7 @@ spec:
         - assert:
             file: secret.yaml
 
-    - name: Assert config
+    - name: Assert command-line-password-free authentication
       try:
         - script:
             timeout: 30s
@@ -62,44 +62,127 @@ spec:
               #!/bin/bash
               set -e
 
-              # Randomly select one leader and one follower
-              LEADER_INDEX=$((RANDOM % 3))
-              FOLLOWER_INDEX=$((RANDOM % 3))
+              # The AvoidCommandLinePassword work makes the operator inject
+              # REDISCLI_AUTH into the redis containers and stop passing
+              # -a <password> on redis-cli command lines. Verify both halves
+              # against a password-protected (and TLS-enabled) cluster.
 
-              echo "Checking leader-${LEADER_INDEX} and follower-${FOLLOWER_INDEX}"
+              # 1. REDISCLI_AUTH must be present on the leader and follower pods.
+              #    containers[0] is the redis container; the exporter is separate.
+              for role in leader follower; do
+                STS="redis-cluster-v1beta2-${role}"
+                NAMES=$(kubectl get statefulset "${STS}" -n ${NAMESPACE} \
+                  -o jsonpath='{.spec.template.spec.containers[0].env[*].name}')
+                echo "${STS} env names: ${NAMES}"
+                echo "${NAMES}" | tr ' ' '\n' | grep -qx REDISCLI_AUTH \
+                  || { echo "REDISCLI_AUTH missing on ${STS}"; exit 1; }
+              done
 
-              # Check leader configuration
-              LEADER_CMD="kubectl exec -n ${NAMESPACE} redis-cluster-v1beta2-leader-${LEADER_INDEX}"
-              LEADER_CMD="${LEADER_CMD} -c redis-cluster-v1beta2-leader -- redis-cli --no-auth-warning -a Opstree1234 --tls --cacert /tls/ca.crt"
-              SLOWLOG_VALUE=$(${LEADER_CMD} config get slowlog-log-slower-than | grep -A1 "slowlog-log-slower-than" | tail -n1)
-              TCP_KEEPALIVE_VALUE=$(${LEADER_CMD} config get tcp-keepalive | grep -A1 "tcp-keepalive" | tail -n1)
-              if [ "$SLOWLOG_VALUE" != "5000" ]; then
-                echo "leader-${LEADER_INDEX} slowlog-log-slower-than value is $SLOWLOG_VALUE, expected 5000"
-                exit 1
-              fi
-              if [ "$TCP_KEEPALIVE_VALUE" != "400" ]; then
-                echo "leader-${LEADER_INDEX} tcp-keepalive value is $TCP_KEEPALIVE_VALUE, expected 400"
-                exit 1
-              fi
+              # 2. redis-cli must authenticate via REDISCLI_AUTH alone: a PING
+              #    with no -a <password> must still succeed. It would return a
+              #    NOAUTH error if the env var were not being honoured. TLS flags
+              #    are transport-only and do not provide authentication.
+              PONG=$(kubectl exec -n ${NAMESPACE} redis-cluster-v1beta2-leader-0 \
+                -c redis-cluster-v1beta2-leader -- \
+                redis-cli --tls --cacert /tls/ca.crt ping)
+              echo "bare PING -> ${PONG}"
+              [ "${PONG}" = "PONG" ] || { echo "expected PONG without -a"; exit 1; }
 
-              # Check follower configuration
-              FOLLOWER_CMD="kubectl exec -n ${NAMESPACE} redis-cluster-v1beta2-follower-${FOLLOWER_INDEX}"
-              FOLLOWER_CMD="${FOLLOWER_CMD} -c redis-cluster-v1beta2-follower -- redis-cli --no-auth-warning -a Opstree1234 --tls --cacert /tls/ca.crt"
-              SLOWLOG_VALUE=$(${FOLLOWER_CMD} config get slowlog-log-slower-than | grep -A1 "slowlog-log-slower-than" | tail -n1)
-              TCP_KEEPALIVE_VALUE=$(${FOLLOWER_CMD} config get tcp-keepalive | grep -A1 "tcp-keepalive" | tail -n1)
-              if [ "$SLOWLOG_VALUE" != "5000" ]; then
-                echo "follower-${FOLLOWER_INDEX} slowlog-log-slower-than value is $SLOWLOG_VALUE, expected 5000"
-                exit 1
-              fi
-              if [ "$TCP_KEEPALIVE_VALUE" != "400" ]; then
-                echo "follower-${LEADER_INDEX} tcp-keepalive value is $TCP_KEEPALIVE_VALUE, expected 400"
-                exit 1
-              fi
+              echo "command-line-password-free authentication verified"
+            check:
+              (contains($stdout, 'command-line-password-free authentication verified')): true
 
-              echo "Redis instances leader-${LEADER_INDEX} and follower-${FOLLOWER_INDEX} have correct slowlog-log-slower-than configuration"
+    - name: Assert cluster preStop failover hook
+      try:
+        - assert:
+            file: prestop-hook.yaml
+
+    - name: Assert config
+      try:
+        - script:
+            timeout: 90s
+            content: |
+              #!/bin/bash
+              set -e
+
+              # Check every leader and follower reflects the applied configuration.
+              # NB: this content runs under /bin/sh (dash) via `sh -c`, so it must
+              # stay POSIX-compatible (no bash-only constructs such as $RANDOM).
+              for ROLE in leader follower; do
+                for INDEX in 0 1 2; do
+                  POD="redis-cluster-v1beta2-${ROLE}-${INDEX}"
+                  CMD="kubectl exec -n ${NAMESPACE} ${POD} -c redis-cluster-v1beta2-${ROLE} -- redis-cli --no-auth-warning -a Opstree1234 --tls --cacert /tls/ca.crt"
+                  SLOWLOG_VALUE=$(${CMD} config get slowlog-log-slower-than | grep -A1 "slowlog-log-slower-than" | tail -n1)
+                  TCP_KEEPALIVE_VALUE=$(${CMD} config get tcp-keepalive | grep -A1 "tcp-keepalive" | tail -n1)
+                  if [ "$SLOWLOG_VALUE" != "5000" ]; then
+                    echo "${POD} slowlog-log-slower-than value is $SLOWLOG_VALUE, expected 5000"
+                    exit 1
+                  fi
+                  if [ "$TCP_KEEPALIVE_VALUE" != "400" ]; then
+                    echo "${POD} tcp-keepalive value is $TCP_KEEPALIVE_VALUE, expected 400"
+                    exit 1
+                  fi
+                done
+              done
+
+              echo "All Redis leaders and followers have correct slowlog-log-slower-than and tcp-keepalive configuration"
               exit 0
             check:
-              (contains($stdout, 'have correct slowlog-log-slower-than configuration')): true
+              (contains($stdout, 'All Redis leaders and followers have correct')): true
+
+    - name: Update dynamic configuration on an already Ready cluster
+      try:
+        - script:
+            timeout: 120s
+            content: |
+              # Chainsaw runs script content through /bin/sh, not its shebang.
+              set -eu
+              cluster=redis-cluster-v1beta2
+              [ "$(kubectl -n "${NAMESPACE}" get rediscluster "$cluster" -o jsonpath='{.status.state}')" = Ready ]
+              pod_uids() {
+                for role in leader follower; do
+                  for ordinal in 0 1 2; do
+                    kubectl -n "${NAMESPACE}" get pod "$cluster-$role-$ordinal" -o jsonpath='{.metadata.uid}{"\n"}'
+                  done
+                done
+              }
+              before="$(pod_uids)"
+              original_config="$(kubectl -n "${NAMESPACE}" get rediscluster "$cluster" -o json | jq -c '.spec.redisConfig.dynamicConfig')"
+              for desired in 6000 5000; do
+                patch="$(printf '%s' "$original_config" | jq -c --arg value "$desired" \
+                  '{spec:{redisConfig:{dynamicConfig:map(if startswith("slowlog-log-slower-than ") then "slowlog-log-slower-than " + $value else . end)}}}')"
+                kubectl -n "${NAMESPACE}" patch rediscluster "$cluster" --type=merge \
+                  -p "$patch"
+                deadline=$(($(date +%s)+50))
+                converged=false
+                while [ "$(date +%s)" -lt "$deadline" ]; do
+                  converged=true
+                  for role in leader follower; do
+                    for ordinal in 0 1 2; do
+                      pod="$cluster-$role-$ordinal"
+                      if output="$(kubectl -n "${NAMESPACE}" exec "$pod" -c "$cluster-$role" -- \
+                        redis-cli --raw --tls --cacert /tls/ca.crt CONFIG GET slowlog-log-slower-than)"; then
+                        value="$(printf '%s\n' "$output" | tail -n1)"
+                        if [ "$value" != "$desired" ]; then
+                          converged=false
+                          case "$value" in ''|*[!0-9]*) value=non-numeric-response;; esac
+                          echo "waiting: $pod slowlog threshold=$value expected=$desired"
+                        fi
+                      else
+                        converged=false
+                        echo "waiting: $pod CONFIG GET exec failed"
+                      fi
+                    done
+                  done
+                  [ "$converged" = true ] && break
+                  sleep 2
+                done
+                [ "$converged" = true ] || { echo "FAIL: threshold $desired did not converge on all six nodes within 50s"; exit 1; }
+                [ "$(pod_uids)" = "$before" ] || { echo "FAIL: pods were replaced during threshold $desired update"; exit 1; }
+              done
+              echo 'PASS: Ready cluster configuration updated and restored without pod replacement'
+            check:
+              (contains($stdout, 'Ready cluster configuration updated')): true
 
     - name: Check maxmemory
       try:
@@ -112,11 +195,26 @@ spec:
               # maxmemory should not equal to 0
               MAXMEMORY=$(kubectl exec -n ${NAMESPACE} redis-cluster-v1beta2-leader-0 -c redis-cluster-v1beta2-leader -- \
               redis-cli --no-auth-warning --tls --cacert /tls/ca.crt -a Opstree1234 config get maxmemory | grep -A1 "maxmemory" | tail -n1)
-              if [ "$MAXMEMORY" == "0" ]; then
+              if [ "$MAXMEMORY" = "0" ]; then
                 echo "maxmemory value is $MAXMEMORY, expected not 0"
                 exit 1
               fi
               exit 0
+
+    - name: Wait for data assertion helper
+      try:
+        - script:
+            timeout: 190s
+            content: |
+              set -eu
+              if ! kubectl -n "${NAMESPACE}" wait pod/data-assert --for=condition=Ready --timeout=180s; then
+                columns='PHASE:.status.phase,WAITING:.status.containerStatuses[*].state.waiting.reason'
+                columns="$columns,TERMINATED:.status.containerStatuses[*].state.terminated.reason"
+                columns="$columns,EXIT:.status.containerStatuses[*].state.terminated.exitCode,RESTARTS:.status.containerStatuses[*].restartCount"
+                kubectl -n "${NAMESPACE}" get pod/data-assert -o "custom-columns=$columns"
+                exit 1
+              fi
+              kubectl -n "${NAMESPACE}" exec data-assert -c data-assert -- test -s /go/src/data-assert/main.go
 
     - name: Put data
       try:
@@ -140,14 +238,15 @@ spec:
 
     - name: Check follower-0 label updated
       try:
-        - sleep:
-            duration: 1m
-        - script:
-            timeout: 30s
-            content: >
-              kubectl get pod -n ${NAMESPACE} redis-cluster-v1beta2-follower-0 -o jsonpath='{.metadata.labels.redis-role}'
-            check:
-              (contains($stdout, 'master')): true
+        - assert:
+            timeout: 1m
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: redis-cluster-v1beta2-follower-0
+                labels:
+                  redis-role: master
 
     - name: Failover the follower-0 to slave
       try:
@@ -158,8 +257,17 @@ spec:
               bash -c  "redis-cli -a Opstree1234 --tls --cacert /tls/ca.crt cluster failover"
             check:
               (contains($stdout, 'OK')): true
-        - sleep:
-            duration: 1m
+        # Wait for the role to swing back before scaling out, rather than
+        # assuming a minute was enough.
+        - assert:
+            timeout: 2m
+            resource:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: redis-cluster-v1beta2-follower-0
+                labels:
+                  redis-role: slave
 
     - name: Scale Out Redis Cluster
       try:

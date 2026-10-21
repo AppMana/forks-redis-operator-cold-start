@@ -1,16 +1,69 @@
 package redisreplication
 
 import (
+	"context"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
 
+	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
+	commonredis "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/statefulset"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+func validatePasswordReferences(rr *rrvb2.RedisReplication) error {
+	refs := []*commonapi.ExistingPasswordSecret{rr.Spec.KubernetesConfig.ExistingPasswordSecret}
+	if rr.EnableSentinel() {
+		refs = append(refs, rr.Spec.Sentinel.ExistingPasswordSecret)
+	}
+	for _, ref := range refs {
+		if ref != nil && (ref.Name == nil || ref.Key == nil || *ref.Name == "" || *ref.Key == "") {
+			return fmt.Errorf("password secret reference requires a non-empty name and key")
+		}
+	}
+	return nil
+}
+
+func (r *Reconciler) validateSentinelConfigStorage(ctx context.Context, rr *rrvb2.RedisReplication) error {
+	if !rr.EnableSentinel() {
+		return nil
+	}
+	persistent := rr.Spec.Sentinel.ConfigVolumeClaimTemplate != nil
+	if persistent && !features.Enabled(features.GenerateConfigInInitContainer) {
+		return fmt.Errorf("embedded Sentinel config persistence requires GenerateConfigInInitContainer")
+	}
+	var current appsv1.StatefulSet
+	if err := r.Get(ctx, client.ObjectKey{Namespace: rr.Namespace, Name: rr.SentinelStatefulSet()}, &current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	hasConfigClaim := false
+	for _, claim := range current.Spec.VolumeClaimTemplates {
+		if claim.Name == common.VolumeNameConfig {
+			hasConfigClaim = true
+		}
+	}
+	if persistent != hasConfigClaim {
+		return fmt.Errorf("embedded Sentinel config storage cannot be changed in place; preserve configuration and perform an explicit orphan/adopt migration before rolling Redis")
+	}
+	return nil
+}
 
 func newSentinelService(rr *rrvb2.RedisReplication) corev1.Service {
 	labels := common.GetRedisLabels(
@@ -48,25 +101,82 @@ func newSentinelStatefulSet(rr *rrvb2.RedisReplication, svcName string) appsv1.S
 		"sentinel",
 		rr.GetLabels(),
 	)
-	return statefulset.New(statefulset.Params{
+	sts := statefulset.New(statefulset.Params{
 		Name:            rr.SentinelStatefulSet(),
 		Namespace:       rr.Namespace,
 		Replicas:        rr.Spec.Sentinel.Size,
 		ServiceName:     svcName,
 		PodTemplateSpec: buildSentinelPodTemplate(rr, labels),
 	})
+	// Respect migration holds and partitioned rollouts rather than silently
+	// allowing the API default (RollingUpdate) to replace every Sentinel pod.
+	rr.Spec.Sentinel.UpdateStrategy.DeepCopyInto(&sts.Spec.UpdateStrategy)
+	if claim := rr.Spec.Sentinel.ConfigVolumeClaimTemplate; claim != nil {
+		copy := claim.DeepCopy()
+		copy.Name = common.VolumeNameConfig
+		copy.Namespace = ""
+		sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{*copy}
+	}
+	return sts
 }
 
 func buildSentinelPodTemplate(rr *rrvb2.RedisReplication, labels map[string]string) corev1.PodTemplateSpec {
+	spec := corev1.PodSpec{
+		Containers: []corev1.Container{
+			buildSentinelContainer(rr),
+		},
+	}
+
+	sentinel := rr.Spec.Sentinel
+	if sentinel.ConfigVolumeClaimTemplate != nil {
+		// Reuse the same bootstrap implementation as external RedisSentinel.
+		// It retains election state and atomically rewrites credentials/tuning.
+		mounts := []corev1.VolumeMount{{Name: common.VolumeNameConfig, MountPath: "/etc/redis"}}
+		spec.Containers[0].Command = []string{"redis-sentinel"}
+		spec.Containers[0].Args = []string{"/etc/redis/sentinel.conf"}
+		spec.Containers[0].VolumeMounts = mounts
+		spec.InitContainers = []corev1.Container{{
+			Name: "init-config", Image: envs.GetInitContainerImage(), ImagePullPolicy: corev1.PullIfNotPresent,
+			Command: []string{"/operator", "agent"}, Args: []string{"bootstrap", "--sentinel"},
+			Env: buildSentinelEnv(rr), VolumeMounts: mounts, SecurityContext: sentinel.SecurityContext,
+		}}
+		if sentinel.Resources != nil {
+			spec.InitContainers[0].Resources = *sentinel.Resources
+		}
+	}
+	if sentinel.Affinity != nil {
+		spec.Affinity = sentinel.Affinity
+	}
+	if sentinel.Tolerations != nil {
+		spec.Tolerations = *sentinel.Tolerations
+	}
+	if sentinel.NodeSelector != nil {
+		spec.NodeSelector = sentinel.NodeSelector
+	}
+	if len(sentinel.TopologySpreadConstraints) > 0 {
+		spec.TopologySpreadConstraints = sentinel.TopologySpreadConstraints
+	}
+	if sentinel.PodSecurityContext != nil {
+		spec.SecurityContext = sentinel.PodSecurityContext
+	}
+	if sentinel.PriorityClassName != "" {
+		spec.PriorityClassName = sentinel.PriorityClassName
+	}
+	if sentinel.TerminationGracePeriodSeconds != nil {
+		spec.TerminationGracePeriodSeconds = sentinel.TerminationGracePeriodSeconds
+	}
+	if sentinel.ImagePullSecrets != nil {
+		spec.ImagePullSecrets = *sentinel.ImagePullSecrets
+	}
+	if sentinel.ServiceAccountName != nil {
+		spec.ServiceAccountName = *sentinel.ServiceAccountName
+	}
+
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels: labels,
 		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				buildSentinelContainer(rr),
-			},
-		},
+		Spec: spec,
 	}
 }
 
@@ -87,26 +197,188 @@ func buildSentinelContainer(rr *rrvb2.RedisReplication) corev1.Container {
 	if rr.Spec.Sentinel.Resources != nil {
 		container.Resources = *rr.Spec.Sentinel.Resources
 	}
+	if rr.Spec.Sentinel.SecurityContext != nil {
+		container.SecurityContext = rr.Spec.Sentinel.SecurityContext
+	}
 	return container
+}
+
+func embeddedSentinelQuorum(rr *rrvb2.RedisReplication) string {
+	if rr.Spec.Sentinel.Quorum != "" {
+		return rr.Spec.Sentinel.Quorum
+	}
+	return fmt.Sprintf("%d", rr.Spec.Sentinel.Size/2+1)
+}
+
+func validateEmbeddedSentinelQuorum(rr *rrvb2.RedisReplication) error {
+	if !rr.EnableSentinel() {
+		return nil
+	}
+	value, err := strconv.ParseUint(embeddedSentinelQuorum(rr), 10, 31)
+	if err != nil || value == 0 {
+		return fmt.Errorf("sentinel quorum must be a positive 32-bit integer")
+	}
+	return nil
 }
 
 func buildSentinelEnv(rr *rrvb2.RedisReplication) []corev1.EnvVar {
 	envs := []corev1.EnvVar{
-		{Name: "QUORUM", Value: fmt.Sprintf("%d", rr.Spec.Sentinel.Size/2+1)},
+		{Name: "QUORUM", Value: embeddedSentinelQuorum(rr)},
+		{Name: "RESOLVE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.ResolveHostnames)},
+		{Name: "ANNOUNCE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.AnnounceHostnames)},
 	}
-	if rr.Spec.KubernetesConfig.ExistingPasswordSecret != nil {
-		envs = append(envs, corev1.EnvVar{
-			Name: "MASTER_PASSWORD",
-			ValueFrom: &corev1.EnvVarSource{
-				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: *rr.Spec.KubernetesConfig.ExistingPasswordSecret.Name,
-					},
-					Key: *rr.Spec.KubernetesConfig.ExistingPasswordSecret.Key,
-				},
-			},
-		})
+	if rr.Spec.Sentinel.ConfigVolumeClaimTemplate != nil {
+		envs = append(envs, corev1.EnvVar{Name: "SENTINEL_PERSISTENCE_ENABLED", Value: "true"})
+		for _, setting := range []corev1.EnvVar{
+			{Name: "DOWN_AFTER_MILLISECONDS", Value: rr.Spec.Sentinel.DownAfterMilliseconds},
+			{Name: "PARALLEL_SYNCS", Value: rr.Spec.Sentinel.ParallelSyncs},
+			{Name: "FAILOVER_TIMEOUT", Value: rr.Spec.Sentinel.FailoverTimeout},
+		} {
+			if setting.Value != "" {
+				envs = append(envs, setting)
+			}
+		}
+	}
+	if secret := rr.Spec.KubernetesConfig.ExistingPasswordSecret; secret != nil {
+		envs = append(envs, secretEnvVar("MASTER_PASSWORD", secret))
+	}
+	if secret := rr.Spec.Sentinel.ExistingPasswordSecret; secret != nil {
+		envs = append(envs, secretEnvVar("REDIS_PASSWORD", secret))
 	}
 
 	return envs
+}
+
+func secretEnvVar(name string, secret *commonapi.ExistingPasswordSecret) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: name,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: *secret.Name,
+				},
+				Key: *secret.Key,
+			},
+		},
+	}
+}
+
+func resolveHostnamesOrDefault(v string) string {
+	if v == "" {
+		return "no"
+	}
+	return v
+}
+
+func (r *Reconciler) sentinelMonitoredMaster(ctx context.Context, inst *rrvb2.RedisReplication, candidates []string) (string, error) {
+	if r.SentinelMonitoredMaster != nil {
+		return r.SentinelMonitoredMaster(ctx, inst, candidates)
+	}
+	return r.querySentinelMonitoredMaster(ctx, redis.NewClient(), inst, candidates)
+}
+
+func (r *Reconciler) querySentinelMonitoredMaster(ctx context.Context, redisClient redis.Client, inst *rrvb2.RedisReplication, candidates []string) (string, error) {
+	// Sentinel reports the master by IP, or by hostname when hostnames are announced.
+	podByAddress := make(map[string]string, 2*len(candidates))
+	for _, podName := range candidates {
+		pod, err := r.K8sClient.CoreV1().Pods(inst.Namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			return "", fmt.Errorf("get pod %s: %w", podName, err)
+		}
+		podByAddress[replicationPodHostname(inst, podName)] = podName
+		if pod.Status.PodIP != "" {
+			podByAddress[pod.Status.PodIP] = podName
+		}
+	}
+
+	sentinelPassword, err := r.sentinelPassword(ctx, inst)
+	if err != nil {
+		return "", fmt.Errorf("get sentinel password secret: %w", err)
+	}
+	sentinelPods, err := r.getSentinelPods(ctx, inst)
+	if err != nil {
+		return "", fmt.Errorf("get sentinel pods: %w", err)
+	}
+
+	votes := make(map[string]int, len(candidates))
+	for _, sentinelPod := range sentinelPods.Items {
+		if !k8sutils.IsRedisPodProbeable(&sentinelPod) {
+			continue
+		}
+		info, err := redisClient.Connect(&redis.ConnectionInfo{
+			Host:     sentinelPod.Status.PodIP,
+			Port:     "26379",
+			Password: sentinelPassword,
+		}).GetInfoSentinel(ctx)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return "", ctxErr
+			}
+			log.FromContext(ctx).V(1).Info("Failed to read sentinel info, skipping sentinel pod", "pod", sentinelPod.Name, "error", err)
+			continue
+		}
+		if podName := podByAddress[sentinelReportedMasterHost(info)]; podName != "" {
+			votes[podName]++
+		}
+	}
+
+	quorum := int(inst.Spec.Sentinel.Size/2) + 1
+	for _, podName := range candidates {
+		if votes[podName] >= quorum {
+			return podName, nil
+		}
+	}
+	return "", nil
+}
+
+func sentinelReportedMasterHost(info *redis.InfoSentinelResult) string {
+	if info == nil {
+		return ""
+	}
+	for _, master := range info.Masters {
+		if master.Name == masterGroupName {
+			return sentinelAddressHost(master.Address)
+		}
+	}
+	return ""
+}
+
+func sentinelAddressHost(address string) string {
+	if host, port, err := net.SplitHostPort(address); err == nil {
+		if port != "6379" {
+			return ""
+		}
+		return host
+	}
+	// INFO sentinel renders IPv6 without brackets. Accept that wire format,
+	// but never discard an absent or different port when counting a vote.
+	if i := strings.LastIndex(address, ":"); i >= 0 && address[i+1:] == "6379" {
+		host := address[:i]
+		if net.ParseIP(host) != nil {
+			return host
+		}
+	}
+	return ""
+}
+
+func (r *Reconciler) sentinelPassword(ctx context.Context, inst *rrvb2.RedisReplication) (string, error) {
+	return r.secretPassword(ctx, inst.Namespace, inst.Spec.Sentinel.ExistingPasswordSecret)
+}
+
+func (r *Reconciler) masterPassword(ctx context.Context, inst *rrvb2.RedisReplication) (string, error) {
+	return r.secretPassword(ctx, inst.Namespace, inst.Spec.KubernetesConfig.ExistingPasswordSecret)
+}
+
+func (r *Reconciler) secretPassword(ctx context.Context, namespace string, ref *commonapi.ExistingPasswordSecret) (string, error) {
+	return commonredis.NewChecker(r.K8sClient).GetPassword(ctx, namespace, ref)
+}
+
+func replicationPodHostname(inst *rrvb2.RedisReplication, podName string) string {
+	return fmt.Sprintf(
+		"%s.%s.%s.svc.%s",
+		podName,
+		common.GetHeadlessServiceNameFromPodName(podName),
+		inst.Namespace,
+		envs.GetServiceDNSDomain(),
+	)
 }
