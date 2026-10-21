@@ -93,7 +93,25 @@ func ReconcileSentinelMonitorBatch(ctx context.Context, peers []SentinelMonitorP
 		}
 		return fmt.Errorf("waiting to verify repaired Sentinel %s", peer.Name)
 	}
-	for _, peer := range peers {
+	for i, peer := range peers {
+		// The initial inventory expires as soon as reconciliation starts.
+		// A different monitor may fail while this peer's predecessor recovers.
+		// Leave repairs to the next full pass instead of changing more peers
+		// on the strength of a stale healthy snapshot.
+		if i > 0 {
+			for _, observed := range peers {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				healthy, err := observed.Healthy(ctx)
+				if err != nil {
+					return fmt.Errorf("recheck Sentinel %s before changing %s: %w", observed.Name, peer.Name, err)
+				}
+				if !healthy {
+					return fmt.Errorf("sentinel %s became unhealthy before changing %s", observed.Name, peer.Name)
+				}
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}

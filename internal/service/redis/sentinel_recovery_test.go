@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -121,7 +122,7 @@ func TestSentinelBatchReconnectionDoesNotReplayMutation(t *testing.T) {
 	}
 	require.NoError(t, ReconcileSentinelMonitorBatch(context.Background(), peers))
 	require.Equal(t, []string{"a", "b"}, mutations)
-	require.Equal(t, 3, probes)
+	require.Equal(t, 4, probes)
 }
 
 func TestSentinelBatchObservesWholeInventoryBeforeMutation(t *testing.T) {
@@ -133,6 +134,40 @@ func TestSentinelBatchObservesWholeInventoryBeforeMutation(t *testing.T) {
 	require.Error(t, ReconcileSentinelMonitorBatch(context.Background(), peers))
 	require.Error(t, ReconcileSentinelMonitorBatch(context.Background(), nil))
 	require.Error(t, ReconcileSentinelMonitorBatch(context.Background(), []SentinelMonitorPeer{peers[0], peers[0]}))
+}
+
+func TestSentinelBatchStopsWhenAnotherMonitorDegradesDuringReconciliation(t *testing.T) {
+	for _, unavailable := range []bool{false, true} {
+		t.Run(fmt.Sprint("observation-error=", unavailable), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			var mutations []string
+			changed := false
+			var peers []SentinelMonitorPeer
+			for _, name := range []string{"a", "b", "c"} {
+				name := name
+				peers = append(peers, SentinelMonitorPeer{
+					Name: name,
+					Healthy: func(context.Context) (bool, error) {
+						if name == "c" && changed {
+							if unavailable {
+								return false, errors.New("monitor unreachable")
+							}
+							return false, nil
+						}
+						return true, nil
+					},
+					Reconcile: func(context.Context) error {
+						mutations = append(mutations, name)
+						changed = true
+						return nil
+					},
+				})
+			}
+			require.Error(t, ReconcileSentinelMonitorBatch(ctx, peers))
+			require.Equal(t, []string{"a"}, mutations, "do not change b using the inventory from before a was reconciled")
+		})
+	}
 }
 
 func TestSentinelBatchCancellationPreventsMutation(t *testing.T) {
