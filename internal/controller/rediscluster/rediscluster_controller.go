@@ -33,6 +33,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -83,7 +84,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	// Check if the cluster is downscaled
-	if leaderCount := r.GetStatefulSetReplicas(ctx, instance.Namespace, instance.Name+"-leader"); leaderReplicas < leaderCount {
+	leaderCount, err := r.currentLeaderReplicas(ctx, instance.Namespace, instance.Name+"-leader")
+	if err != nil {
+		return intctrlutil.RequeueE(ctx, err, "cannot determine existing leader replicas")
+	}
+	if leaderReplicas < leaderCount {
+		if leaderReplicas < 1 {
+			return intctrlutil.RequeueE(ctx, fmt.Errorf("cannot downscale to zero leaders"), "")
+		}
 		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.Name+"-leader") || !r.IsStatefulSetReady(ctx, instance.Namespace, instance.Name+"-follower") {
 			return intctrlutil.Reconciled()
 		}
@@ -150,7 +158,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			}
 			return intctrlutil.RequeueAfter(ctx, time.Second*10, "")
 		} else {
-			logger.Info("masterCount is not equal to leader statefulset replicas,skip downscale", "masterCount", masterCount, "leaderReplicas", leaderReplicas)
+			if err := k8sutils.VerifyClusterScaleDownReady(ctx, r.K8sClient, instance); err != nil {
+				return intctrlutil.RequeueE(ctx, err, "refusing StatefulSet downscale before retained topology is verified")
+			}
 		}
 	}
 
@@ -443,6 +453,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	return intctrlutil.RequeueAfter(ctx, time.Second*10, "")
+}
+
+func (r *Reconciler) currentLeaderReplicas(ctx context.Context, namespace, name string) (int32, error) {
+	sts, err := r.K8sClient.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if sts.Spec.Replicas == nil {
+		return 0, fmt.Errorf("existing leader StatefulSet has no replica count")
+	}
+	return *sts.Spec.Replicas, nil
 }
 
 func clusterServingStatus(current rcvb2.RedisClusterStatus, ready bool) *rcvb2.RedisClusterStatus {

@@ -8,6 +8,12 @@ import (
 	rcvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/rediscluster/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
 	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 )
 
 type fakeChecker struct {
@@ -15,6 +21,27 @@ type fakeChecker struct {
 	slotsAssigned bool
 	err           error
 	called        bool
+}
+
+func TestCurrentLeaderReplicasPreservesReadErrors(t *testing.T) {
+	c := k8sfake.NewSimpleClientset()
+	r := &Reconciler{K8sClient: c}
+	n, err := r.currentLeaderReplicas(context.Background(), "default", "test-leader")
+	assert.NoError(t, err)
+	assert.Zero(t, n)
+	c.PrependReactor("get", "statefulsets", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, errors.New("read failed") })
+	_, err = r.currentLeaderReplicas(context.Background(), "default", "test-leader")
+	assert.Error(t, err, "a failed read must not masquerade as an absent StatefulSet")
+	for _, replicas := range []*int32{nil, ptr.To(int32(3))} {
+		r.K8sClient = k8sfake.NewSimpleClientset(&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "test-leader", Namespace: "default"}, Spec: appsv1.StatefulSetSpec{Replicas: replicas}})
+		n, err = r.currentLeaderReplicas(context.Background(), "default", "test-leader")
+		if replicas == nil {
+			assert.Error(t, err)
+		} else {
+			assert.NoError(t, err)
+			assert.Equal(t, int32(3), n)
+		}
+	}
 }
 
 func TestClusterServingStatusWithdrawsReady(t *testing.T) {
