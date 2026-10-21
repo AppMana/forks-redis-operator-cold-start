@@ -887,6 +887,7 @@ func executeCommand1(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 	}
 	targetContainer, pod := getContainerID(ctx, client, cr, podName)
 	if targetContainer < 0 {
+		err := fmt.Errorf("cannot execute command: Redis leader container not found in pod %s/%s", cr.Namespace, podName)
 		log.FromContext(ctx).Error(err, "Could not find pod to execute")
 		return "", err
 	}

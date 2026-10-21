@@ -19,6 +19,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	k8sClientFake "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	"k8s.io/utils/ptr"
 )
 
@@ -898,6 +900,38 @@ func TestCreateRedisReplicationCommand(t *testing.T) {
 
 			// Assert the command is as expected using testify
 			assert.Equal(t, tt.expectedCommand, cmd)
+		})
+	}
+}
+
+func TestExecuteCommandRejectsMissingTarget(t *testing.T) {
+	configPath := t.TempDir() + "/config"
+	config := clientcmdapi.Config{
+		Clusters:       map[string]*clientcmdapi.Cluster{"test": {Server: "https://127.0.0.1:1"}},
+		Contexts:       map[string]*clientcmdapi.Context{"test": {Cluster: "test"}},
+		CurrentContext: "test",
+	}
+	if err := clientcmd.WriteToFile(config, configPath); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KUBECONFIG", configPath)
+	cr := &rcvb2.RedisCluster{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}}
+	for _, tc := range []struct {
+		name    string
+		objects []runtime.Object
+	}{
+		{name: "pod absent"},
+		{name: "container absent", objects: []runtime.Object{&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-leader-0", Namespace: "default"},
+			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "exporter"}}},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := k8sClientFake.NewSimpleClientset(tc.objects...)
+			out, err := executeCommand1(context.Background(), client, cr, []string{"redis-cli", "PING"}, "test-leader-0")
+			assert.Error(t, err, "no command was executed; it must not report success")
+			assert.Empty(t, out)
+			assert.Len(t, client.Actions(), 1, "must stop after resolving the missing target")
 		})
 	}
 }
