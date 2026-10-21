@@ -20,7 +20,6 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util"
-	retry "github.com/avast/retry-go"
 	redis "github.com/redis/go-redis/v9"
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
@@ -647,46 +646,42 @@ func CheckRedisNodeCount(ctx context.Context, client kubernetes.Interface, cr *r
 // RedisClusterStatusHealth use `redis-cli --cluster check 127.0.0.1:6379`
 func RedisClusterStatusHealth(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) bool {
 	logger := log.FromContext(ctx)
-	leaderReplicas := cr.Spec.GetReplicaCounts("leader")
+	err := checkClusterTopology(ctx, cr.Spec.GetReplicaCounts("leader"), func(ctx context.Context, ordinal int32) error {
+		return checkClusterHealth(ctx, client, cr, fmt.Sprintf("%s-leader-%d", cr.Name, ordinal))
+	})
+	if err != nil {
+		logger.V(1).Info("Cluster topology check failed; retrying on next reconcile", "error", err)
+		return false
+	}
+	if err := clusterNodesServing(ctx, cr, func(pod string) *redis.Client {
+		return configureRedisClient(ctx, client, cr, pod)
+	}); err != nil {
+		logger.V(1).Info("Cluster is not serving on every node", "error", err)
+		return false
+	}
+	return true
+}
 
-	// Try to check cluster health from multiple leader nodes with retry logic
-	var lastErr error
-	for i := int32(0); i < leaderReplicas; i++ {
-		podName := fmt.Sprintf("%s-leader-%d", cr.Name, i)
-
-		// Retry logic with exponential backoff for each node
-		err := retry.Do(
-			func() error {
-				return checkClusterHealth(ctx, client, cr, podName)
-			},
-			retry.Attempts(3),
-			retry.Delay(500*time.Millisecond),
-			retry.DelayType(retry.BackOffDelay),
-			retry.OnRetry(func(n uint, err error) {
-				logger.V(1).Info("Retrying cluster health check", "pod", podName, "attempt", n+1, "error", err)
-			}),
-		)
-
-		if err == nil {
-			if err := clusterNodesServing(ctx, cr, func(pod string) *redis.Client {
-				return configureRedisClient(ctx, client, cr, pod)
-			}); err != nil {
-				logger.V(1).Info("Cluster is not serving on every node", "error", err)
-				return false
-			}
-			logger.V(1).Info("Cluster health check passed", "pod", podName)
-			return true
+// Share one exec budget across all seeds. Retrying three times per seed pinned
+// a three-leader reconcile for ~140s and prevented the next address-repair pass.
+// The reconcile loop supplies retries; fallback seeds only use remaining time.
+func checkClusterTopology(ctx context.Context, leaders int32, check func(context.Context, int32) error) error {
+	ctx, cancel := context.WithTimeout(ctx, clusterCheckExecTimeout)
+	defer cancel()
+	lastErr := fmt.Errorf("no cluster leaders available for health check")
+	for i := int32(0); i < leaders; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
-		lastErr = err
-		logger.V(1).Info("Cluster health check failed from node", "pod", podName, "error", err)
+		lastErr = check(ctx, i)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if lastErr == nil {
+			return nil
+		}
 	}
-
-	// All nodes failed the health check
-	if lastErr != nil {
-		logger.Error(lastErr, "Cluster health check failed from all leader nodes")
-	}
-	return false
+	return lastErr
 }
 
 // Slot topology can pass redis-cli --cluster check while Redis still returns
