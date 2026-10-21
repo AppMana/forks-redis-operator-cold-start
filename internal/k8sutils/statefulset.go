@@ -59,13 +59,18 @@ func (s *StatefulSetService) IsStatefulSetReady(ctx context.Context, namespace, 
 		replicas = int(*sts.Spec.Replicas)
 	}
 
-	if expectedUpdateReplicas := replicas - partition; sts.Status.UpdatedReplicas < int32(expectedUpdateReplicas) {
-		log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.UpdatedReplicas", sts.Status.UpdatedReplicas, "ExpectedUpdateReplicas", expectedUpdateReplicas)
-		return false
-	}
-	if partition == 0 && sts.Status.CurrentRevision != sts.Status.UpdateRevision {
-		log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.CurrentRevision", sts.Status.CurrentRevision, "Status.UpdateRevision", sts.Status.UpdateRevision)
-		return false
+	// OnDelete deliberately retains older pod revisions until an explicit
+	// replacement. Do not block topology repair waiting for an automatic rollout
+	// that this strategy will never perform.
+	if sts.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType {
+		if expectedUpdateReplicas := replicas - partition; sts.Status.UpdatedReplicas < int32(expectedUpdateReplicas) {
+			log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.UpdatedReplicas", sts.Status.UpdatedReplicas, "ExpectedUpdateReplicas", expectedUpdateReplicas)
+			return false
+		}
+		if partition == 0 && sts.Status.CurrentRevision != sts.Status.UpdateRevision {
+			log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.CurrentRevision", sts.Status.CurrentRevision, "Status.UpdateRevision", sts.Status.UpdateRevision)
+			return false
+		}
 	}
 	if sts.Status.ObservedGeneration != sts.Generation {
 		log.FromContext(ctx).V(1).Info("StatefulSet is not ready", "Status.ObservedGeneration", sts.Status.ObservedGeneration, "Generation", sts.Generation)
