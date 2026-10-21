@@ -7,7 +7,11 @@ expected="${2:?existing fixture value required}"
 expected_reply="${3:-OK}"
 [[ "$expected_reply" == OK || "$expected_reply" == 'NOREPLICAS Not enough good replicas to write.' ]]
 context="$(kubectl --kubeconfig "$config" config current-context)"
-[[ "$context" == kind-redis-recovery-20261020 ]]
+case "$context" in
+  kind-redis-recovery-20261020|kind-redis-recovery-release-20261021) ;;
+  *) exit 2 ;;
+esac
+cluster=${context#kind-}
 [[ "$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" == https://127.0.0.1:* ]]
 export CANARY_NAMESPACE=redis-upgrade-canary-migration
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$CANARY_NAMESPACE")
@@ -18,14 +22,18 @@ primary="$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNo
 [[ "$primary" == upgrade-[012] ]]
 primary_uid="$("${k[@]}" get pod "$primary" -o jsonpath='{.metadata.uid}')"
 node="$("${k[@]}" get pod "$primary" -o jsonpath='{.spec.nodeName}')"
-[[ "$node" == redis-recovery-20261020-control-plane ]]
-[[ "$(docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node")" == redis-recovery-20261020 ]]
+[[ "$node" == "$cluster-control-plane" ]]
+[[ "$(docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node")" == "$cluster" ]]
 container="$("${k[@]}" get pod "$primary" -o jsonpath='{.status.containerStatuses[?(@.name=="upgrade")].containerID}')"
 [[ "$container" =~ ^containerd://[a-f0-9]{64}$ ]]
 pid="$(docker exec "$node" crictl inspect "${container#containerd://}" | jq -er '.info.pid')"
 [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]]
 chain="AMDIRECT$$"
-net() { docker exec "$node" nsenter -t "$pid" -n -- iptables -w 3 "$@"; }
+netns="$(docker exec "$node" readlink "/proc/$pid/ns/net")"
+net() {
+  [[ "$(docker exec "$node" readlink "/proc/$pid/ns/net")" == "$netns" ]] || return 1
+  docker exec "$node" nsenter -t "$pid" -n -- iptables -w 3 "$@"
+}
 cleanup() {
   net -D INPUT -j "$chain" 2>/dev/null || true
   net -F "$chain" 2>/dev/null || true
@@ -36,7 +44,7 @@ trap 'exit 130' INT TERM
 net -N "$chain"
 # Local exec probes survive; operator, replicas and Sentinels cannot reach Redis.
 net -A "$chain" ! -i lo -p tcp --dport 6379 -j DROP
-docker exec -d "$node" sh -c 'sleep 120; nsenter -t "$1" -n -- iptables -w 3 -D INPUT -j "$2"; nsenter -t "$1" -n -- iptables -w 3 -F "$2"; nsenter -t "$1" -n -- iptables -w 3 -X "$2"' sh "$pid" "$chain"
+docker exec -d "$node" nsenter -t "$pid" -n -- sh -c 'sleep 120; iptables -w 3 -D INPUT -j "$1"; iptables -w 3 -F "$1"; iptables -w 3 -X "$1"' sh "$chain"
 net -I INPUT 1 -j "$chain"
 deadline=$((SECONDS+75)); elected=""
 while (( SECONDS < deadline )); do
