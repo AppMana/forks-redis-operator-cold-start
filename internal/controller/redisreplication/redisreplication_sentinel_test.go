@@ -237,10 +237,46 @@ func assertSecretEnv(t *testing.T, envs []corev1.EnvVar, name, wantName, wantKey
 	t.Fatalf("%s env var not found in %+v", name, envs)
 }
 
-// TestConfigureSentinelPodUsesSentinelRedisSecret exercises the controller path
-// that regressed when an outer ExistingPasswordSecret shadowed the embedded
-// redisSecret: the Sentinel connection must authenticate with the password read
-// from the embedded redisSecret.
+func TestInvalidPasswordReferenceStopsBeforeResourceChanges(t *testing.T) {
+	for _, sentinel := range []bool{false, true} {
+		inst := &rrvb2.RedisReplication{Spec: rrvb2.RedisReplicationSpec{Sentinel: &rrvb2.Sentinel{Size: 3}}}
+		if sentinel {
+			inst.Spec.Sentinel.ExistingPasswordSecret = &commonapi.ExistingPasswordSecret{}
+		} else {
+			inst.Spec.KubernetesConfig.ExistingPasswordSecret = &commonapi.ExistingPasswordSecret{}
+		}
+		// No clients: any API access before validation would panic.
+		r := &Reconciler{}
+		var err error
+		require.NotPanics(t, func() { _, err = r.reconcileResources(context.Background(), inst) })
+		require.ErrorContains(t, err, "password secret reference")
+	}
+}
+
+func TestEmbeddedPasswordRejectsInvalidReferences(t *testing.T) {
+	for _, ref := range []*commonapi.ExistingPasswordSecret{
+		{},
+		{Name: ptr.To("credentials")},
+		{Name: ptr.To("credentials"), Key: ptr.To("missing")},
+	} {
+		r := &Reconciler{K8sClient: fake.NewSimpleClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "test"}})}
+		var err error
+		require.NotPanics(t, func() { _, err = r.secretPassword(context.Background(), "test", ref) })
+		require.Error(t, err)
+	}
+}
+
+func TestEmbeddedPasswordMatchesCheckerNormalization(t *testing.T) {
+	r := &Reconciler{K8sClient: fake.NewSimpleClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "test"},
+		Data:       map[string][]byte{"password": []byte("synthetic-password\r\n")},
+	})}
+	value, err := r.secretPassword(context.Background(), "test", &commonapi.ExistingPasswordSecret{Name: ptr.To("credentials"), Key: ptr.To("password")})
+	require.NoError(t, err)
+	require.Equal(t, "synthetic-password", value)
+}
+
+// The Sentinel connection must use the embedded KubernetesConfig redisSecret.
 func TestConfigureSentinelPodUsesSentinelRedisSecret(t *testing.T) {
 	clientset := fake.NewSimpleClientset(&corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "sentinel-secret", Namespace: "default"},

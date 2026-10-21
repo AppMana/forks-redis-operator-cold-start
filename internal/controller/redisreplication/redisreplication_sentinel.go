@@ -9,6 +9,7 @@ import (
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
+	commonredis "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/statefulset"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
@@ -22,6 +23,19 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+func validatePasswordReferences(rr *rrvb2.RedisReplication) error {
+	refs := []*commonapi.ExistingPasswordSecret{rr.Spec.KubernetesConfig.ExistingPasswordSecret}
+	if rr.EnableSentinel() {
+		refs = append(refs, rr.Spec.Sentinel.ExistingPasswordSecret)
+	}
+	for _, ref := range refs {
+		if ref != nil && (ref.Name == nil || ref.Key == nil || *ref.Name == "" || *ref.Key == "") {
+			return fmt.Errorf("password secret reference requires a non-empty name and key")
+		}
+	}
+	return nil
+}
 
 func (r *Reconciler) validateSentinelConfigStorage(ctx context.Context, rr *rrvb2.RedisReplication) error {
 	if !rr.EnableSentinel() {
@@ -329,14 +343,7 @@ func (r *Reconciler) masterPassword(ctx context.Context, inst *rrvb2.RedisReplic
 }
 
 func (r *Reconciler) secretPassword(ctx context.Context, namespace string, ref *commonapi.ExistingPasswordSecret) (string, error) {
-	if ref == nil {
-		return "", nil
-	}
-	secret, err := r.K8sClient.CoreV1().Secrets(namespace).Get(ctx, *ref.Name, metav1.GetOptions{})
-	if err != nil {
-		return "", err
-	}
-	return string(secret.Data[*ref.Key]), nil
+	return commonredis.NewChecker(r.K8sClient).GetPassword(ctx, namespace, ref)
 }
 
 func replicationPodHostname(inst *rrvb2.RedisReplication, podName string) string {

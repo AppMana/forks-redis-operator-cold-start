@@ -337,6 +337,9 @@ func (r *Reconciler) reconcileFinalizer(ctx context.Context, instance *rrvb2.Red
 }
 
 func (r *Reconciler) reconcileResources(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
+	if err := validatePasswordReferences(instance); err != nil {
+		return intctrlutil.RequeueE(ctx, err, "invalid credential reference")
+	}
 	if err := r.validateSentinelConfigStorage(ctx, instance); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "Sentinel storage migration required before resource changes")
 	}
