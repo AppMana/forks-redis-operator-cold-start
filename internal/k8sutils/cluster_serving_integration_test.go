@@ -38,4 +38,10 @@ func TestClusterServingIntegration(t *testing.T) {
 		return err == nil && validateClusterServingInfo(info) == nil
 	}, 8*time.Second, 25*time.Millisecond)
 	require.ErrorIs(t, client.Get(ctx, "readiness-probe").Err(), redis.Nil)
+	t.Run("failover error is not acknowledgement", func(t *testing.T) {
+		out, err := exec.CommandContext(ctx, "redis-cli", "--raw", "CLUSTER", "FAILOVER").Output()
+		require.NoError(t, err, "redis-cli exits zero despite Redis rejecting failover on a master")
+		require.Contains(t, string(out), "ERR")
+		require.EqualError(t, validateFailoverAcknowledgement(string(out), err), "redis cluster failover was not acknowledged")
+	})
 }

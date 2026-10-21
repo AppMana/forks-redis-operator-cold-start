@@ -672,18 +672,24 @@ func ClusterFailover(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 	cmd = []string{"redis-cli", "-h", host, "-p", port}
 	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, slavePodName)
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
+		return fmt.Errorf("cannot initiate failover: authentication configuration unavailable")
 	}
 	cmd = append(cmd, authArgs...)
 
 	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, slavePodName)...)
 	cmd = append(cmd, "cluster", "failover")
 
-	log.FromContext(ctx).V(1).Info("Redis cluster failover command is", "Command", cmd)
+	log.FromContext(ctx).V(1).Info("Requesting Redis cluster failover", "Pod", slavePodName)
 	execOut, err := executeCommand1(ctx, client, cr, cmd, slavePodName)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "Could not execute command", "Command", cmd, "Output", execOut)
-		return err
+	return validateFailoverAcknowledgement(execOut, err)
+}
+
+// redis-cli may exit successfully for a Redis error reply. Only an exact OK
+// acknowledges this request; acknowledgement is not proof of completed failover.
+func validateFailoverAcknowledgement(output string, err error) error {
+	if err != nil || strings.TrimSpace(output) != "OK" {
+		// CLI arguments and output may contain credentials; keep this error static.
+		return fmt.Errorf("redis cluster failover was not acknowledged")
 	}
 	return nil
 }
