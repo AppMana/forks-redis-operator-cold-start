@@ -58,21 +58,37 @@ for ordinal in 0 1 2; do
           volumeMounts:[{name:"config",mountPath:"/seed"}]}],volumes:[{name:"config",persistentVolumeClaim:{claimName:$claim}}]}}
     ]}' | "${k[@]}" apply -f -
   "${k[@]}" wait pod "$seed" --for=condition=Ready --timeout=120s
-  "${k[@]}" exec "$seed" -- test ! -e /seed/sentinel.conf
+  existing="$("${k[@]}" exec "$seed" -- sh -ec 'if test -e /seed/sentinel.conf; then sha256sum /seed/sentinel.conf; else echo missing; fi' | awk '{print $1}')"
+  if [[ "$existing" != missing ]]; then
+    before="$("${k[@]}" exec "$source" -c "$sentinel_container" -- sha256sum /etc/redis/sentinel.conf | awk '{print $1}')"
+    [[ "$existing" =~ ^[a-f0-9]{64}$ && "$existing" == "$before" ]] || {
+      echo "Existing accepted seed differs from live source; preserving both, refusing overwrite" >&2; exit 1;
+    }
+    echo "PASS: $source already has an identical accepted seed; retaining it"
+    continue
+  fi
   stable=false
   for attempt in {1..10}; do
     before="$("${k[@]}" exec "$source" -c "$sentinel_container" -- sha256sum /etc/redis/sentinel.conf | awk '{print $1}')"
     [[ "$before" =~ ^[a-f0-9]{64}$ ]]
-    "${k[@]}" exec "$source" -c "$sentinel_container" -- cat /etc/redis/sentinel.conf |
-      "${k[@]}" exec -i "$seed" -- sh -ec 'umask 077; test ! -e /seed/sentinel.conf; cat > /seed/sentinel.conf.pending'
+    if ! "${k[@]}" exec "$source" -c "$sentinel_container" -- cat /etc/redis/sentinel.conf |
+      "${k[@]}" exec -i "$seed" -- sh -ec 'umask 077; test ! -e /seed/sentinel.conf; cat > /seed/sentinel.conf.pending; sync; test -s /seed/sentinel.conf.pending'; then
+      echo "Config transfer failed or was empty; retry $attempt/10"
+      sleep 1
+      continue
+    fi
     copied="$("${k[@]}" exec "$seed" -- sha256sum /seed/sentinel.conf.pending | awk '{print $1}')"
     after="$("${k[@]}" exec "$source" -c "$sentinel_container" -- sha256sum /etc/redis/sentinel.conf | awk '{print $1}')"
     if [[ "$before" == "$copied" && "$before" == "$after" ]]; then stable=true; break; fi
-    echo "Source rewrote config during copy; retry $attempt/10"
+    if [[ "$before" != "$after" ]]; then
+      echo "Source rewrote config during copy; retry $attempt/10"
+    else
+      echo "Config transfer checksum mismatch; retry $attempt/10"
+    fi
     sleep 1
   done
   [[ "$stable" == true ]] || {
-    echo "Election state changed while copying; source retained, do not migrate" >&2; exit 1;
+    echo "No verified config copy obtained; source retained, do not migrate" >&2; exit 1;
   }
   "${k[@]}" exec "$seed" -- sh -ec 'test ! -e /seed/sentinel.conf; mv /seed/sentinel.conf.pending /seed/sentinel.conf; sync'
   echo "PASS: $source config copied unchanged into $claim; original pod retained"

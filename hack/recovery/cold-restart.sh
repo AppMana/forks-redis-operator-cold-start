@@ -24,6 +24,24 @@ if [[ "${CANARY_EMBEDDED_SENTINEL:-false}" == true ]]; then
 else
   [[ "$("${k[@]}" get redissentinel upgrade -o json | jq '.spec.configVolumeClaimTemplate != null')" == true ]]
 fi
+# A desired hostname mode is not proof that live monitors have migrated.
+# Refuse the fault while OnDelete still holds an IP-only runtime configuration.
+if [[ "${CANARY_EMBEDDED_SENTINEL:-false}" == true ]]; then
+  hostname_mode="$("${k[@]}" get redisreplication upgrade -o json | jq '.spec.sentinel.resolveHostnames == "yes" and .spec.sentinel.announceHostnames == "yes"')"
+  group=mymaster
+else
+  hostname_mode="$("${k[@]}" get redissentinel upgrade -o json | jq '.spec.redisSentinelConfig.resolveHostnames == "yes" and .spec.redisSentinelConfig.announceHostnames == "yes"')"
+  group=upgrade
+fi
+if [[ "$hostname_mode" == true ]]; then
+  primary="$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')"
+  for ordinal in 0 1 2; do
+    monitored="$(cli "$sentinel_prefix-$ordinal" SENTINEL GET-MASTER-ADDR-BY-NAME "$group" | head -1)"
+    [[ "$monitored" == "$primary.upgrade-headless.$CANARY_NAMESPACE.svc.cluster.local" ]] || {
+      echo 'FAIL: live hostname monitor migration is incomplete; refusing cold restart' >&2; exit 1;
+    }
+  done
+fi
 pods=(upgrade-0 upgrade-1 upgrade-2 "$sentinel_prefix-0" "$sentinel_prefix-1" "$sentinel_prefix-2")
 uids=()
 identities=()
