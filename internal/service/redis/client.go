@@ -97,6 +97,7 @@ func (m SentinelMasterInfo) HasStaleEntries(expectedSlaves, expectedSentinels in
 
 type service struct {
 	connectionInfo *ConnectionInfo
+	redisClient    *rediscli.Client
 }
 
 func NewService() Service {
@@ -104,6 +105,9 @@ func NewService() Service {
 }
 
 func (s *service) createClient() *rediscli.Client {
+	if s.redisClient != nil {
+		return s.redisClient
+	}
 	if s.connectionInfo == nil {
 		return nil
 	}
@@ -277,6 +281,19 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 			if monitoredHost == master.Host && monitoredPort == master.Port {
 				return nil
 			}
+		}
+	}
+
+	// Legacy Sentinel entrypoints may ignore hostname environment settings.
+	// Check the live resolver before removing an existing monitor: otherwise
+	// MONITOR rejects the hostname after REMOVE has already erased the group.
+	if net.ParseIP(master.Host) == nil {
+		settings, configErr := client.Do(ctx, "SENTINEL", "CONFIG", "GET", "resolve-hostnames").StringSlice()
+		if configErr != nil {
+			return fmt.Errorf("verify Sentinel resolve-hostnames before changing monitor: %w", configErr)
+		}
+		if len(settings) != 2 || settings[0] != "resolve-hostnames" || settings[1] != "yes" {
+			return fmt.Errorf("sentinel resolve-hostnames must be enabled before changing monitor to a hostname; existing monitor preserved")
 		}
 	}
 
