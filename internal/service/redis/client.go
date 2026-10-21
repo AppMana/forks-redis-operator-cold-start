@@ -71,6 +71,7 @@ type Service interface {
 	GetAttachedReplicaCount(ctx context.Context) (int, error)
 	GetKeyCount(ctx context.Context) (int64, error)
 	SentinelMonitor(ctx context.Context, master *ConnectionInfo, masterGroupName, quorum string) error
+	SentinelMonitorHealthy(ctx context.Context, masterGroupName string) (bool, error)
 	SentinelSet(ctx context.Context, masterGroupName, key, value string) error
 	SentinelConfigSet(ctx context.Context, key, value string) error
 	SentinelReset(ctx context.Context, masterGroupName string) error

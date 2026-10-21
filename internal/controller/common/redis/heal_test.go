@@ -626,7 +626,7 @@ func TestSentinelResetSkipsSentinelsWithoutMasterGroup(t *testing.T) {
 	assert.Equal(t, []string{"10.0.1.12"}, redisClient.resetHosts)
 }
 
-func TestSentinelMonitorSkipsUnreadySentinelsAndReportsUnreachableOnes(t *testing.T) {
+func TestSentinelMonitorPreservesPeersWhenInventoryIsUnready(t *testing.T) {
 	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
 	labels := map[string]string{"app": rs.GetStatefulSetName()}
 	objects = append(objects, newLabeledRedisPod(rs.GetStatefulSetName()+"-2", labels, "10.0.1.12", corev1.PodRunning, false))
@@ -637,8 +637,8 @@ func TestSentinelMonitorSkipsUnreadySentinelsAndReportsUnreachableOnes(t *testin
 
 	err := h.SentinelMonitor(context.Background(), rs, "10.0.0.10")
 
-	require.ErrorContains(t, err, rs.GetStatefulSetName()+"-0")
-	assert.Equal(t, []string{"10.0.1.11"}, redisClient.monitorHosts)
+	require.ErrorContains(t, err, rs.GetStatefulSetName()+"-2")
+	assert.Empty(t, redisClient.monitorHosts, "unobserved peers block monitor replacement")
 }
 
 func TestSentinelMonitorStopsAfterUncertainMutation(t *testing.T) {
@@ -648,6 +648,22 @@ func TestSentinelMonitorStopsAfterUncertainMutation(t *testing.T) {
 	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
 	require.ErrorIs(t, h.SentinelMonitor(context.Background(), rs, "10.0.0.10"), failure)
 	assert.Empty(t, redisClient.monitorHosts, "later Sentinels must remain untouched")
+}
+
+func TestSentinelMonitorRepairsPersistedGapBeforeHealthyPeers(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	remote := &fakeRedisClient{sentinelHealthByHost: map[string]bool{
+		"10.0.1.10": true, "10.0.1.11": false, "10.0.1.12": true,
+	}}
+	kube := k8sfake.NewSimpleClientset(objects...)
+	first := &healer{redis: remote, k8s: kube}
+	require.ErrorContains(t, first.SentinelMonitor(context.Background(), rs, "10.0.0.10"), "waiting to verify")
+	require.Equal(t, []string{"10.0.1.11"}, remote.monitorHosts)
+	remote.monitorHosts = nil
+	// No coordinator state survives. Only the remote monitor observations do.
+	restarted := &healer{redis: remote, k8s: kube}
+	require.NoError(t, restarted.SentinelMonitor(context.Background(), rs, "10.0.0.10"))
+	require.Equal(t, []string{"10.0.1.10", "10.0.1.11", "10.0.1.12"}, remote.monitorHosts)
 }
 
 func TestIsConnectivityError(t *testing.T) {
@@ -693,17 +709,18 @@ func TestIsConnectivityError(t *testing.T) {
 }
 
 type fakeRedisClient struct {
-	connectHosts       []string
-	isMasterByHost     map[string]bool
-	replicasByHost     map[string]int
-	errByHost          map[string]error
-	replicaErrByHost   map[string]error
-	keyCountByHost     map[string]int64
-	keyCountErrByHost  map[string]error
-	sentinelInfoByHost map[string]*redisservice.InfoSentinelResult
-	monitorHosts       []string
-	setHosts           []string
-	resetHosts         []string
+	sentinelHealthByHost map[string]bool
+	connectHosts         []string
+	isMasterByHost       map[string]bool
+	replicasByHost       map[string]int
+	errByHost            map[string]error
+	replicaErrByHost     map[string]error
+	keyCountByHost       map[string]int64
+	keyCountErrByHost    map[string]error
+	sentinelInfoByHost   map[string]*redisservice.InfoSentinelResult
+	monitorHosts         []string
+	setHosts             []string
+	resetHosts           []string
 }
 
 func (f *fakeRedisClient) Connect(info *redisservice.ConnectionInfo) redisservice.Service {
@@ -713,6 +730,13 @@ func (f *fakeRedisClient) Connect(info *redisservice.ConnectionInfo) redisservic
 
 func (f *fakeRedisService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return "", "", false, nil
+}
+
+func (f *fakeRedisService) SentinelMonitorHealthy(context.Context, string) (bool, error) {
+	if f.client.sentinelHealthByHost != nil {
+		return f.client.sentinelHealthByHost[f.host], nil
+	}
+	return true, nil
 }
 
 type fakeRedisService struct {
@@ -746,6 +770,9 @@ func (f *fakeRedisService) SentinelMonitor(context.Context, *redisservice.Connec
 		return err
 	}
 	f.client.monitorHosts = append(f.client.monitorHosts, f.host)
+	if f.client.sentinelHealthByHost != nil {
+		f.client.sentinelHealthByHost[f.host] = true
+	}
 	return nil
 }
 

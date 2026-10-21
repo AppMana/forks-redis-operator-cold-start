@@ -2,7 +2,6 @@ package redisreplication
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -407,22 +406,26 @@ func (r *Reconciler) configureSentinelPods(ctx context.Context, redisClient redi
 	if len(pods) < int(inst.Spec.Sentinel.Size) {
 		return fmt.Errorf("not all configured Sentinel pods are available")
 	}
-	var failures []error
-	for _, pod := range pods {
-		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
-			failures = append(failures, fmt.Errorf("sentinel pod %s is not available", pod.Name))
-			continue
-		}
-		if err := r.configureSentinelPod(ctx, redisClient, inst, pod, monitorAddr, masterPassword); err != nil {
-			log.FromContext(ctx).Error(err, "failed to configure sentinel pod", "pod", pod.Name)
-			failures = append(failures, fmt.Errorf("configure sentinel %s: %w", pod.Name, err))
-			var mutationErr *redis.SentinelMonitorMutationError
-			if errors.As(err, &mutationErr) {
-				return errors.Join(failures...)
-			}
-		}
+	sentinelPassword, err := r.sentinelPassword(ctx, inst)
+	if err != nil {
+		return err
 	}
-	return errors.Join(failures...)
+	var peers []redis.SentinelMonitorPeer
+	for _, pod := range pods {
+		pod := pod
+		if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+			return fmt.Errorf("sentinel pod %s is not available", pod.Name)
+		}
+		service := redisClient.Connect(&redis.ConnectionInfo{Host: pod.Status.PodIP, Port: "26379", Password: sentinelPassword})
+		peers = append(peers, redis.SentinelMonitorPeer{
+			Name:    pod.Name,
+			Healthy: func(ctx context.Context) (bool, error) { return service.SentinelMonitorHealthy(ctx, masterGroupName) },
+			Reconcile: func(ctx context.Context) error {
+				return r.configureSentinelPod(ctx, redisClient, inst, pod, monitorAddr, masterPassword)
+			},
+		})
+	}
+	return redis.ReconcileSentinelMonitorBatch(ctx, peers)
 }
 
 func (r *Reconciler) getSentinelPods(ctx context.Context, inst *rrvb2.RedisReplication) (*corev1.PodList, error) {

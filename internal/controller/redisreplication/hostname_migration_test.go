@@ -92,7 +92,7 @@ func TestSentinelConfigurationFailureIsNotSwallowed(t *testing.T) {
 	r := &Reconciler{}
 	err := r.configureSentinelPods(context.Background(), &fakeSentinelRedisClient{svc: svc}, rr, pods, "redis.example", "")
 	require.ErrorIs(t, err, failure)
-	require.Len(t, svc.hostnameCalls, 3, "try every Sentinel even when one fails")
+	require.Len(t, svc.hostnameCalls, 1, "do not advance after an unsuccessful peer reconciliation")
 	require.Nil(t, svc.monitoredMaster)
 	require.Error(t, r.configureSentinelPods(context.Background(), &fakeSentinelRedisClient{svc: svc}, rr, pods[:2], "redis.example", ""))
 }

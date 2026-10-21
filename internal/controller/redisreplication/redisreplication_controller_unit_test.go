@@ -1147,6 +1147,10 @@ func (f *fakeSentinelInfoClient) Connect(info *redis.ConnectionInfo) redis.Servi
 	return &fakeSentinelInfoService{info: f.infoByHost[info.Host], err: f.errByHost[info.Host]}
 }
 
+func (f *fakeSentinelInfoService) SentinelMonitorHealthy(context.Context, string) (bool, error) {
+	return true, nil
+}
+
 func (f *fakeSentinelInfoService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return "", "", false, nil
 }

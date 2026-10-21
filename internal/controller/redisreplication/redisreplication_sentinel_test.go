@@ -402,6 +402,10 @@ type fakeSentinelRedisService struct {
 
 func (f *fakeSentinelRedisService) IsMaster(context.Context) (bool, error) { return false, nil }
 
+func (f *fakeSentinelRedisService) SentinelMonitorHealthy(context.Context, string) (bool, error) {
+	return true, nil
+}
+
 func (f *fakeSentinelRedisService) GetKeyCount(context.Context) (int64, error) {
 	return 0, nil
 }
@@ -423,12 +427,13 @@ func TestEmbeddedSentinelStopsAfterUncertainMutation(t *testing.T) {
 	client := &fakeSentinelRedisClient{svc: &fakeSentinelRedisService{monitorError: failure}}
 	r := &Reconciler{K8sClient: fake.NewSimpleClientset()}
 	pods := []corev1.Pod{
-		{Status: corev1.PodStatus{PodIP: "10.0.1.10"}},
-		{Status: corev1.PodStatus{PodIP: "10.0.1.11"}},
-		{Status: corev1.PodStatus{PodIP: "10.0.1.12"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "sentinel-0"}, Status: corev1.PodStatus{PodIP: "10.0.1.10"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "sentinel-1"}, Status: corev1.PodStatus{PodIP: "10.0.1.11"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "sentinel-2"}, Status: corev1.PodStatus{PodIP: "10.0.1.12"}},
 	}
 	require.ErrorIs(t, r.configureSentinelPods(context.Background(), client, inst, pods, "10.0.0.10", ""), failure)
-	require.Len(t, client.connections, 1, "later Sentinels must remain untouched")
+	require.Len(t, client.connections, 4, "observe three peers, then reconcile only the first")
+	require.Equal(t, []string{"monitor"}, client.svc.hostnameCalls, "later Sentinels must not be mutated")
 }
 
 func TestEmbeddedSentinelHonorsConfiguredQuorum(t *testing.T) {

@@ -431,6 +431,9 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 	if err != nil {
 		return err
 	}
+	if rs.Spec.Size == nil || len(pods.Items) < int(*rs.Spec.Size) {
+		return errors.New("not all configured Sentinel pods are available for monitor observation")
+	}
 
 	sentinelPass, err := NewChecker(h.k8s).GetPassword(ctx, rs.Namespace, rs.Spec.KubernetesConfig.ExistingPasswordSecret)
 	if err != nil {
@@ -454,37 +457,31 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 		}
 	}
 
-	var errs []error
+	var peers []redis.SentinelMonitorPeer
 	for _, pod := range pods.Items {
 		if !k8sutils.IsRedisPodProbeable(&pod) {
-			continue
+			return fmt.Errorf("sentinel pod %s is not available for monitor observation", pod.Name)
 		}
 		connInfo := createConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace, "26379")
+		service := h.redis.Connect(connInfo)
 
 		masterConnInfo := &redis.ConnectionInfo{
 			Host:     master,
 			Port:     "6379",
 			Password: masterPass,
 		}
-		err = h.redis.Connect(connInfo).SentinelMonitor(
-			ctx,
-			masterConnInfo,
-			rs.Spec.RedisSentinelConfig.MasterGroupName,
-			rs.Spec.RedisSentinelConfig.Quorum,
-		)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			errs = append(errs, fmt.Errorf("sentinel monitor on pod %s: %w", pod.Name, err))
-			var mutationErr *redis.SentinelMonitorMutationError
-			if errors.As(err, &mutationErr) {
-				return errors.Join(errs...)
-			}
-		}
+		peers = append(peers, redis.SentinelMonitorPeer{
+			Name: pod.Name,
+			Healthy: func(ctx context.Context) (bool, error) {
+				return service.SentinelMonitorHealthy(ctx, rs.Spec.RedisSentinelConfig.MasterGroupName)
+			},
+			Reconcile: func(ctx context.Context) error {
+				return service.SentinelMonitor(ctx, masterConnInfo, rs.Spec.RedisSentinelConfig.MasterGroupName, rs.Spec.RedisSentinelConfig.Quorum)
+			},
+		})
 	}
 
-	return errors.Join(errs...)
+	return redis.ReconcileSentinelMonitorBatch(ctx, peers)
 }
 
 func (h *healer) getSentinelPods(ctx context.Context, rs *rsvb2.RedisSentinel) (*v1.PodList, error) {

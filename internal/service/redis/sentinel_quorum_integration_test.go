@@ -52,6 +52,10 @@ func TestSentinelQuorumIntegration(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Do(ctx, "SENTINEL", "CONFIG", "SET", "resolve-hostnames", "yes").Err())
 	svc := NewClient().Connect(&ConnectionInfo{Host: "127.0.0.1", Port: "26379"})
+	require.Eventually(t, func() bool {
+		healthy, err := svc.SentinelMonitorHealthy(ctx, "upgrade")
+		return err == nil && healthy
+	}, 3*time.Second, 25*time.Millisecond)
 	err = svc.SentinelMonitor(ctx, &ConnectionInfo{Host: "missing.invalid", Port: "6379"}, "upgrade", "2")
 	require.ErrorContains(t, err, "resolve replacement Sentinel master")
 	retained := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "MASTER", "upgrade")
