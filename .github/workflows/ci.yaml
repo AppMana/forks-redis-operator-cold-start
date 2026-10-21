@@ -69,6 +69,8 @@ jobs:
         run: bash hack/recovery/check-cluster-serving.sh
       - name: Test Sentinel quorum reconciliation against Redis
         run: bash hack/recovery/check-sentinel-quorum.sh
+      - name: Test retained Sentinel configuration against Redis
+        run: bash hack/recovery/check-sentinel-persistence.sh
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
