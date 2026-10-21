@@ -2,6 +2,7 @@ package k8sutils
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"sort"
@@ -256,6 +257,9 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 		log.FromContext(ctx).V(1).Info("Reconciliation complete, no changes required.")
 		return nil
 	}
+	if err := guardEphemeralRollout(storedStateful, newStateful, patchResult.Patch, recreateStatefulSet); err != nil {
+		return err
+	}
 
 	log.FromContext(ctx).V(1).Info("Changes detected in statefulset, updating...", "patch", string(patchResult.Patch), "VCT modified", vctModified)
 
@@ -269,6 +273,38 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 	}
 
 	return updateStatefulSet(ctx, cl, namespace, newStateful, recreateStatefulSet, deletePropagation)
+}
+
+// PING readiness cannot prove that ephemeral replicas have copied the dataset,
+// or that replacement Sentinels have learned the surviving election history.
+// Do not let an operator template upgrade automatically replace those pods.
+// OnDelete stages the desired template for an explicitly coordinated migration.
+func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, recreate bool) error {
+	if len(stored.Spec.VolumeClaimTemplates) != 0 {
+		return nil
+	}
+	managed := false
+	for _, owner := range stored.OwnerReferences {
+		if strings.HasPrefix(owner.APIVersion, "redis.redis.opstreelabs.in/") &&
+			(owner.Kind == "RedisReplication" || owner.Kind == "RedisSentinel") {
+			managed = true
+		}
+	}
+	if !managed {
+		return nil
+	}
+	var delta struct {
+		Spec map[string]json.RawMessage `json:"spec"`
+	}
+	if err := json.Unmarshal(changes, &delta); err != nil {
+		return fmt.Errorf("inspect ephemeral rollout patch: %w", err)
+	}
+	_, templateChanged := delta.Spec["template"]
+	pendingRollout := stored.Status.CurrentRevision != stored.Status.UpdateRevision
+	if recreate || (desired.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType && (templateChanged || pendingRollout)) {
+		return fmt.Errorf("refusing automatic replacement of ephemeral StatefulSet %s/%s: stage updateStrategy.type=OnDelete with recreation disabled and coordinate data/Sentinel migration", stored.Namespace, stored.Name)
+	}
+	return nil
 }
 
 // syncManagedFields syncs system-managed fields from the stored object to the new object.
