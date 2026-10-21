@@ -20,6 +20,17 @@ func TestSentinelQuorumIntegration(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	masterProcess := exec.CommandContext(ctx, "redis-server", "--port", "6379", "--save", "", "--appendonly", "no")
+	require.NoError(t, masterProcess.Start())
+	t.Cleanup(func() { _ = masterProcess.Process.Kill(); _ = masterProcess.Wait() })
+	masterService := NewClient().Connect(&ConnectionInfo{Host: "127.0.0.1", Port: "6379"})
+	require.Eventually(t, func() bool {
+		isMaster, err := masterService.IsMaster(ctx)
+		return err == nil && isMaster
+	}, 5*time.Second, 50*time.Millisecond)
+	attached, err := masterService.GetAttachedReplicaCount(ctx)
+	require.NoError(t, err)
+	require.Zero(t, attached)
 	config := filepath.Join(t.TempDir(), "sentinel.conf")
 	require.NoError(t, os.WriteFile(config, []byte("port 26379\nbind 127.0.0.1\nsentinel monitor upgrade 127.0.0.1 6379 3\nsentinel down-after-milliseconds upgrade 23456\n"), 0o600))
 	process := exec.CommandContext(ctx, "redis-server", config, "--sentinel")

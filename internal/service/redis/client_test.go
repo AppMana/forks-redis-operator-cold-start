@@ -4,9 +4,57 @@ import (
 	"context"
 	"testing"
 
+	"github.com/go-redis/redismock/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestRoleObservationRejectsUnknownReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name, info      string
+		master, invalid bool
+	}{
+		{name: "master", info: "# Replication\r\nrole:master\r\n", master: true},
+		{name: "replica", info: "# Replication\r\nrole:slave\r\n"},
+		{name: "empty", invalid: true},
+		{name: "unknown", info: "role:unknown\r\n", invalid: true},
+		{name: "substring", info: "other:role:master\r\n", invalid: true},
+		{name: "suffix", info: "role:master-invalid\r\n", invalid: true},
+		{name: "duplicate", info: "role:master\r\nrole:slave\r\n", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := redismock.NewClientMock()
+			mock.ExpectInfo("replication").SetVal(tc.info)
+			got, err := (&service{redisClient: db}).IsMaster(context.Background())
+			require.Equal(t, tc.invalid, err != nil)
+			require.Equal(t, tc.master, got)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestReplicaCountRejectsUnknownReplies(t *testing.T) {
+	for _, tc := range []struct {
+		name, info string
+		count      int
+		invalid    bool
+	}{
+		{name: "zero", info: "connected_slaves:0\r\n"},
+		{name: "two", info: "connected_slaves:2\r\n", count: 2},
+		{name: "missing", info: "role:master\r\n", invalid: true},
+		{name: "negative", info: "connected_slaves:-1\r\n", invalid: true},
+		{name: "duplicate", info: "connected_slaves:1\r\nconnected_slaves:2\r\n", invalid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, mock := redismock.NewClientMock()
+			mock.ExpectInfo("replication").SetVal(tc.info)
+			got, err := (&service{redisClient: db}).GetAttachedReplicaCount(context.Background())
+			require.Equal(t, tc.invalid, err != nil)
+			require.Equal(t, tc.count, got)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
 
 func TestServiceWithoutConnectionFailsClosed(t *testing.T) {
 	ctx := context.Background()

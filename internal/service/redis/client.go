@@ -13,10 +13,6 @@ import (
 	rediscli "github.com/redis/go-redis/v9"
 )
 
-const (
-	redisRoleMaster = "role:master"
-)
-
 var errConnectionInfoNotSet = errors.New("redis connection info is not set")
 
 // SentinelMonitorMutationError means a mutating command was attempted but its
@@ -419,7 +415,18 @@ func (c *service) IsMaster(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return strings.Contains(result, redisRoleMaster), nil
+	role, err := replicationInfoField(result, "role")
+	if err != nil {
+		return false, err
+	}
+	switch role {
+	case "master":
+		return true, nil
+	case "slave":
+		return false, nil
+	default:
+		return false, errors.New("unknown role in Redis replication info")
+	}
 }
 
 func (c *service) GetAttachedReplicaCount(ctx context.Context) (int, error) {
@@ -434,17 +441,33 @@ func (c *service) GetAttachedReplicaCount(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	var count int
-	for _, line := range strings.Split(result, "\r\n") {
-		if value, found := strings.CutPrefix(line, "connected_slaves:"); found {
-			count, err = strconv.Atoi(value)
-			if err != nil {
-				return 0, err
-			}
-			return count, nil
-		}
+	value, err := replicationInfoField(result, "connected_slaves")
+	if err != nil {
+		return 0, err
 	}
-	return count, nil
+	count, err := strconv.ParseUint(value, 10, 31)
+	if err != nil {
+		return 0, errors.New("invalid connected_slaves in Redis replication info")
+	}
+	return int(count), nil
+}
+
+func replicationInfoField(info, field string) (string, error) {
+	value, found := "", false
+	for _, line := range strings.Split(info, "\n") {
+		candidate, matches := strings.CutPrefix(strings.TrimSuffix(line, "\r"), field+":")
+		if !matches {
+			continue
+		}
+		if found {
+			return "", fmt.Errorf("duplicate %s in Redis replication info", field)
+		}
+		value, found = candidate, true
+	}
+	if !found {
+		return "", fmt.Errorf("missing %s in Redis replication info", field)
+	}
+	return value, nil
 }
 
 func (c *service) GetKeyCount(ctx context.Context) (int64, error) {
