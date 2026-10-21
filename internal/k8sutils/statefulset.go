@@ -156,6 +156,7 @@ type containerParameters struct {
 	// SentinelService is empty the replication preStop hook is not installed.
 	SentinelService    string
 	SentinelMasterName string
+	SentinelAuthSecret *commonapi.ExistingPasswordSecret
 	SentinelPort       int
 	// PreStopWaitSeconds is not Sentinel-specific: it is populated for the
 	// "replication" role and for every RedisCluster leader and follower, and
@@ -521,6 +522,14 @@ func generateContainerDef(name string, containerParams containerParameters, clus
 		WaitSeconds:        containerParams.PreStopWaitSeconds,
 	}
 	if preStopCmd := GeneratePreStopCommand(preStopCfg); preStopCmd != "" {
+		if ref := containerParams.SentinelAuthSecret; ref != nil && ref.Name != nil && ref.Key != nil {
+			containerDefinition[0].Env = append(containerDefinition[0].Env, corev1.EnvVar{
+				Name: "SENTINELCLI_AUTH",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: *ref.Name}, Key: *ref.Key,
+				}},
+			})
+		}
 		containerDefinition[0].Lifecycle = &corev1.Lifecycle{
 			PreStop: &corev1.LifecycleHandler{
 				Exec: &corev1.ExecAction{
@@ -613,8 +622,8 @@ type PreStopConfig struct {
 // triggers a Sentinel failover, but only when a Sentinel service is configured.
 // All other roles (and Sentinel-less replication) return an empty string.
 //
-// Authentication is taken from the REDISCLI_AUTH environment variable that the
-// operator sets on the pod, so the password is never passed on the command line.
+// Local authentication uses REDISCLI_AUTH; the embedded Sentinel call uses its
+// separate SENTINELCLI_AUTH. Neither password is passed on the command line.
 func GeneratePreStopCommand(cfg PreStopConfig) string {
 	tlsArgs := GenerateTLSArgs(cfg.EnableTLS)
 
@@ -788,7 +797,14 @@ func generateReplicationPreStop(tlsArgs string, cfg PreStopConfig) string {
 ROLE=$(redis-cli -h $(hostname) -p ${REDIS_PORT} %s info replication | awk -F: '/role:master/ {print "master"}')
 
 if [ "$ROLE" = "master" ]; then
-    FAILOVER_RESULT=$(redis-cli -h "%s" -p %d SENTINEL FAILOVER %s 2>&1)
+    FAILOVER_RESULT=$(
+        unset REDISCLI_AUTH
+        if [ -n "${SENTINELCLI_AUTH:-}" ]; then
+            REDISCLI_AUTH="$(printf %%s "$SENTINELCLI_AUTH" | tr -d '\r\n')"
+            export REDISCLI_AUTH
+        fi
+        redis-cli -h "%s" -p %d SENTINEL FAILOVER %s 2>&1
+    )
     case "$FAILOVER_RESULT" in
         OK*) ;;
         *)

@@ -268,12 +268,14 @@ func Test_generateRedisReplicationContainerParams_SentinelPreStop(t *testing.T) 
 	t.Run("embedded sentinel wires preStop from CR config", func(t *testing.T) {
 		cr := base()
 		cr.Spec.Sentinel = &rrvb2.Sentinel{Size: 3}
+		cr.Spec.Sentinel.ExistingPasswordSecret = &common.ExistingPasswordSecret{Name: ptr.To("sentinel-auth"), Key: ptr.To("password")}
 		cr.Spec.TerminationGracePeriodSeconds = ptr.To(int64(60))
 
 		got, err := generateRedisReplicationContainerParams(context.TODO(), cr, nil)
 		assert.NoError(t, err)
 		assert.Equal(t, "my-replication-s-hl", got.SentinelService)
 		assert.Equal(t, "mymaster", got.SentinelMasterName)
+		assert.Equal(t, cr.Spec.Sentinel.ExistingPasswordSecret, got.SentinelAuthSecret)
 		assert.Equal(t, 26379, got.SentinelPort)
 		// grace(60) - headroom(10) => 50s wait, leaving headroom before SIGKILL.
 		assert.Equal(t, 50, got.PreStopWaitSeconds)
