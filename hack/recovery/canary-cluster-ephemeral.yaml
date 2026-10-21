@@ -1,0 +1,28 @@
+# Disposable cluster-mode upgrade fixture. No production data or PVCs.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: redis-upgrade-canary-cluster-guard
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisCluster
+metadata:
+  name: guarded
+  namespace: redis-upgrade-canary-cluster-guard
+spec:
+  clusterSize: 3
+  clusterVersion: v7
+  persistenceEnabled: false
+  redisLeader:
+    replicas: 3
+  redisFollower:
+    replicas: 0
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits: {memory: 256Mi}
