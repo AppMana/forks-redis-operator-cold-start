@@ -251,34 +251,12 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 	defer client.Close()
 
 	masterExists := false
-	masterCheckCmd := rediscli.NewSliceCmd(ctx, "SENTINEL", "MASTER", masterGroupName)
+	masterCheckCmd := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "MASTER", masterGroupName)
 	if err = client.Process(ctx, masterCheckCmd); err == nil {
 		if err = masterCheckCmd.Err(); err == nil {
 			masterExists = true
-			result, _ := masterCheckCmd.Result()
-			var monitoredHost, monitoredPort string
-			for i := 0; i+1 < len(result); i += 2 {
-				key, ok := result[i].(string)
-				if !ok {
-					continue
-				}
-				var val string
-				switch v := result[i+1].(type) {
-				case string:
-					val = v
-				case []byte:
-					val = string(v)
-				default:
-					continue
-				}
-				switch key {
-				case "ip":
-					monitoredHost = val
-				case "port":
-					monitoredPort = val
-				}
-			}
-			if monitoredHost == master.Host && monitoredPort == master.Port {
+			result := masterCheckCmd.Val()
+			if result["ip"] == master.Host && result["port"] == master.Port {
 				return nil
 			}
 		}
@@ -288,11 +266,16 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 	// Check the live resolver before removing an existing monitor: otherwise
 	// MONITOR rejects the hostname after REMOVE has already erased the group.
 	if net.ParseIP(master.Host) == nil {
-		settings, configErr := client.Do(ctx, "SENTINEL", "CONFIG", "GET", "resolve-hostnames").StringSlice()
+		// The typed map command reads RESP2 key/value arrays and RESP3 maps.
+		configCmd := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "CONFIG", "GET", "resolve-hostnames")
+		if configErr := client.Process(ctx, configCmd); configErr != nil {
+			return fmt.Errorf("verify Sentinel resolve-hostnames before changing monitor: %w", configErr)
+		}
+		settings, configErr := configCmd.Result()
 		if configErr != nil {
 			return fmt.Errorf("verify Sentinel resolve-hostnames before changing monitor: %w", configErr)
 		}
-		if len(settings) != 2 || settings[0] != "resolve-hostnames" || settings[1] != "yes" {
+		if settings["resolve-hostnames"] != "yes" {
 			return fmt.Errorf("sentinel resolve-hostnames must be enabled before changing monitor to a hostname; existing monitor preserved")
 		}
 	}
