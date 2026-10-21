@@ -32,8 +32,33 @@ import (
 // Offsets from different replication IDs are not comparable. Empty peers
 // are safe to reattach, but missing observations are never treated as empty.
 func ValidateRecoveryLineage(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, pods []string, candidate string, counts map[string]int64) error {
+	return observeRecoveryLineage(pods, candidate, counts, func(pod string) (string, error) {
+		c := configureRedisReplicationClient(ctx, client, cr, pod)
+		defer c.Close()
+		return c.Info(ctx, "replication").Result()
+	})
+}
+
+func observeRecoveryLineage(pods []string, candidate string, counts map[string]int64, observe func(string) (string, error)) error {
 	infos := map[string]string{}
+	// Sample the candidate last: a live primary's stream can advance while
+	// peers are being queried. Sampling it first can make caught-up replicas
+	// appear ahead forever under continuous traffic. The history/offset checks
+	// below still reject genuinely newer or divergent peer data.
+	ordered := make([]string, 0, len(pods))
+	found := false
 	for _, pod := range pods {
+		if pod == candidate {
+			found = true
+		} else {
+			ordered = append(ordered, pod)
+		}
+	}
+	if !found {
+		return errors.New("recovery candidate is not in the observed topology")
+	}
+	ordered = append(ordered, candidate)
+	for _, pod := range ordered {
 		count, ok := counts[pod]
 		if !ok {
 			return fmt.Errorf("recovery key count unavailable for %s", pod)
@@ -41,9 +66,7 @@ func ValidateRecoveryLineage(ctx context.Context, client kubernetes.Interface, c
 		if count == 0 {
 			continue
 		}
-		c := configureRedisReplicationClient(ctx, client, cr, pod)
-		info, err := c.Info(ctx, "replication").Result()
-		c.Close()
+		info, err := observe(pod)
 		if err != nil {
 			return fmt.Errorf("recovery lineage unavailable for %s: %w", pod, err)
 		}
