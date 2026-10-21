@@ -54,7 +54,7 @@ func TestKeyCountNetworkDeadlineStartsAfterMetadata(t *testing.T) {
 	require.Equal(t, int64(7), counts[rr.Name+"-0"])
 }
 
-func TestGetMasterFromReplicationSkipsUnreachableAndUnreadyPods(t *testing.T) {
+func TestGetMasterFromReplicationPreservesMonitorWithUnknownRoles(t *testing.T) {
 	rr, objects := newReplicationFixture("10.0.0.10", "10.0.0.11")
 	labels := map[string]string{"app": rr.GetStatefulSetName()}
 	objects = append(objects, newLabeledRedisPod(rr.GetStatefulSetName()+"-2", labels, "10.0.0.12", corev1.PodRunning, false))
@@ -66,10 +66,49 @@ func TestGetMasterFromReplicationSkipsUnreachableAndUnreadyPods(t *testing.T) {
 	c := &checker{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
 
 	master, err := c.GetMasterFromReplication(context.Background(), rr)
-	require.NoError(t, err)
-
-	assert.Equal(t, rr.GetStatefulSetName()+"-1", master.Name)
+	require.Error(t, err)
+	assert.Empty(t, master.Name)
 	assert.NotContains(t, redisClient.connectHosts, "10.0.0.12")
+}
+
+func TestGetMasterFromReplicationAcceptsCompleteSingleMasterView(t *testing.T) {
+	rr, objects := newReplicationFixture("10.0.0.10", "10.0.0.11", "10.0.0.12")
+	c := &checker{redis: &fakeRedisClient{isMasterByHost: map[string]bool{"10.0.0.11": true}, replicasByHost: map[string]int{"10.0.0.11": 2}}, k8s: k8sfake.NewSimpleClientset(objects...)}
+	master, err := c.GetMasterFromReplication(context.Background(), rr)
+	require.NoError(t, err)
+	require.Equal(t, rr.Name+"-1", master.Name)
+}
+
+func TestGetMasterFromReplicationRejectsIncompleteObservations(t *testing.T) {
+	for _, scenario := range []string{"missing", "terminating", "unready", "unreachable"} {
+		t.Run(scenario, func(t *testing.T) {
+			rr, objects := newReplicationFixture("10.0.0.10", "10.0.0.11", "10.0.0.12")
+			redisClient := &fakeRedisClient{
+				isMasterByHost: map[string]bool{"10.0.0.10": true},
+				replicasByHost: map[string]int{"10.0.0.10": 2},
+			}
+			switch scenario {
+			case "missing":
+				objects = objects[:len(objects)-1]
+			case "terminating":
+				pod := objects[len(objects)-1].(*corev1.Pod)
+				now := metav1.Now()
+				pod.DeletionTimestamp = &now
+			case "unready":
+				pod := objects[len(objects)-1].(*corev1.Pod)
+				pod.Status.Conditions = nil
+			case "unreachable":
+				redisClient.errByHost = map[string]error{"10.0.0.12": errors.New("role probe unavailable")}
+			}
+			c := &checker{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+			master, err := c.GetMasterFromReplication(context.Background(), rr)
+			require.ErrorContains(t, err, "preserving Sentinel monitor")
+			require.Empty(t, master.Name)
+			if scenario != "unreachable" {
+				require.NotContains(t, redisClient.connectHosts, "10.0.0.12")
+			}
+		})
+	}
 }
 
 func TestGetMasterFromReplicationRejectsCompetingMasters(t *testing.T) {

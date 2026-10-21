@@ -79,8 +79,13 @@ func (c *checker) GetMasterFromReplication(ctx context.Context, rr *rr.RedisRepl
 	}
 
 	var masterPods []corev1.Pod
+	var unknownRoles []error
+	if sts.Spec.Replicas == nil || len(pods.Items) < int(*sts.Spec.Replicas) {
+		return corev1.Pod{}, errors.New("incomplete Redis pod inventory; preserving Sentinel monitor")
+	}
 	for _, pod := range pods.Items {
-		if !k8sutils.IsRedisPodProbeable(&pod) {
+		if !k8sutils.IsRedisPodProbeable(&pod) || pod.DeletionTimestamp != nil {
+			unknownRoles = append(unknownRoles, fmt.Errorf("redis role unavailable for pod %s", pod.Name))
 			continue
 		}
 		connInfo := createConnectionInfo(ctx, pod, password, rr.Spec.TLS, c.k8s, rr.Namespace, "6379")
@@ -89,12 +94,18 @@ func (c *checker) GetMasterFromReplication(ctx context.Context, rr *rr.RedisRepl
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return corev1.Pod{}, ctxErr
 			}
-			log.FromContext(ctx).Error(err, "failed to check redis role, skipping pod", "pod", pod.Name)
+			unknownRoles = append(unknownRoles, fmt.Errorf("inspect Redis role for pod %s: %w", pod.Name, err))
 			continue
 		}
 		if isMaster {
 			masterPods = append(masterPods, pod)
 		}
+	}
+	// Unreachable or terminating nodes may include the newly elected master.
+	// Existing Sentinel failover remains autonomous; do not replace its monitor
+	// using a partial Redis view. The replication controller repairs topology.
+	if len(unknownRoles) != 0 {
+		return corev1.Pod{}, fmt.Errorf("incomplete Redis role observation; preserving Sentinel monitor: %w", errors.Join(unknownRoles...))
 	}
 
 	// Replica links can lag behind a Sentinel promotion. Picking the first
