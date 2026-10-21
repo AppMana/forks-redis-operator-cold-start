@@ -197,6 +197,16 @@ var _ = Describe("Redis Cluster Controller", func() {
 			})
 
 			By("marking the leader and follower StatefulSets as ready")
+			DeferCleanup(func() {
+				if !CurrentSpecReport().Failed() {
+					return
+				}
+				for _, role := range []string{"leader", "follower"} {
+					sts := &appsv1.StatefulSet{}
+					err := k8sClient.Get(context.Background(), types.NamespacedName{Name: degradedName + "-" + role, Namespace: ns}, sts)
+					fmt.Fprintf(GinkgoWriter, "readiness diagnostic role=%s getError=%v generation=%d status=%+v\n", role, err, sts.Generation, sts.Status)
+				}
+			})
 			setStatefulSetReadyReplicas(degradedName+"-leader", 3)
 			setStatefulSetReadyReplicas(degradedName+"-follower", 3)
 
