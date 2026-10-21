@@ -146,17 +146,29 @@ data:
     	}
     	defer rdb.Close()
     
-    	// Count existing keys
+    	return checkData(ctx, rdb)
+    }
+    
+    type dataReader interface {
+    	Get(context.Context, string) *redis.StringCmd
+    }
+    
+    func checkData(ctx context.Context, rdb dataReader) error {
+    	// A surviving key with a changed value is data loss too.
     	actualCount := 0
     	for i := range totalKey {
     		key := fmt.Sprintf("key-%d", i)
-    		exists, err := rdb.Exists(ctx, key).Result()
+    		value, err := rdb.Get(ctx, key).Result()
+    		if err == redis.Nil {
+    			continue
+    		}
     		if err != nil {
     			return fmt.Errorf("error checking key %s: %w", key, err)
     		}
-    		if exists == 1 {
-    			actualCount++
+    		if value != fmt.Sprintf("value-%d", i) {
+    			return fmt.Errorf("data value mismatch for key %s", key)
     		}
+    		actualCount++
     	}
     
     	if actualCount != totalKey {

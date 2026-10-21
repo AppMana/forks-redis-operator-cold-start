@@ -60,6 +60,9 @@ jobs:
           export KUBEBUILDER_ASSETS
           unset USE_EXISTING_CLUSTER
           go test ./... -coverprofile=coverage.txt -covermode=atomic
+      - name: Test data integrity assertion helper
+        working-directory: tests/data-assert
+        run: go test -race ./... -count=1
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
