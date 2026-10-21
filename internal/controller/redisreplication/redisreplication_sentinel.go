@@ -11,14 +11,44 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/statefulset"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+func (r *Reconciler) validateSentinelConfigStorage(ctx context.Context, rr *rrvb2.RedisReplication) error {
+	if !rr.EnableSentinel() {
+		return nil
+	}
+	persistent := rr.Spec.Sentinel.ConfigVolumeClaimTemplate != nil
+	if persistent && !features.Enabled(features.GenerateConfigInInitContainer) {
+		return fmt.Errorf("embedded Sentinel config persistence requires GenerateConfigInInitContainer")
+	}
+	var current appsv1.StatefulSet
+	if err := r.Get(ctx, client.ObjectKey{Namespace: rr.Namespace, Name: rr.SentinelStatefulSet()}, &current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	hasConfigClaim := false
+	for _, claim := range current.Spec.VolumeClaimTemplates {
+		if claim.Name == common.VolumeNameConfig {
+			hasConfigClaim = true
+		}
+	}
+	if persistent != hasConfigClaim {
+		return fmt.Errorf("embedded Sentinel config storage cannot be changed in place; preserve configuration and perform an explicit orphan/adopt migration before rolling Redis")
+	}
+	return nil
+}
 
 func newSentinelService(rr *rrvb2.RedisReplication) corev1.Service {
 	labels := common.GetRedisLabels(
@@ -56,13 +86,20 @@ func newSentinelStatefulSet(rr *rrvb2.RedisReplication, svcName string) appsv1.S
 		"sentinel",
 		rr.GetLabels(),
 	)
-	return statefulset.New(statefulset.Params{
+	sts := statefulset.New(statefulset.Params{
 		Name:            rr.SentinelStatefulSet(),
 		Namespace:       rr.Namespace,
 		Replicas:        rr.Spec.Sentinel.Size,
 		ServiceName:     svcName,
 		PodTemplateSpec: buildSentinelPodTemplate(rr, labels),
 	})
+	if claim := rr.Spec.Sentinel.ConfigVolumeClaimTemplate; claim != nil {
+		copy := claim.DeepCopy()
+		copy.Name = common.VolumeNameConfig
+		copy.Namespace = ""
+		sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{*copy}
+	}
+	return sts
 }
 
 func buildSentinelPodTemplate(rr *rrvb2.RedisReplication, labels map[string]string) corev1.PodTemplateSpec {
@@ -73,6 +110,22 @@ func buildSentinelPodTemplate(rr *rrvb2.RedisReplication, labels map[string]stri
 	}
 
 	sentinel := rr.Spec.Sentinel
+	if sentinel.ConfigVolumeClaimTemplate != nil {
+		// Reuse the same bootstrap implementation as external RedisSentinel.
+		// It retains election state and atomically rewrites credentials/tuning.
+		mounts := []corev1.VolumeMount{{Name: common.VolumeNameConfig, MountPath: "/etc/redis"}}
+		spec.Containers[0].Command = []string{"redis-sentinel"}
+		spec.Containers[0].Args = []string{"/etc/redis/sentinel.conf"}
+		spec.Containers[0].VolumeMounts = mounts
+		spec.InitContainers = []corev1.Container{{
+			Name: "init-config", Image: envs.GetInitContainerImage(), ImagePullPolicy: corev1.PullIfNotPresent,
+			Command: []string{"/operator", "agent"}, Args: []string{"bootstrap", "--sentinel"},
+			Env: buildSentinelEnv(rr), VolumeMounts: mounts, SecurityContext: sentinel.SecurityContext,
+		}}
+		if sentinel.Resources != nil {
+			spec.InitContainers[0].Resources = *sentinel.Resources
+		}
+	}
 	if sentinel.Affinity != nil {
 		spec.Affinity = sentinel.Affinity
 	}
@@ -137,6 +190,18 @@ func buildSentinelEnv(rr *rrvb2.RedisReplication) []corev1.EnvVar {
 		{Name: "QUORUM", Value: fmt.Sprintf("%d", rr.Spec.Sentinel.Size/2+1)},
 		{Name: "RESOLVE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.ResolveHostnames)},
 		{Name: "ANNOUNCE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.AnnounceHostnames)},
+	}
+	if rr.Spec.Sentinel.ConfigVolumeClaimTemplate != nil {
+		envs = append(envs, corev1.EnvVar{Name: "SENTINEL_PERSISTENCE_ENABLED", Value: "true"})
+		for _, setting := range []corev1.EnvVar{
+			{Name: "DOWN_AFTER_MILLISECONDS", Value: rr.Spec.Sentinel.DownAfterMilliseconds},
+			{Name: "PARALLEL_SYNCS", Value: rr.Spec.Sentinel.ParallelSyncs},
+			{Name: "FAILOVER_TIMEOUT", Value: rr.Spec.Sentinel.FailoverTimeout},
+		} {
+			if setting.Value != "" {
+				envs = append(envs, setting)
+			}
+		}
 	}
 	if secret := rr.Spec.KubernetesConfig.ExistingPasswordSecret; secret != nil {
 		envs = append(envs, secretEnvVar("MASTER_PASSWORD", secret))

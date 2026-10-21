@@ -550,6 +550,7 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
+| `configVolumeClaimTemplate` _[PersistentVolumeClaim](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#persistentvolumeclaim-v1-core)_ | ConfigVolumeClaimTemplate preserves embedded Sentinel identity, monitor<br />and election epochs across pod replacement. Requires<br />GenerateConfigInInitContainer. Existing StatefulSets require an explicit<br />configuration-copy and orphan/adopt migration; claims are never replaced<br />automatically. Use hostname mode to survive Redis pod IP changes. |  |  |
 | `image` _string_ |  |  |  |
 | `imagePullPolicy` _[PullPolicy](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#pullpolicy-v1-core)_ |  |  |  |
 | `resources` _[ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#resourcerequirements-v1-core)_ |  |  |  |

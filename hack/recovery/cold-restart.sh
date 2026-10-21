@@ -11,16 +11,26 @@ export CANARY_NAMESPACE="${CANARY_NAMESPACE:?explicit canary namespace required}
 [[ "$CANARY_NAMESPACE" == redis-upgrade-canary* ]] || exit 2
 dir="$(cd "$(dirname "$0")" && pwd)"
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$CANARY_NAMESPACE")
-cli() { "${k[@]}" exec "$1" -c upgrade-sentinel -- redis-cli --raw -p 26379 "${@:2}"; }
+sentinel_prefix=upgrade-sentinel
+sentinel_container=upgrade-sentinel
+if [[ "${CANARY_EMBEDDED_SENTINEL:-false}" == true ]]; then
+  sentinel_prefix=upgrade-s
+  sentinel_container=sentinel
+fi
+cli() { "${k[@]}" exec "$1" -c "$sentinel_container" -- redis-cli --raw -p 26379 "${@:2}"; }
 bash "$dir/check.sh" "$config" "$expected"
-[[ "$("${k[@]}" get redissentinel upgrade -o json | jq '.spec.configVolumeClaimTemplate != null')" == true ]]
-pods=(upgrade-0 upgrade-1 upgrade-2 upgrade-sentinel-0 upgrade-sentinel-1 upgrade-sentinel-2)
+if [[ "${CANARY_EMBEDDED_SENTINEL:-false}" == true ]]; then
+  [[ "$("${k[@]}" get redisreplication upgrade -o json | jq '.spec.sentinel.configVolumeClaimTemplate != null')" == true ]]
+else
+  [[ "$("${k[@]}" get redissentinel upgrade -o json | jq '.spec.configVolumeClaimTemplate != null')" == true ]]
+fi
+pods=(upgrade-0 upgrade-1 upgrade-2 "$sentinel_prefix-0" "$sentinel_prefix-1" "$sentinel_prefix-2")
 uids=()
 identities=()
 for pod in "${pods[@]}"; do
   uids+=("$("${k[@]}" get pod "$pod" -o jsonpath='{.metadata.uid}')")
 done
-for ordinal in 0 1 2; do identities+=("$(cli "upgrade-sentinel-$ordinal" SENTINEL MYID)"); done
+for ordinal in 0 1 2; do identities+=("$(cli "$sentinel_prefix-$ordinal" SENTINEL MYID)"); done
 claims="$("${k[@]}" get pvc -o json | jq -Sc '[.items[]|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)')"
 # Exact pod names only; no PVC or namespace deletion.
 "${k[@]}" delete pod "${pods[@]}" --wait=false
@@ -41,6 +51,6 @@ done
 [[ "$passed" == true ]] || { echo 'FAIL: cold restart did not converge' >&2; exit 1; }
 [[ "$claims" == "$("${k[@]}" get pvc -o json | jq -Sc '[.items[]|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)')" ]]
 for ordinal in 0 1 2; do
-  [[ "${identities[$ordinal]}" == "$(cli "upgrade-sentinel-$ordinal" SENTINEL MYID)" ]]
+  [[ "${identities[$ordinal]}" == "$(cli "$sentinel_prefix-$ordinal" SENTINEL MYID)" ]]
 done
 echo 'PASS: full cold restart preserved original data, Sentinel identities and all PVC UIDs'
