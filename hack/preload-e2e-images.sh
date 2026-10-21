@@ -16,6 +16,7 @@ IMAGES=(
   redis:alpine
   busybox:latest
   busybox:1.36
+  docker.io/library/golang:1.23.4
 )
 
 # Docker Hub rate-limits anonymous pulls from shared runner IPs, so a pull can
