@@ -71,6 +71,8 @@ jobs:
         run: bash hack/recovery/check-sentinel-quorum.sh
       - name: Test retained Sentinel configuration against Redis
         run: bash hack/recovery/check-sentinel-persistence.sh
+      - name: Test Sentinel replica readiness verifier
+        run: python3 -m unittest discover -s hack/recovery -p test_sentinel_replica_readiness.py
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:

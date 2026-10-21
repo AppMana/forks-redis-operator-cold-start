@@ -19,6 +19,7 @@ ips="$("${k[@]}" get endpointslices -l kubernetes.io/service-name=upgrade-master
   jq -r '[.items[].endpoints[]? | select(.conditions.ready != false) | .addresses[]] | unique | .[]')"
 [[ "$(printf '%s\n' "$ips" | sed '/^$/d' | wc -l)" -eq 1 ]]
 primary=""
+observations='[]'
 for ordinal in 0 1 2; do
   pod="upgrade-$ordinal"
   info="$(cli "$pod" INFO replication | tr -d '\r')"
@@ -32,9 +33,15 @@ for ordinal in 0 1 2; do
   fi
   [[ "$(cli "$pod" GET appmana:upgrade:sentinel-regression)" == "$expected" ]]
   [[ "$(cli "$pod" -n 1 GET appmana:upgrade:secondary-database)" == "$expected" ]]
+  runid="$(cli "$pod" INFO server | tr -d '\r' | awk -F: '$1=="run_id" {print $2}')"
+  [[ "$runid" =~ ^[0-9a-f]{40}$ ]]
+  pod_ip="$("${k[@]}" get pod "$pod" -o jsonpath='{.status.podIP}')"
+  observations="$(jq -c --arg name "$pod" --arg ip "$pod_ip" --arg host "$pod.upgrade-headless.$namespace.svc.cluster.local" --arg runid "$runid" '. + [{name:$name, addresses:[$ip,$host], runid:$runid}]' <<<"$observations")"
 done
 [[ -n "$primary" ]]
 [[ "$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')" == "$primary" ]]
+expected_replicas="$(jq -c --arg primary "$primary" '[.[] | select(.name != $primary)]' <<<"$observations")"
+primary_addresses="$(jq -c --arg primary "$primary" '.[] | select(.name == $primary) | .addresses' <<<"$observations")"
 sentinel_pods=("$sentinel_prefix-0" "$sentinel_prefix-1" "$sentinel_prefix-2")
 expected_sentinels="${CANARY_SENTINEL_COUNT:-3}"
 [[ "$expected_sentinels" =~ ^[1-9][0-9]*$ ]]
@@ -54,8 +61,9 @@ for pod in "${sentinel_pods[@]}"; do
   master="$(cli "$pod" -p 26379 SENTINEL GET-MASTER-ADDR-BY-NAME "$master_group" | head -1)"
   [[ "$master" == "$ips" || "$master" == "$primary.upgrade-headless.$namespace.svc.cluster.local" ]]
   metadata="$(cli "$pod" -p 26379 SENTINEL MASTER "$master_group" | tr -d '\r')"
-  [[ "$(printf '%s\n' "$metadata" | awk '$0=="num-slaves" {getline; print}')" == 2 ]]
+  replicas="$(cli "$pod" --json -p 26379 SENTINEL REPLICAS "$master_group")"
+  python3 "$(dirname "$0")/sentinel_replica_readiness.py" "$expected_replicas" "$primary_addresses" <<<"$replicas"
   [[ "$(printf '%s\n' "$metadata" | awk '$0=="num-other-sentinels" {getline; print}')" == "$((expected_sentinels-1))" ]]
 done
 [[ "$(printf '%s\n' "${sentinel_ids[@]}" | sort -u | wc -l)" -eq "$expected_sentinels" ]]
-printf 'PASS: %s, one writable endpoint, two linked replicas, %s agreeing Sentinels, key preserved\n' "$primary" "$expected_sentinels"
+printf 'PASS: %s, one writable endpoint, two linked and Sentinel-eligible current replicas, %s agreeing Sentinels, key preserved\n' "$primary" "$expected_sentinels"
