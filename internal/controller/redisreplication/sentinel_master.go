@@ -171,6 +171,16 @@ func majorityAddress(answers []string, size int32) (string, bool) {
 	}
 	votes := map[string]int32{}
 	for _, addr := range answers {
+		// Init-generated Sentinel configs monitor an unspecified address until
+		// Redis bootstraps. This is not an election for a missing/dead primary:
+		// treating it as authoritative deadlocks first installation. Keep the
+		// configured majority denominator, and retain every real address.
+		host, _, err := net.SplitHostPort(addr)
+		if err == nil {
+			if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+				continue
+			}
+		}
 		votes[addr]++
 		if votes[addr] > size/2 {
 			return addr, true
