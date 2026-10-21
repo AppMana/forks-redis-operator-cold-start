@@ -409,30 +409,25 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		k8sutils.CheckIfEmptyMasters(ctx, r.K8sClient, instance)
 	}
 
-	// Mark the cluster status as ready if all the leader and follower nodes are ready
-	// and the cluster is not already in Ready state (to avoid unnecessary status updates)
-	if instance.Status.ReadyLeaderReplicas == leaderReplicas && instance.Status.ReadyFollowerReplicas == followerReplicas && instance.Status.State != rcvb2.RedisClusterReady {
-		monitoring.RedisClusterHealthy.WithLabelValues(instance.Namespace, instance.Name).Set(0)
-		if k8sutils.RedisClusterStatusHealth(ctx, r.K8sClient, instance) {
-			monitoring.RedisClusterHealthy.WithLabelValues(instance.Namespace, instance.Name).Set(1)
-			// Apply dynamic config to all Redis instances in the cluster
-			if err = k8sutils.SetRedisClusterDynamicConfig(ctx, r.K8sClient, instance); err != nil {
-				logger.Error(err, "Failed to set dynamic config")
-				return intctrlutil.RequeueE(ctx, err, "failed to set dynamic config")
-			}
-
-			requeue, err := r.updateStatus(ctx, instance, rcvb2.RedisClusterStatus{
-				State:                 rcvb2.RedisClusterReady,
-				Reason:                rcvb2.ReadyClusterReason,
-				ReadyLeaderReplicas:   leaderReplicas,
-				ReadyFollowerReplicas: followerReplicas,
-			})
-			if err != nil {
-				return intctrlutil.RequeueE(ctx, err, "")
-			}
-			if requeue {
-				return intctrlutil.Requeue()
-			}
+	ready, err := configureHealthyCluster(instance,
+		func() bool { return k8sutils.RedisClusterStatusHealth(ctx, r.K8sClient, instance) },
+		func() error { return k8sutils.SetRedisClusterDynamicConfig(ctx, r.K8sClient, instance) })
+	if err != nil {
+		return intctrlutil.RequeueE(ctx, err, "failed to set dynamic config")
+	}
+	// Avoid redundant status writes, not configuration convergence.
+	if ready && instance.Status.State != rcvb2.RedisClusterReady {
+		requeue, err := r.updateStatus(ctx, instance, rcvb2.RedisClusterStatus{
+			State:                 rcvb2.RedisClusterReady,
+			Reason:                rcvb2.ReadyClusterReason,
+			ReadyLeaderReplicas:   leaderReplicas,
+			ReadyFollowerReplicas: followerReplicas,
+		})
+		if err != nil {
+			return intctrlutil.RequeueE(ctx, err, "")
+		}
+		if requeue {
+			return intctrlutil.Requeue()
 		}
 	}
 
@@ -444,6 +439,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	return intctrlutil.RequeueAfter(ctx, time.Second*10, "")
+}
+
+func configureHealthyCluster(instance *rcvb2.RedisCluster, healthy func() bool, apply func() error) (bool, error) {
+	if instance.Status.ReadyLeaderReplicas != instance.Spec.GetReplicaCounts("leader") ||
+		instance.Status.ReadyFollowerReplicas != instance.Spec.GetReplicaCounts("follower") {
+		return false, nil
+	}
+	monitoring.RedisClusterHealthy.WithLabelValues(instance.Namespace, instance.Name).Set(0)
+	if !healthy() {
+		return false, nil
+	}
+	monitoring.RedisClusterHealthy.WithLabelValues(instance.Namespace, instance.Name).Set(1)
+	if err := apply(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // shouldScaleUpExistingCluster reports whether the missing leaders should be

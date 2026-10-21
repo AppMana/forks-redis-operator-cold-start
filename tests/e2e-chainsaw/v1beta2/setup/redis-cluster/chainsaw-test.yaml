@@ -130,6 +130,47 @@ spec:
             check:
               (contains($stdout, 'All Redis leaders and followers have correct')): true
 
+    - name: Update dynamic configuration on an already Ready cluster
+      try:
+        - script:
+            timeout: 120s
+            content: |
+              #!/bin/bash
+              set -euo pipefail
+              cluster=redis-cluster-v1beta2
+              [ "$(kubectl -n "${NAMESPACE}" get rediscluster "$cluster" -o jsonpath='{.status.state}')" = Ready ]
+              pod_uids() {
+                for role in leader follower; do
+                  for ordinal in 0 1 2; do
+                    kubectl -n "${NAMESPACE}" get pod "$cluster-$role-$ordinal" -o jsonpath='{.metadata.uid}{"\n"}'
+                  done
+                done
+              }
+              before="$(pod_uids)"
+              for desired in 6000 5000; do
+                kubectl -n "${NAMESPACE}" patch rediscluster "$cluster" --type=merge \
+                  -p "{\"spec\":{\"redisConfig\":{\"dynamicConfig\":[\"slowlog-log-slower-than $desired\"]}}}"
+                deadline=$((SECONDS+50))
+                converged=false
+                while (( SECONDS < deadline )); do
+                  converged=true
+                  for role in leader follower; do
+                    for ordinal in 0 1 2; do
+                      value="$(kubectl -n "${NAMESPACE}" exec "$cluster-$role-$ordinal" -c "$cluster-$role" -- \
+                        redis-cli --raw --tls --cacert /tls/ca.crt CONFIG GET slowlog-log-slower-than | tail -n1)"
+                      [ "$value" = "$desired" ] || converged=false
+                    done
+                  done
+                  [ "$converged" = true ] && break
+                  sleep 2
+                done
+                [ "$converged" = true ]
+                [ "$(pod_uids)" = "$before" ]
+              done
+              echo 'PASS: Ready cluster configuration updated and restored without pod replacement'
+            check:
+              (contains($stdout, 'Ready cluster configuration updated')): true
+
     - name: Check maxmemory
       try:
         - script:
