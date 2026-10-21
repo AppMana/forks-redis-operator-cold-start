@@ -442,6 +442,16 @@ func (r *Reconciler) configureSentinelPod(
 	}
 
 	sentinelService := redisClient.Connect(sentinelConnInfo)
+	resolve := resolveHostnamesOrDefault(inst.Spec.Sentinel.ResolveHostnames)
+	announce := resolveHostnamesOrDefault(inst.Spec.Sentinel.AnnounceHostnames)
+	// Legacy entrypoints may ignore the environment. Enable resolution before
+	// MONITOR can replace an IP with a hostname; never erase the old monitor
+	// first and discover only afterward that resolution is disabled.
+	if resolve == "yes" {
+		if err := sentinelService.SentinelConfigSet(ctx, "resolve-hostnames", resolve); err != nil {
+			return err
+		}
+	}
 
 	masterConnInfo := &redis.ConnectionInfo{
 		Host:     masterAddr,
@@ -457,6 +467,16 @@ func (r *Reconciler) configureSentinelPod(
 		fmt.Sprintf("%d", quorum),
 	); err != nil {
 		return err
+	}
+	if err := sentinelService.SentinelConfigSet(ctx, "announce-hostnames", announce); err != nil {
+		return err
+	}
+	// When disabling hostname mode, first move the monitor back to an IP and
+	// stop hostname announcements, then disable resolution.
+	if resolve == "no" {
+		if err := sentinelService.SentinelConfigSet(ctx, "resolve-hostnames", resolve); err != nil {
+			return err
+		}
 	}
 
 	for k, v := range map[string]string{

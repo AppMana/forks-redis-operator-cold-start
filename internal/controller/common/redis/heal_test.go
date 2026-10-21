@@ -740,6 +740,8 @@ func (f *fakeRedisService) SentinelMonitor(context.Context, *redisservice.Connec
 	return nil
 }
 
+func (f *fakeRedisService) SentinelConfigSet(context.Context, string, string) error { return nil }
+
 func (f *fakeRedisService) SentinelSet(context.Context, string, string, string) error {
 	if err := f.client.errByHost[f.host]; err != nil {
 		return err

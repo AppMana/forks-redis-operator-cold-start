@@ -1164,6 +1164,10 @@ func (f *fakeSentinelInfoService) SentinelMonitor(context.Context, *redis.Connec
 	return nil
 }
 
+func (f *fakeSentinelInfoService) SentinelConfigSet(context.Context, string, string) error {
+	return nil
+}
+
 func (f *fakeSentinelInfoService) SentinelSet(context.Context, string, string, string) error {
 	return nil
 }

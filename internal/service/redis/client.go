@@ -58,6 +58,7 @@ type Service interface {
 	GetKeyCount(ctx context.Context) (int64, error)
 	SentinelMonitor(ctx context.Context, master *ConnectionInfo, masterGroupName, quorum string) error
 	SentinelSet(ctx context.Context, masterGroupName, key, value string) error
+	SentinelConfigSet(ctx context.Context, key, value string) error
 	SentinelReset(ctx context.Context, masterGroupName string) error
 	GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, error)
 	// SentinelGetMasterAddrByName returns the address this Sentinel currently
@@ -200,6 +201,26 @@ func (c *service) SentinelGetMasterAddrByName(ctx context.Context, masterGroupNa
 		return "", "", false, fmt.Errorf("unexpected SENTINEL GET-MASTER-ADDR-BY-NAME reply %q", addr)
 	}
 	return addr[0], addr[1], true, nil
+}
+
+func (c *service) SentinelConfigSet(ctx context.Context, key, value string) error {
+	client := c.createClient()
+	defer client.Close()
+	current := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "CONFIG", "GET", key)
+	if err := client.Process(ctx, current); err != nil {
+		return err
+	}
+	settings, err := current.Result()
+	if err != nil {
+		return err
+	}
+	if _, ok := settings[key]; !ok {
+		return fmt.Errorf("Sentinel configuration %s was not returned", key)
+	}
+	if settings[key] == value {
+		return nil
+	}
+	return client.Do(ctx, "SENTINEL", "CONFIG", "SET", key, value).Err()
 }
 
 func (c *service) SentinelSet(ctx context.Context, masterGroupName, key, value string) error {

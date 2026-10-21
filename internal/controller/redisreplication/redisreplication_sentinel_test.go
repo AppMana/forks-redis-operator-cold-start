@@ -2,6 +2,7 @@ package redisreplication
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
@@ -354,6 +355,8 @@ func (f *fakeSentinelRedisService) SentinelGetMasterAddrByName(context.Context, 
 }
 
 type fakeSentinelRedisService struct {
+	hostnameError   error
+	hostnameCalls   []string
 	slaves          int
 	sentinels       int
 	monitoredMaster *redis.ConnectionInfo
@@ -370,12 +373,50 @@ func (f *fakeSentinelRedisService) GetAttachedReplicaCount(context.Context) (int
 }
 
 func (f *fakeSentinelRedisService) SentinelMonitor(_ context.Context, master *redis.ConnectionInfo, _, _ string) error {
+	f.hostnameCalls = append(f.hostnameCalls, "monitor")
 	f.monitoredMaster = master
 	return nil
 }
 
 func (f *fakeSentinelRedisService) SentinelSet(context.Context, string, string, string) error {
 	return nil
+}
+
+func (f *fakeSentinelRedisService) SentinelConfigSet(_ context.Context, key, value string) error {
+	f.hostnameCalls = append(f.hostnameCalls, key+"="+value)
+	return f.hostnameError
+}
+
+func TestEmbeddedSentinelPreservesMonitorOnHostnameConfigFailure(t *testing.T) {
+	inst := &rrvb2.RedisReplication{Spec: rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3)), Sentinel: &rrvb2.Sentinel{Size: 3}}}
+	inst.Spec.Sentinel.ResolveHostnames = "yes"
+	failure := errors.New("Sentinel configuration unavailable")
+	svc := &fakeSentinelRedisService{hostnameError: failure}
+	err := (&Reconciler{}).configureSentinelPod(context.Background(), &fakeSentinelRedisClient{svc: svc}, inst, corev1.Pod{}, "redis.example", "")
+	require.ErrorIs(t, err, failure)
+	require.Equal(t, []string{"resolve-hostnames=yes"}, svc.hostnameCalls)
+	require.Nil(t, svc.monitoredMaster)
+}
+
+func TestEmbeddedSentinelReconcilesHostnameSettingsInSafeOrder(t *testing.T) {
+	for _, mode := range []string{"yes", "no"} {
+		t.Run(mode, func(t *testing.T) {
+			inst := &rrvb2.RedisReplication{Spec: rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3)), Sentinel: &rrvb2.Sentinel{
+				Size: 3,
+			}}}
+			inst.Spec.Sentinel.ResolveHostnames = mode
+			inst.Spec.Sentinel.AnnounceHostnames = mode
+			svc := &fakeSentinelRedisService{}
+			r := &Reconciler{}
+			err := r.configureSentinelPod(context.Background(), &fakeSentinelRedisClient{svc: svc}, inst, corev1.Pod{}, "10.0.0.1", "")
+			require.NoError(t, err)
+			if mode == "yes" {
+				require.Equal(t, []string{"resolve-hostnames=yes", "monitor", "announce-hostnames=yes"}, svc.hostnameCalls)
+			} else {
+				require.Equal(t, []string{"monitor", "announce-hostnames=no", "resolve-hostnames=no"}, svc.hostnameCalls)
+			}
+		})
+	}
 }
 
 func (f *fakeSentinelRedisService) SentinelReset(context.Context, string) error { return nil }
