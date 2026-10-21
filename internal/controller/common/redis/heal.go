@@ -476,6 +476,19 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 				return service.SentinelMonitorHealthy(ctx, rs.Spec.RedisSentinelConfig.MasterGroupName)
 			},
 			Reconcile: func(ctx context.Context) error {
+				// OnDelete and legacy entrypoints can leave runtime flags behind
+				// the desired pod template. Enable hostname handling before MONITOR;
+				// otherwise its safety preflight correctly refuses the migration.
+				for _, setting := range []struct{ key, value string }{
+					{"resolve-hostnames", rs.Spec.RedisSentinelConfig.ResolveHostnames},
+					{"announce-hostnames", rs.Spec.RedisSentinelConfig.AnnounceHostnames},
+				} {
+					if setting.value == "yes" {
+						if err := service.SentinelConfigSet(ctx, setting.key, setting.value); err != nil {
+							return fmt.Errorf("enable Sentinel %s before monitor migration: %w", setting.key, err)
+						}
+					}
+				}
 				return service.SentinelMonitor(ctx, masterConnInfo, rs.Spec.RedisSentinelConfig.MasterGroupName, rs.Spec.RedisSentinelConfig.Quorum)
 			},
 		})

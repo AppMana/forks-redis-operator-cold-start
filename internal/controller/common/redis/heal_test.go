@@ -626,6 +626,25 @@ func TestSentinelResetSkipsSentinelsWithoutMasterGroup(t *testing.T) {
 	assert.Equal(t, []string{"10.0.1.12"}, redisClient.resetHosts)
 }
 
+func TestExternalSentinelEnablesHostnameSettingsBeforeMonitor(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "yes"
+	rs.Spec.RedisSentinelConfig.AnnounceHostnames = "yes"
+	remote := &fakeRedisClient{}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.NoError(t, h.SentinelMonitor(context.Background(), rs, "redis.test.svc.cluster.local"))
+	require.Equal(t, []string{"resolve-hostnames=yes", "announce-hostnames=yes", "monitor"}, remote.monitorConfigOrder)
+}
+
+func TestExternalSentinelPreservesMonitorOnHostnameConfigFailure(t *testing.T) {
+	rs, _, objects := newSentinelFixture("10.0.1.10")
+	rs.Spec.RedisSentinelConfig.ResolveHostnames = "yes"
+	remote := &fakeRedisClient{configErr: errors.New("configuration rejected")}
+	h := &healer{redis: remote, k8s: k8sfake.NewSimpleClientset(objects...)}
+	require.ErrorContains(t, h.SentinelMonitor(context.Background(), rs, "redis.test.svc.cluster.local"), "configuration rejected")
+	require.Empty(t, remote.monitorHosts)
+}
+
 func TestSentinelMonitorPreservesPeersWhenInventoryIsUnready(t *testing.T) {
 	rs, _, objects := newSentinelFixture("10.0.1.10", "10.0.1.11")
 	labels := map[string]string{"app": rs.GetStatefulSetName()}
@@ -709,6 +728,8 @@ func TestIsConnectivityError(t *testing.T) {
 }
 
 type fakeRedisClient struct {
+	monitorConfigOrder   []string
+	configErr            error
 	sentinelHealthByHost map[string]bool
 	connectHosts         []string
 	isMasterByHost       map[string]bool
@@ -766,6 +787,7 @@ func (f *fakeRedisService) GetKeyCount(context.Context) (int64, error) {
 }
 
 func (f *fakeRedisService) SentinelMonitor(context.Context, *redisservice.ConnectionInfo, string, string) error {
+	f.client.monitorConfigOrder = append(f.client.monitorConfigOrder, "monitor")
 	if err := f.client.errByHost[f.host]; err != nil {
 		return err
 	}
@@ -776,7 +798,10 @@ func (f *fakeRedisService) SentinelMonitor(context.Context, *redisservice.Connec
 	return nil
 }
 
-func (f *fakeRedisService) SentinelConfigSet(context.Context, string, string) error { return nil }
+func (f *fakeRedisService) SentinelConfigSet(_ context.Context, key, value string) error {
+	f.client.monitorConfigOrder = append(f.client.monitorConfigOrder, key+"="+value)
+	return f.client.configErr
+}
 
 func (f *fakeRedisService) SentinelSet(context.Context, string, string, string) error {
 	if err := f.client.errByHost[f.host]; err != nil {
