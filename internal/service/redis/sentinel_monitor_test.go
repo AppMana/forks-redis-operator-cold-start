@@ -48,3 +48,39 @@ func TestSentinelMonitorDoesNotTouchAlreadyCorrectHostname(t *testing.T) {
 	require.NoError(t, svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "redis-0.example", Port: "6379"}, "upgrade", "2"))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+type sentinelTestError string
+
+func (e sentinelTestError) Error() string { return string(e) }
+func (sentinelTestError) RedisError()     {}
+
+func TestSentinelMonitorDoesNotMutateUnknownState(t *testing.T) {
+	for _, lookupErr := range []error{context.DeadlineExceeded, sentinelTestError("NOAUTH Authentication required"), errors.New("connection reset")} {
+		t.Run(lookupErr.Error(), func(t *testing.T) {
+			db, mock := redismock.NewClientMock()
+			svc := &service{redisClient: db}
+			mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetErr(lookupErr)
+			err := svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, "upgrade", "2")
+			require.ErrorIs(t, err, lookupErr)
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestSentinelMonitorCreatesOnlyConfirmedMissingGroup(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	svc := &service{redisClient: db}
+	mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetErr(sentinelTestError("ERR No such master with that name"))
+	mock.ExpectDo("SENTINEL", "MONITOR", "upgrade", "10.0.0.2", "6379", "2").SetVal(true)
+	require.NoError(t, svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, "upgrade", "2"))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSentinelMonitorPreservesMalformedExistingGroup(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	svc := &service{redisClient: db}
+	mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1"})
+	err := svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, "upgrade", "2")
+	require.ErrorContains(t, err, "incomplete Sentinel master metadata")
+	require.NoError(t, mock.ExpectationsWereMet())
+}

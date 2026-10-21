@@ -252,13 +252,21 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 
 	masterExists := false
 	masterCheckCmd := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "MASTER", masterGroupName)
-	if err = client.Process(ctx, masterCheckCmd); err == nil {
-		if err = masterCheckCmd.Err(); err == nil {
-			masterExists = true
-			result := masterCheckCmd.Val()
-			if result["ip"] == master.Host && result["port"] == master.Port {
-				return nil
-			}
+	err = client.Process(ctx, masterCheckCmd)
+	if err != nil {
+		// Transport/authentication failures do not prove the monitor is absent.
+		// Only Sentinel's explicit missing-group response permits bootstrap.
+		if !rediscli.HasErrorPrefix(err, "No such master with that name") {
+			return fmt.Errorf("inspect Sentinel master before changing monitor: %w", err)
+		}
+	} else {
+		masterExists = true
+		result := masterCheckCmd.Val()
+		if result["ip"] == "" || result["port"] == "" {
+			return fmt.Errorf("incomplete Sentinel master metadata; existing monitor preserved")
+		}
+		if result["ip"] == master.Host && result["port"] == master.Port {
+			return nil
 		}
 	}
 
