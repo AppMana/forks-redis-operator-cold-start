@@ -309,3 +309,14 @@ jobs:
 
       - name: Run chainsaw test
         run: chainsaw test --test-dir ./tests/e2e-chainsaw/v1beta2 --config tests/_config/chainsaw-configuration.yaml
+      - name: Collect value-free cluster convergence timings
+        if: failure()
+        continue-on-error: true
+        run: |
+          kubectl logs -n redis-operator-system deployment/redis-operator-redis-operator --since=30m |
+            jq -Rc 'fromjson? |
+              select(.msg == "Slow RedisCluster reconcile" or
+                     .msg == "RedisCluster serving check completed" or
+                     .msg == "RedisCluster dynamic configuration completed") |
+              {ts,msg,clusterNamespace,clusterName,generation,durationSeconds,healthy,success}' |
+            tail -n 300

@@ -57,6 +57,7 @@ type Reconciler struct {
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	reconcileStarted := time.Now()
 	logger := log.FromContext(ctx)
 	instance := &rcvb2.RedisCluster{}
 
@@ -64,6 +65,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return intctrlutil.RequeueECheck(ctx, err, "failed to get redis cluster instance")
 	}
+	generation := instance.Generation
+	defer func() {
+		if elapsed := time.Since(reconcileStarted); elapsed >= 10*time.Second {
+			logger.Info("Slow RedisCluster reconcile", "clusterNamespace", req.Namespace, "clusterName", req.Name,
+				"generation", generation, "durationSeconds", elapsed.Seconds())
+		}
+	}()
 	if instance.GetDeletionTimestamp() != nil {
 		if err = k8sutils.HandleRedisClusterFinalizer(ctx, r.Client, instance, RedisClusterFinalizer); err != nil {
 			return intctrlutil.RequeueE(ctx, err, "failed to handle redis cluster finalizer")
@@ -422,8 +430,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	ready, err := configureHealthyCluster(instance,
-		func() bool { return k8sutils.RedisClusterStatusHealth(ctx, r.K8sClient, instance) },
-		func() error { return k8sutils.SetRedisClusterDynamicConfig(ctx, r.K8sClient, instance) })
+		func() bool {
+			started := time.Now()
+			healthy := k8sutils.RedisClusterStatusHealth(ctx, r.K8sClient, instance)
+			logger.Info("RedisCluster serving check completed", "clusterNamespace", req.Namespace, "clusterName", req.Name,
+				"generation", generation, "durationSeconds", time.Since(started).Seconds(), "healthy", healthy)
+			return healthy
+		},
+		func() error {
+			started := time.Now()
+			err := k8sutils.SetRedisClusterDynamicConfig(ctx, r.K8sClient, instance)
+			logger.Info("RedisCluster dynamic configuration completed", "clusterNamespace", req.Namespace, "clusterName", req.Name,
+				"generation", generation, "durationSeconds", time.Since(started).Seconds(), "success", err == nil)
+			return err
+		})
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "failed to set dynamic config")
 	}
