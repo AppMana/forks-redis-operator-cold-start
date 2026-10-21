@@ -27,3 +27,19 @@ func TestSentinelVotesUsePodIdentityNotAddressSpelling(t *testing.T) {
 		require.False(t, ok)
 	}
 }
+
+func TestSentinelVotesIncludeObservedSurplusMembers(t *testing.T) {
+	oldPrimary, newPrimary := "10.0.0.1:6379", "10.0.0.2:6379"
+	for _, answers := range [][]string{
+		{oldPrimary, oldPrimary, oldPrimary, newPrimary, newPrimary, newPrimary, newPrimary},
+		{newPrimary, newPrimary, newPrimary, newPrimary, oldPrimary, oldPrimary, oldPrimary},
+	} {
+		address, ok := majorityAddress(answers, 3)
+		require.True(t, ok)
+		require.Equal(t, newPrimary, address, "surplus observed voters must not permit competing majorities")
+	}
+	_, ok := majorityAddress([]string{oldPrimary, oldPrimary, newPrimary, newPrimary}, 3)
+	require.False(t, ok, "a split surplus inventory has no majority")
+	_, ok = majorityAddress([]string{oldPrimary, oldPrimary, oldPrimary}, 7)
+	require.False(t, ok, "unreachable members must remain in the denominator")
+}

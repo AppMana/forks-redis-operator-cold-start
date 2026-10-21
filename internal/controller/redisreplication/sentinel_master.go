@@ -151,9 +151,13 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			}(pod.Name)
 		}
 		wg.Wait()
-		addr, ok := majorityAddress(answers, group.size)
+		// Include surplus pods during replacement/downscale in the electorate,
+		// including unreachable or terminating members. Otherwise a configured
+		// size smaller than the live inventory can admit competing majorities.
+		electorate := max(group.size, int32(len(group.pods)))
+		addr, ok := majorityAddress(answers, electorate)
 		if !ok {
-			if sentinelsUnconfigured(answers, group.size) {
+			if sentinelsUnconfigured(answers, electorate) {
 				continue
 			}
 			logger.Info("Sentinel authority unresolved; refusing fallback election", "masterGroup", group.masterGroup)
@@ -211,6 +215,9 @@ func majorityAddress(answers []string, size int32) (string, bool) {
 	if size <= 0 {
 		return "", false
 	}
+	// Callers include nonresponding pods in size. Still account for every
+	// supplied observation if the inventory exceeded the configured size.
+	size = max(size, int32(len(answers)))
 	votes := map[string]int32{}
 	for _, addr := range answers {
 		if addr == "" {
