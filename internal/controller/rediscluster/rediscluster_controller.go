@@ -406,7 +406,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Check If there is No Empty Master Node
 	if k8sutils.CheckRedisNodeCount(ctx, r.K8sClient, instance, "") == totalReplicas {
-		k8sutils.CheckIfEmptyMasters(ctx, r.K8sClient, instance)
+		if err := k8sutils.CheckIfEmptyMasters(ctx, r.K8sClient, instance); err != nil {
+			return intctrlutil.RequeueE(ctx, err, "failed to inspect empty masters")
+		}
 	}
 
 	ready, err := configureHealthyCluster(instance,

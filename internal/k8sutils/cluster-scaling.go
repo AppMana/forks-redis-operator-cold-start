@@ -387,25 +387,56 @@ func RebalanceRedisClusterEmptyMasters(ctx context.Context, client kubernetes.In
 	executeCommand(ctx, client, cr, cmd, cr.Name+"-leader-1")
 }
 
-func CheckIfEmptyMasters(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) {
+func CheckIfEmptyMasters(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
 	totalRedisLeaderNodes := CheckRedisNodeCount(ctx, client, cr, "leader")
+	if totalRedisLeaderNodes != cr.Spec.GetReplicaCounts("leader") {
+		return fmt.Errorf("cannot inspect empty masters: observed leader count does not match desired count")
+	}
 	redisClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
 	defer redisClient.Close()
 
-	for i := 0; i < int(totalRedisLeaderNodes); i++ {
+	empty, err := observeEmptyMasters(totalRedisLeaderNodes, func(i int32) (string, string) {
 		pod := RedisDetails{
-			PodName:   cr.Name + "-leader-" + strconv.Itoa(i),
+			PodName:   cr.Name + "-leader-" + strconv.Itoa(int(i)),
 			Namespace: cr.Namespace,
 		}
 		podNodeID := getRedisNodeID(ctx, client, cr, pod)
-		podSlots := getRedisClusterSlots(ctx, redisClient, podNodeID)
-
-		if podSlots == "0" || podSlots == "" {
-			log.FromContext(ctx).V(1).Info("Found Empty Redis Leader Node", "pod", pod)
-			RebalanceRedisClusterEmptyMasters(ctx, client, cr)
-			break
+		if podNodeID == "" {
+			return "", ""
 		}
+		podSlots := getRedisClusterSlots(ctx, redisClient, podNodeID)
+		return podNodeID, podSlots
+	})
+	if err != nil {
+		return err
 	}
+	if empty {
+		RebalanceRedisClusterEmptyMasters(ctx, client, cr)
+	}
+	return nil
+}
+
+// Complete the inventory before permitting a rebalance. Empty strings from the
+// legacy observation helpers mean lookup failure, not a node with zero slots.
+func observeEmptyMasters(count int32, observe func(int32) (string, string)) (bool, error) {
+	if count <= 0 {
+		return false, fmt.Errorf("cannot inspect empty masters: no leaders observed")
+	}
+	seen := make(map[string]bool, count)
+	empty := false
+	for i := int32(0); i < count; i++ {
+		nodeID, slots := observe(i)
+		if nodeID == "" || seen[nodeID] {
+			return false, fmt.Errorf("cannot inspect empty masters: missing or duplicate node identity at ordinal %d", i)
+		}
+		seen[nodeID] = true
+		n, err := strconv.ParseUint(slots, 10, 15)
+		if err != nil || n > 16384 {
+			return false, fmt.Errorf("cannot inspect empty masters: missing or invalid slot count at ordinal %d", i)
+		}
+		empty = empty || n == 0
+	}
+	return empty, nil
 }
 
 // Rebalance Redis Cluster Would Rebalance the Redis Cluster without using the empty masters

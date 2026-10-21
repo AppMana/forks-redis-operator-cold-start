@@ -10,6 +10,38 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestObserveEmptyMastersRejectsIncompleteInventory(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		nodes     [][2]string
+		wantEmpty bool
+		wantError bool
+	}{
+		{name: "missing inventory", wantError: true},
+		{name: "unknown identity", nodes: [][2]string{{"", "0"}}, wantError: true},
+		{name: "slot lookup failed", nodes: [][2]string{{"node-a", ""}}, wantError: true},
+		{name: "later lookup failed", nodes: [][2]string{{"node-a", "0"}, {"node-b", ""}}, wantError: true},
+		{name: "negative slot count", nodes: [][2]string{{"node-a", "-1"}}, wantError: true},
+		{name: "invalid slot count", nodes: [][2]string{{"node-a", "invalid"}}, wantError: true},
+		{name: "excess slot count", nodes: [][2]string{{"node-a", "16385"}}, wantError: true},
+		{name: "duplicate identity", nodes: [][2]string{{"node-a", "0"}, {"node-a", "16384"}}, wantError: true},
+		{name: "confirmed empty node", nodes: [][2]string{{"node-a", "0"}, {"node-b", "16384"}}, wantEmpty: true},
+		{name: "all have slots", nodes: [][2]string{{"node-a", "8192"}, {"node-b", "8192"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			empty, err := observeEmptyMasters(int32(len(tt.nodes)), func(i int32) (string, string) {
+				return tt.nodes[i][0], tt.nodes[i][1]
+			})
+			assert.Equal(t, tt.wantEmpty, empty)
+			if tt.wantError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
 func Test_clusterHasEmptyMasters_WhenConnectedMasterHasNoSlots_ReturnsTrue(t *testing.T) {
 	nodes := []clusterNodesResponse{
 		// master with slots assigned
