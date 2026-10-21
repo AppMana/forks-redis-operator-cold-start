@@ -51,7 +51,10 @@ done
 sleep 12
 [[ "$("${k[@]}" get pod "$primary" -o jsonpath='{.metadata.uid}')" == "$primary_uid" ]]
 [[ "$("${k[@]}" get pod "$primary" -o jsonpath='{.status.containerStatuses[?(@.name=="upgrade")].containerID}')" == "$container" ]]
-reply="$("${k[@]}" exec "$primary" -c upgrade -- redis-cli --raw EVAL 'if redis.call("GET",KEYS[1]) ~= ARGV[1] then return redis.error_reply("fixture value mismatch") end; return redis.call("SET",KEYS[1],ARGV[1],"KEEPTTL")' 1 appmana:upgrade:sentinel-regression "$expected")"
+# No other fixture writers run during this fault. Verify the value first and
+# use SET directly: Lua adds script metadata to NOREPLICAS error replies.
+[[ "$("${k[@]}" exec "$primary" -c upgrade -- redis-cli --raw GET appmana:upgrade:sentinel-regression)" == "$expected" ]]
+reply="$("${k[@]}" exec "$primary" -c upgrade -- redis-cli --raw SET appmana:upgrade:sentinel-regression "$expected" KEEPTTL)"
 [[ "$reply" == "$expected_reply" ]] || { echo "FAIL: unexpected direct-write result: $reply" >&2; exit 1; }
 dropped="$(net -L "$chain" -n -v -x | awk '$3=="DROP" {sum+=$1} END {print sum+0}')"
 [[ "$dropped" -gt 0 ]]
