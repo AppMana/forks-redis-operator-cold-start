@@ -12,7 +12,7 @@ import (
 )
 
 func TestPausePrimaryDoesNotHideResumeInventoryFailure(t *testing.T) {
-	for _, mode := range []string{"inventory-failure", "resume-failure", "success", "task-gone"} {
+	for _, mode := range []string{"inventory-failure", "resume-failure", "success", "task-gone", "chainsaw", "wrong-cluster"} {
 		t.Run(mode, func(t *testing.T) { testPausePrimaryCleanup(t, mode) })
 	}
 }
@@ -22,7 +22,9 @@ func testPausePrimaryCleanup(t *testing.T, mode string) {
 	dir := t.TempDir()
 	kubectl := `#!/bin/sh
 case "$*" in
-  'config current-context') echo kind-test ;;
+  'config current-context')
+    if [ "$TEST_MODE" = chainsaw ]; then echo chainsaw; else echo kind-test; fi ;;
+  *'cluster.server'*) echo https://127.0.0.1:6443 ;;
   *'get redisreplication'*)
     if [ -e "$TEST_STATE/observed" ]; then echo redis-replication-1; else touch "$TEST_STATE/observed"; echo redis-replication-0; fi ;;
   *'spec.nodeName'*) echo test-control-plane ;;
@@ -34,6 +36,8 @@ esac
 `
 	docker := `#!/bin/sh
 case "$*" in
+  'inspect '*)
+    if [ "$TEST_MODE" = wrong-cluster ]; then echo other; else echo test; fi ;;
   *'tasks list -q')
     case "$TEST_MODE" in inventory-failure) exit 12;; task-gone) exit 0;; esac
     printf '%064d\n' 1 ;;
@@ -49,10 +53,10 @@ esac
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "../../tests/e2e-chainsaw/v1beta2/setup/redis-replication/pause-primary.sh")
-	cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "TEST_STATE="+dir, "TEST_MODE="+mode, "NAMESPACE=chainsaw-test", "REPLICATION_NAME=redis-replication")
+	cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"), "TEST_STATE="+dir, "TEST_MODE="+mode, "NAMESPACE=chainsaw-test", "REPLICATION_NAME=redis-replication", "KIND_CLUSTER_NAME=test")
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, ctx.Err(), "the regression must fail through cleanup, not its deadline")
-	if mode == "success" || mode == "task-gone" {
+	if mode == "success" || mode == "task-gone" || mode == "chainsaw" {
 		require.NoError(t, err)
 		require.Contains(t, string(output), "PASS:paused-primary")
 	} else {

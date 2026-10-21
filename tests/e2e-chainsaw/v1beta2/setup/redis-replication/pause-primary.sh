@@ -4,12 +4,20 @@ set -eu
 : "${NAMESPACE:?test namespace required}"
 case "$NAMESPACE" in chainsaw-*|redis-upgrade-canary-*) ;; *) exit 2;; esac
 context=$(kubectl config current-context)
-case "$context" in kind-*) ;; *) exit 2;; esac
+case "$context" in
+  kind-*) cluster=${context#kind-} ;;
+  chainsaw) cluster=${KIND_CLUSTER_NAME:?explicit kind cluster required for Chainsaw} ;;
+  *) echo 'FAIL: unsupported test context' >&2; exit 2 ;;
+esac
+server=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+case "$server" in https://127.0.0.1:*|https://localhost:*) ;; *) echo 'FAIL: API is not local' >&2; exit 2;; esac
 name="${REPLICATION_NAME:-redis-replication}"
 primary=$(kubectl -n "$NAMESPACE" get redisreplication "$name" -o jsonpath='{.status.masterNode}')
 case "$primary" in "$name"-[0-9]*) ;; *) exit 2;; esac
 node=$(kubectl -n "$NAMESPACE" get pod "$primary" -o jsonpath='{.spec.nodeName}')
-case "$node" in "${context#kind-}-control-plane"|"${context#kind-}-worker"*) ;; *) exit 2;; esac
+case "$node" in "$cluster-control-plane"|"$cluster-worker"*) ;; *) echo 'FAIL: node name is outside test cluster' >&2; exit 2;; esac
+owner=$(docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node")
+[ "$owner" = "$cluster" ] || { echo 'FAIL: Docker node is outside test cluster' >&2; exit 2; }
 task=$(kubectl -n "$NAMESPACE" get pod "$primary" -o "jsonpath={.status.containerStatuses[?(@.name=='$name')].containerID}")
 printf '%s\n' "$task" | grep -Eq '^containerd://[a-f0-9]{64}$'
 task=${task#containerd://}

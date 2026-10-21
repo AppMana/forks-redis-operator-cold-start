@@ -145,8 +145,9 @@ spec:
         - script:
             timeout: 150s
             content: |
-              NAMESPACE="${NAMESPACE}" sh ./pause-primary.sh
+              KIND_CLUSTER_NAME=kind NAMESPACE="${NAMESPACE}" sh ./pause-primary.sh
             check:
+              ($error == null): true
               (contains($stdout, 'PASS:paused-primary')): true
 
     - name: Assert data
