@@ -386,6 +386,8 @@ func (f *fakeSentinelRedisClient) Connect(info *redis.ConnectionInfo) redis.Serv
 	return f.svc
 }
 
+func (f *fakeSentinelRedisService) SentinelMyID(context.Context) (string, error) { return "", nil }
+
 func (f *fakeSentinelRedisService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return "", "", false, nil
 }

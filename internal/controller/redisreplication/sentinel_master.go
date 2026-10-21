@@ -161,6 +161,8 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			wg         sync.WaitGroup
 			answers    []string
 			electorate = max(group.size, int32(len(group.pods)))
+			identities = map[string]bool{}
+			duplicate  bool
 		)
 		for _, pod := range group.pods {
 			if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
@@ -173,6 +175,16 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 				queryCtx, cancel := context.WithTimeout(ctx, sentinelQueryTimeout)
 				defer cancel()
 				service := redisClient.Connect(connInfo)
+				identity, err := service.SentinelMyID(queryCtx)
+				if err != nil || identity == "" {
+					return
+				}
+				mu.Lock()
+				if identities[identity] {
+					duplicate = true
+				}
+				identities[identity] = true
+				mu.Unlock()
 				host, port, monitored, err := service.SentinelGetMasterAddrByName(queryCtx, group.masterGroup)
 				if err != nil {
 					logger.V(1).Info("Sentinel did not answer", "sentinel", name, "error", err.Error())
@@ -199,6 +211,10 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			}(pod.Name)
 		}
 		wg.Wait()
+		if duplicate {
+			logger.Info("Duplicate Sentinel identities; refusing fallback election", "masterGroup", group.masterGroup)
+			return "", true
+		}
 		// Include surplus pods during replacement/downscale in the electorate,
 		// including unreachable or terminating members. Otherwise a configured
 		// size smaller than the live inventory can admit competing majorities.

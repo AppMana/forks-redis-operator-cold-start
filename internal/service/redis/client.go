@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -67,6 +68,7 @@ func NewClient() Client {
 }
 
 type Service interface {
+	SentinelMyID(ctx context.Context) (string, error)
 	IsMaster(ctx context.Context) (bool, error)
 	GetAttachedReplicaCount(ctx context.Context) (int, error)
 	GetKeyCount(ctx context.Context) (int64, error)
@@ -81,6 +83,22 @@ type Service interface {
 	// does not monitor that group.
 	SentinelGetMasterAddrByName(ctx context.Context, masterGroupName string) (host, port string, ok bool, err error)
 	GetClusterInfo(ctx context.Context) (*ClusterStatus, error)
+}
+
+func (c *service) SentinelMyID(ctx context.Context) (string, error) {
+	client := c.createClient()
+	if client == nil {
+		return "", errConnectionInfoNotSet
+	}
+	defer client.Close()
+	id, err := client.Do(ctx, "SENTINEL", "MYID").Text()
+	if err != nil {
+		return "", err
+	}
+	if _, err := hex.DecodeString(id); len(id) != 40 || err != nil {
+		return "", errors.New("invalid Sentinel identity")
+	}
+	return strings.ToLower(id), nil
 }
 
 type InfoSentinelResult struct {

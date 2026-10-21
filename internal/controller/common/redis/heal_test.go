@@ -780,6 +780,8 @@ func (f *fakeRedisClient) Connect(info *redisservice.ConnectionInfo) redisservic
 	return &fakeRedisService{client: f, host: info.Host}
 }
 
+func (f *fakeRedisService) SentinelMyID(context.Context) (string, error) { return "", nil }
+
 func (f *fakeRedisService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return "", "", false, nil
 }

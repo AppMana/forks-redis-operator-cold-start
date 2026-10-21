@@ -1173,6 +1173,8 @@ func (f *fakeSentinelInfoService) SentinelMonitorHealthy(context.Context, string
 	return true, nil
 }
 
+func (f *fakeSentinelInfoService) SentinelMyID(context.Context) (string, error) { return "", nil }
+
 func (f *fakeSentinelInfoService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return "", "", false, nil
 }

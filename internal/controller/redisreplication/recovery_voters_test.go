@@ -23,7 +23,10 @@ type electorateService struct {
 	redis.Service
 	master string
 	known  int
+	id     string
 }
+
+func (s electorateService) SentinelMyID(context.Context) (string, error) { return s.id, nil }
 
 func (s electorateService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return s.master, "6379", true, nil
@@ -35,11 +38,18 @@ func (s electorateService) GetInfoSentinel(context.Context) (*redis.InfoSentinel
 
 type electorateClient map[string]electorateService
 
-func (c electorateClient) Connect(info *redis.ConnectionInfo) redis.Service { return c[info.Host] }
+func (c electorateClient) Connect(info *redis.ConnectionInfo) redis.Service {
+	s := c[info.Host]
+	if s.id == "" {
+		s.id = fmt.Sprintf("%040x", []byte(info.Host))
+	}
+	return s
+}
 
 func TestRecoveryVotersParticipateWithoutGrantingManagedMinorityAuthority(t *testing.T) {
-	for _, associated := range []bool{false, true} {
-		t.Run(fmt.Sprintf("associated=%v", associated), func(t *testing.T) {
+	for _, tc := range []struct{ associated, duplicate bool }{{false, false}, {true, false}, {true, true}} {
+		associated := tc.associated
+		t.Run(fmt.Sprintf("associated=%v/duplicate=%v", associated, tc.duplicate), func(t *testing.T) {
 			scheme := runtime.NewScheme()
 			require.NoError(t, rrvb2.AddToScheme(scheme))
 			require.NoError(t, rsvb2.AddToScheme(scheme))
@@ -71,6 +81,9 @@ func TestRecoveryVotersParticipateWithoutGrantingManagedMinorityAuthority(t *tes
 					master = "10.0.0.2"
 				}
 				probes[ip] = electorateService{master: master, known: 7}
+				if tc.duplicate && i >= 3 {
+					probes[ip] = electorateService{master: master, known: 7, id: fmt.Sprintf("%040d", 42)}
+				}
 			}
 			// Same association in another namespace must never join this vote.
 			objects = append(objects, newRunningPodForTest("other", "foreign", "10.0.2.1", map[string]string{RecoverySentinelOwnerLabel: rs.GetStatefulSetName()}, true))
@@ -83,7 +96,11 @@ func TestRecoveryVotersParticipateWithoutGrantingManagedMinorityAuthority(t *tes
 			if associated {
 				require.EqualValues(t, 7, groups[0].size)
 				require.Len(t, groups[0].pods, 7)
-				require.Equal(t, rr.Name+"-1", master)
+				if tc.duplicate {
+					require.Empty(t, master, "cloned Sentinel identities are not independent election voters")
+				} else {
+					require.Equal(t, rr.Name+"-1", master)
+				}
 			} else {
 				require.Empty(t, master, "three managed votes cannot override a seven-member electorate")
 			}
