@@ -287,6 +287,13 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 			return fmt.Errorf("incomplete Sentinel master metadata; existing monitor preserved")
 		}
 		if result["ip"] == master.Host && result["port"] == master.Port {
+			// Scaling Sentinels or editing an external group's quorum must
+			// update the retained monitor too, without discarding election state.
+			if result["quorum"] != quorum {
+				if err := client.Do(ctx, "SENTINEL", "SET", masterGroupName, "quorum", quorum).Err(); err != nil {
+					return fmt.Errorf("update Sentinel quorum: %w", err)
+				}
+			}
 			return setSentinelMasterAuth(ctx, client, masterGroupName, master.Password)
 		}
 	}
