@@ -1,0 +1,25 @@
+---
+# Explicitly target the existing isolated fixture; never bootstrap or clean it up.
+# Run with --namespace redis-upgrade-canary-auth-rotation --skip-delete.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: local-paused-primary
+spec:
+  namespace: redis-upgrade-canary-auth-rotation
+  skipDelete: true
+  steps:
+    - name: Verify Chainsaw context and sustained primary outage
+      try:
+        - script:
+            timeout: 150s
+            content: |
+              set -eu
+              [ "$NAMESPACE" = redis-upgrade-canary-auth-rotation ]
+              [ "$(kubectl config current-context)" = chainsaw ]
+              export KIND_CLUSTER_NAME=redis-recovery-20261020
+              export REPLICATION_NAME=upgrade
+              sh ../../../tests/e2e-chainsaw/v1beta2/setup/redis-replication/pause-primary.sh
+            check:
+              ($error == null): true
+              (contains($stdout, 'PASS:paused-primary')): true
