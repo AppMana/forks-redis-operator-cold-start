@@ -6,18 +6,32 @@ context="$(kubectl --kubeconfig "$config" config current-context)"
 [[ "$context" == kind-redis-recovery-* ]]
 [[ "$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" == https://127.0.0.1:* ]]
 namespace=redis-upgrade-canary-cluster-downscale
+leaders=1
+followers=0
+shrinking_role=leader
 case "${2:-baseline}" in
   baseline) ;;
   interrupted) namespace=redis-upgrade-canary-cluster-downscale-interrupted-routable ;;
-  *) echo 'Expected baseline or interrupted'; exit 1 ;;
+  followers) namespace=redis-upgrade-canary-cluster-follower-downscale; leaders=3; followers=1; shrinking_role=follower ;;
+  *) echo 'Expected baseline, interrupted or followers'; exit 1 ;;
 esac
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$namespace")
 cluster=redis-cluster-v1beta2
 "${k[@]}" wait "rediscluster/$cluster" --for=jsonpath='{.status.state}'=Ready --timeout=180s
 [[ "$("${k[@]}" get sts "$cluster-leader" -o jsonpath='{.spec.replicas}')" == 3 ]]
+[[ "$("${k[@]}" get sts "$cluster-$shrinking_role" -o jsonpath='{.spec.replicas}')" == 3 ]]
 pvc_uids() { "${k[@]}" get pvc -o json | jq -Sc '[.items[]|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)'; }
 pvcs="$(pvc_uids)"
 leader_uid="$("${k[@]}" get pod "$cluster-leader-0" -o jsonpath='{.metadata.uid}')"
+retained_uids() {
+  for role in leader follower; do
+    count="$leaders"; [[ "$role" == leader ]] || count="$followers"
+    for ((i=0; i<count; i++)); do
+      "${k[@]}" get pod "$cluster-$role-$i" -o jsonpath='{.metadata.uid}{"\n"}'
+    done
+  done
+}
+before_retained="$(retained_uids)"
 "${k[@]}" exec "$cluster-leader-0" -c "$cluster-leader" -- sh -eu -c '
   for i in $(seq 0 99); do
     redis-cli -c SET "appmana:downscale:$i" "retained-$i" NX >/dev/null
@@ -47,13 +61,14 @@ if [[ "${2:-baseline}" == interrupted ]]; then
   echo 'Injected interrupted retirement boundary: two members remain, StatefulSet still has three replicas'
   "${k[@]}" annotate rediscluster "$cluster" rediscluster.opstreelabs.in/skip-reconcile-
 else
-  "${k[@]}" patch rediscluster "$cluster" --type=merge -p '{"spec":{"clusterSize":1,"redisLeader":{"replicas":1}}}'
+  patch="$(jq -cn --argjson leaders "$leaders" --argjson followers "$followers" '{spec:{clusterSize:$leaders,redisLeader:{replicas:$leaders},redisFollower:{replicas:$followers}}}')"
+  "${k[@]}" patch rediscluster "$cluster" --type=merge -p "$patch"
 fi
 deadline=$((SECONDS+180))
 converged=false
 while (( SECONDS < deadline )); do
-  replicas="$("${k[@]}" get sts "$cluster-leader" -o jsonpath='{.spec.replicas}')"
-  count="$("${k[@]}" get pods -l app="$cluster-leader" -o json | jq '.items|length')"
+  replicas="$("${k[@]}" get sts "$cluster-$shrinking_role" -o jsonpath='{.spec.replicas}')"
+  count="$("${k[@]}" get pods -l app="$cluster-$shrinking_role" -o json | jq '.items|length')"
   if [[ "$replicas" == 1 && "$count" == 1 ]]; then converged=true; break; fi
   sleep 2
 done
@@ -62,9 +77,16 @@ done
   for i in $(seq 0 99); do
     [ "$(redis-cli -c --raw GET "appmana:downscale:$i")" = "retained-$i" ]
   done
-  redis-cli --raw CLUSTER INFO' | tr -d '\r' | awk 'BEGIN { ok=0; slots=0; nodes=0 } /^cluster_state:ok$/ {ok=1} /^cluster_slots_ok:16384$/ {slots=1} /^cluster_known_nodes:1$/ {nodes=1} END {exit !(ok && slots && nodes)}'
+  redis-cli --raw CLUSTER INFO' | tr -d '\r' | awk -F: -v expected="$((leaders+followers))" 'BEGIN { ok=0; slots=0; nodes=0 } /^cluster_state:ok$/ {ok=1} /^cluster_slots_ok:16384$/ {slots=1} $1=="cluster_known_nodes" && $2==expected {nodes=1} END {exit !(ok && slots && nodes)}'
 [[ "$(pvc_uids)" == "$pvcs" ]]
 [[ "$("${k[@]}" get pod "$cluster-leader-0" -o jsonpath='{.metadata.uid}')" == "$leader_uid" ]]
+[[ "$(retained_uids)" == "$before_retained" ]]
 "${k[@]}" wait "rediscluster/$cluster" --for=jsonpath='{.status.state}'=Ready --timeout=45s
-"${k[@]}" wait "rediscluster/$cluster" --for=jsonpath='{.status.readyLeaderReplicas}'=1 --timeout=45s
-echo 'PASS: three-to-one downscale retained all 100 values, survivor pod UID and every PVC UID'
+"${k[@]}" wait "rediscluster/$cluster" --for=jsonpath='{.status.readyLeaderReplicas}'="$leaders" --timeout=45s
+# Zero is omitted by the API's omitempty tag; it is not the string "0".
+deadline=$((SECONDS+45))
+while ! "${k[@]}" get rediscluster "$cluster" -o json | jq -e --argjson expected "$followers" '(.status.readyFollowerReplicas // 0)==$expected' >/dev/null; do
+  (( SECONDS < deadline )) || { echo 'FAIL: ready follower count did not converge'; exit 1; }
+  sleep 1
+done
+echo "PASS: $shrinking_role three-to-one downscale retained all 100 values, survivor pod UIDs and every PVC UID"

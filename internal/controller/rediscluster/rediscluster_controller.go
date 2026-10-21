@@ -96,7 +96,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return intctrlutil.RequeueE(ctx, err, "cannot determine existing leader replicas")
 	}
-	if leaderReplicas < leaderCount {
+	followerCount, err := r.currentLeaderReplicas(ctx, instance.Namespace, instance.Name+"-follower")
+	if err != nil {
+		return intctrlutil.RequeueE(ctx, err, "cannot determine existing follower replicas")
+	}
+	if leaderReplicas < leaderCount || followerReplicas < followerCount {
 		if leaderReplicas < 1 {
 			return intctrlutil.RequeueE(ctx, fmt.Errorf("cannot downscale to zero leaders"), "")
 		}
@@ -157,17 +161,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				monitoring.RedisClusterRemoveFollowerAttempt.WithLabelValues(instance.Namespace, instance.Name).Inc()
 				monitoring.RedisClusterReshardTotal.WithLabelValues(instance.Namespace, instance.Name).Inc()
 			}
+			if err := k8sutils.RetireObsoleteClusterFollowers(ctx, r.K8sClient, instance, followerCount); err != nil {
+				return intctrlutil.RequeueE(ctx, err, "failed to retire obsolete follower membership")
+			}
 			// Step 3 Rebalance the cluster. With a single remaining leader there is
 			// nothing to rebalance: all slots were already resharded to leader-0 and
 			// the rebalance command targets leader-1, which is no longer part of the
 			// cluster at this point.
-			if leaderReplicas > 1 {
+			if leaderReplicas > 1 && leaderReplicas < leaderCount {
 				logger.Info("Redis cluster is downscaled... Rebalancing the cluster")
 				k8sutils.RebalanceRedisCluster(ctx, r.K8sClient, instance)
 				logger.Info("Redis cluster is downscaled... Rebalancing the cluster is done")
 				monitoring.RedisClusterRebalanceTotal.WithLabelValues(instance.Namespace, instance.Name).Inc()
 			} else {
-				logger.Info("Redis cluster is downscaled... Skipping rebalance for single-node cluster")
+				logger.Info("Skipping rebalance: no leader retirement or single-node cluster")
 			}
 			return intctrlutil.RequeueAfter(ctx, time.Second*10, "")
 		}
@@ -485,7 +492,7 @@ func (r *Reconciler) currentLeaderReplicas(ctx context.Context, namespace, name 
 		return 0, err
 	}
 	if sts.Spec.Replicas == nil {
-		return 0, fmt.Errorf("existing leader StatefulSet has no replica count")
+		return 0, fmt.Errorf("existing StatefulSet has no replica count")
 	}
 	return *sts.Spec.Replicas, nil
 }
