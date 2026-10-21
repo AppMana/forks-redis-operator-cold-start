@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -486,26 +487,48 @@ func (c *service) GetKeyCount(ctx context.Context) (int64, error) {
 
 func countKeyspaceKeys(info string) (int64, error) {
 	var total int64
-	for _, line := range strings.Split(info, "\r\n") {
+	seenHeader := false
+	seenDB := make(map[uint64]bool)
+	for _, line := range strings.Split(info, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "db") {
+		if line == "" {
 			continue
 		}
-		_, fields, ok := strings.Cut(line, ":")
-		if !ok {
+		if line == "# Keyspace" && !seenHeader {
+			seenHeader = true
 			continue
 		}
+		name, fields, ok := strings.Cut(line, ":")
+		if !ok || !strings.HasPrefix(name, "db") {
+			return 0, errors.New("invalid Redis keyspace inventory line")
+		}
+		db, err := strconv.ParseUint(strings.TrimPrefix(name, "db"), 10, 32)
+		if err != nil || seenDB[db] {
+			return 0, errors.New("invalid or duplicate database in Redis keyspace inventory")
+		}
+		seenDB[db] = true
+		foundKeys := false
 		for _, field := range strings.Split(fields, ",") {
 			value, found := strings.CutPrefix(field, "keys=")
 			if !found {
 				continue
 			}
+			if foundKeys {
+				return 0, errors.New("duplicate key count in Redis keyspace inventory")
+			}
+			foundKeys = true
 			keys, err := strconv.ParseInt(value, 10, 64)
-			if err != nil {
-				return 0, fmt.Errorf("parse %q: %w", line, err)
+			if err != nil || keys < 0 || keys > math.MaxInt64-total {
+				return 0, errors.New("invalid or overflowing key count in Redis keyspace inventory")
 			}
 			total += keys
 		}
+		if !foundKeys {
+			return 0, errors.New("missing key count in Redis keyspace inventory")
+		}
+	}
+	if !seenHeader {
+		return 0, errors.New("missing Redis keyspace inventory header")
 	}
 	return total, nil
 }

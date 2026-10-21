@@ -106,3 +106,21 @@ func TestCountKeyspaceKeysRejectsMalformedCount(t *testing.T) {
 	_, err := countKeyspaceKeys("# Keyspace\r\ndb0:keys=many,expires=0,avg_ttl=0\r\n")
 	assert.Error(t, err)
 }
+
+func TestCountKeyspaceKeysRejectsUnknownInventory(t *testing.T) {
+	for _, info := range []string{
+		"", "# Replication\r\nrole:master\r\n",
+		"db0:keys=1,expires=0\r\n",
+		"# Keyspace\r\ndb0\r\n",
+		"# Keyspace\r\ndb0:expires=0\r\n",
+		"# Keyspace\r\ndb0:keys=-1\r\n",
+		"# Keyspace\r\ndb0:keys=1,keys=2\r\n",
+		"# Keyspace\r\ndb0:keys=1\r\ndb0:keys=2\r\n",
+		"# Keyspace\r\ndb-invalid:keys=1\r\n",
+		"# Keyspace\r\ndb0:keys=9223372036854775807\r\ndb1:keys=1\r\n",
+		"# Keyspace\r\nunrecognized inventory\r\n",
+	} {
+		_, err := countKeyspaceKeys(info)
+		assert.Error(t, err, "unknown inventory must not become an empty or partial count")
+	}
+}
