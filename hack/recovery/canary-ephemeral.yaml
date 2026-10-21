@@ -1,0 +1,49 @@
+# Isolated approximation of Spellsource: no data/config PVCs, IP monitors,
+# default RollingUpdate, Redis 7.0.15. Names/resources are lab-local.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: redis-upgrade-canary-ephemeral
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisReplication
+metadata:
+  name: upgrade
+  namespace: redis-upgrade-canary-ephemeral
+spec:
+  clusterSize: 3
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits: {memory: 256Mi}
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: RedisSentinel
+metadata:
+  name: upgrade
+  namespace: redis-upgrade-canary-ephemeral
+spec:
+  clusterSize: 3
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+  redisSentinelConfig:
+    redisReplicationName: upgrade
+    masterGroupName: upgrade
+    resolveHostnames: "no"
+    announceHostnames: "no"
+    downAfterMilliseconds: "5000"
+    failoverTimeout: "10000"
+    parallelSyncs: "1"
+    quorum: "2"
+  kubernetesConfig:
+    image: quay.io/opstree/redis-sentinel:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 25m, memory: 32Mi}
+      limits: {memory: 128Mi}
