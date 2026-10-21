@@ -1254,24 +1254,20 @@ func applyDynamicConfig(ctx context.Context, redisClient *redis.Client, podName 
 		return false, nil
 	}
 
-	for _, config := range dynamicConfig {
+	for index, config := range dynamicConfig {
 		parts := strings.SplitN(config, " ", 2)
-		if len(parts) != 2 {
-			log.FromContext(ctx).Error(nil, "Invalid config format", "config", config)
-			continue
+		if len(parts) != 2 || parts[0] == "" {
+			return true, fmt.Errorf("invalid dynamic configuration format at entry %d for pod %s", index, podName)
 		}
 
 		if err := redisClient.ConfigSet(ctx, parts[0], parts[1]).Err(); err != nil {
-			log.FromContext(ctx).Error(err, "Failed to set config",
-				"key", parts[0],
-				"value", parts[1],
-				"pod", podName)
-			return true, err
+			// CONFIG SET errors may echo the supplied value. Neither logs nor
+			// returned errors may expose credentials such as masterauth.
+			return true, fmt.Errorf("failed to set dynamic configuration entry %d for pod %s", index, podName)
 		}
 
 		log.FromContext(ctx).V(1).Info("Successfully set config",
-			"key", parts[0],
-			"value", parts[1],
+			"entry", index,
 			"pod", podName)
 	}
 
@@ -1280,6 +1276,12 @@ func applyDynamicConfig(ctx context.Context, redisClient *redis.Client, podName 
 
 // SetRedisClusterDynamicConfig applies dynamic configuration to each Redis instance in the cluster
 func SetRedisClusterDynamicConfig(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster) error {
+	return setRedisClusterDynamicConfig(ctx, cr, func(podName string) *redis.Client {
+		return configureRedisClient(ctx, client, cr, podName)
+	})
+}
+
+func setRedisClusterDynamicConfig(ctx context.Context, cr *rcvb2.RedisCluster, makeClient func(string) *redis.Client) error {
 	// Get dynamic configuration
 	dynamicConfig := cr.Spec.GetRedisDynamicConfig()
 	if len(dynamicConfig) == 0 {
@@ -1291,6 +1293,7 @@ func SetRedisClusterDynamicConfig(ctx context.Context, client kubernetes.Interfa
 	followerReplicas := cr.Spec.GetReplicaCounts("follower")
 
 	// Apply configuration to each Redis instance
+	var pending []error
 	for i := 0; i < int(leaderReplicas+followerReplicas); i++ {
 		var podName string
 		if i < int(leaderReplicas) {
@@ -1299,15 +1302,18 @@ func SetRedisClusterDynamicConfig(ctx context.Context, client kubernetes.Interfa
 			podName = cr.Name + "-follower-" + strconv.Itoa(i-int(leaderReplicas))
 		}
 
-		redisClient := configureRedisClient(ctx, client, cr, podName)
-		_, err := applyDynamicConfig(ctx, redisClient, podName, dynamicConfig)
+		redisClient := makeClient(podName)
+		applied, err := applyDynamicConfig(ctx, redisClient, podName, dynamicConfig)
 		redisClient.Close()
 		if err != nil {
 			return err
 		}
+		if !applied {
+			pending = append(pending, fmt.Errorf("dynamic configuration not applied to pod %s", podName))
+		}
 	}
 
-	return nil
+	return errors.Join(pending...)
 }
 
 func SetRedisReplicationDynamicConfig(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication) error {
@@ -1323,18 +1329,22 @@ func setRedisReplicationDynamicConfig(ctx context.Context, cr *rrvb2.RedisReplic
 	}
 
 	replicas := cr.Spec.GetReplicationCounts("")
+	var pending []error
 	for i := 0; i < int(replicas); i++ {
 		podName := cr.Name + "-" + strconv.Itoa(i)
 
 		redisClient := makeClient(podName)
-		_, err := applyDynamicConfig(ctx, redisClient, podName, dynamicConfig)
+		applied, err := applyDynamicConfig(ctx, redisClient, podName, dynamicConfig)
 		redisClient.Close()
 		if err != nil {
 			return err
 		}
+		if !applied {
+			pending = append(pending, fmt.Errorf("dynamic configuration not applied to pod %s", podName))
+		}
 	}
 
-	return nil
+	return errors.Join(pending...)
 }
 
 func SetRedisStandaloneDynamicConfig(ctx context.Context, client kubernetes.Interface, cr *rvb2.Redis) (bool, error) {

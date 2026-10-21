@@ -1,18 +1,22 @@
 package k8sutils
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
 
 	common "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	rvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redis/v1beta2"
+	rcvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/rediscluster/v1beta2"
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	"github.com/go-redis/redismock/v9"
 	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 func TestApplyDynamicConfig(t *testing.T) {
@@ -65,16 +69,15 @@ func TestApplyDynamicConfig(t *testing.T) {
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
 
-	t.Run("skips malformed entries but applies valid ones", func(t *testing.T) {
+	t.Run("rejects malformed entries", func(t *testing.T) {
 		client, mock := redismock.NewClientMock()
 		mock.ExpectPing().SetVal("PONG")
-		mock.ExpectConfigSet("maxmemory-policy", "allkeys-lru").SetVal("OK")
 
 		applied, err := applyDynamicConfig(ctx, client, "redis-0", []string{
 			"missing-value",
 			"maxmemory-policy allkeys-lru",
 		})
-		assert.NoError(t, err)
+		assert.Error(t, err)
 		assert.True(t, applied)
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
@@ -89,6 +92,38 @@ func TestApplyDynamicConfig(t *testing.T) {
 		assert.True(t, applied, "the pod was reachable, so it is considered applied even though a CONFIG SET failed")
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
+}
+
+func TestDynamicConfigDoesNotExposeValues(t *testing.T) {
+	for _, scenario := range []string{"success", "server-error", "malformed"} {
+		t.Run(scenario, func(t *testing.T) {
+			const sensitive = "synthetic-sensitive-config-value"
+			var output bytes.Buffer
+			ctx := log.IntoContext(context.Background(), zap.New(zap.WriteTo(&output), zap.UseDevMode(true)))
+			client, mock := redismock.NewClientMock()
+			mock.ExpectPing().SetVal("PONG")
+			config := "masterauth " + sensitive
+			switch scenario {
+			case "malformed":
+				config = sensitive
+			case "server-error":
+				mock.ExpectConfigSet("masterauth", sensitive).SetErr(errors.New("invalid value " + sensitive))
+			default:
+				mock.ExpectConfigSet("masterauth", sensitive).SetVal("OK")
+			}
+			_, err := applyDynamicConfig(ctx, client, "redis-0", []string{config})
+			if scenario == "success" {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+				if err != nil {
+					assert.NotContains(t, err.Error(), sensitive)
+				}
+			}
+			assert.NotContains(t, output.String(), sensitive)
+			assert.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
 }
 
 func TestSetRedisReplicationDynamicConfig(t *testing.T) {
@@ -139,7 +174,7 @@ func TestSetRedisReplicationDynamicConfig(t *testing.T) {
 		assert.False(t, called, "client factory must not be called without dynamic config")
 	})
 
-	t.Run("continues past unreachable pods", func(t *testing.T) {
+	t.Run("continues past unreachable pods but reports incomplete application", func(t *testing.T) {
 		cr := newReplication(2)
 		mocks := map[string]redismock.ClientMock{}
 		makeClient := func(podName string) *redis.Client {
@@ -155,7 +190,7 @@ func TestSetRedisReplicationDynamicConfig(t *testing.T) {
 		}
 
 		err := setRedisReplicationDynamicConfig(ctx, cr, makeClient)
-		assert.NoError(t, err)
+		assert.Error(t, err)
 		assert.Len(t, mocks, 2, "every pod should be visited even if an earlier one is unreachable")
 		for _, m := range mocks {
 			assert.NoError(t, m.ExpectationsWereMet())
@@ -178,6 +213,31 @@ func TestSetRedisReplicationDynamicConfig(t *testing.T) {
 		err := setRedisReplicationDynamicConfig(ctx, cr, makeClient)
 		assert.Error(t, err)
 	})
+}
+
+func TestClusterDynamicConfigReportsUnreachablePod(t *testing.T) {
+	cr := &rcvb2.RedisCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: rcvb2.RedisClusterSpec{
+			ClusterSize: ptr.To(int32(1)),
+			RedisConfig: &common.RedisConfig{DynamicConfig: []string{"maxmemory-policy allkeys-lru"}},
+		},
+	}
+	var visited []string
+	err := setRedisClusterDynamicConfig(context.Background(), cr, func(name string) *redis.Client {
+		visited = append(visited, name)
+		client, mock := redismock.NewClientMock()
+		if name == "cluster-leader-0" {
+			mock.ExpectPing().SetErr(errors.New("connection refused"))
+		} else {
+			mock.ExpectPing().SetVal("PONG")
+			mock.ExpectConfigSet("maxmemory-policy", "allkeys-lru").SetVal("OK")
+		}
+		t.Cleanup(func() { assert.NoError(t, mock.ExpectationsWereMet()) })
+		return client
+	})
+	assert.ErrorContains(t, err, "cluster-leader-0")
+	assert.Equal(t, []string{"cluster-leader-0", "cluster-follower-0"}, visited)
 }
 
 func TestSetRedisStandaloneDynamicConfig(t *testing.T) {
