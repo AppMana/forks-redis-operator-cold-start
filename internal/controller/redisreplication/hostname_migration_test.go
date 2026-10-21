@@ -40,7 +40,8 @@ func TestHostnameMigrationPreflight(t *testing.T) {
 				topology.Masters = []string{"redis-0", "redis-1"}
 			}
 			called := false
-			r := &Reconciler{Client: c,
+			r := &Reconciler{
+				Client: c,
 				RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
 					return topology, nil
 				},
@@ -110,7 +111,8 @@ func TestHostnameMigrationBlocksRedisResourceWrites(t *testing.T) {
 	sentinel.Generation = 1
 	sentinel.Status = appsv1.StatefulSetStatus{ObservedGeneration: 1, ReadyReplicas: 3, UpdatedReplicas: 3, CurrentRevision: "r", UpdateRevision: "r"}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(rr, data, &sentinel).Build()
-	r := &Reconciler{Client: c,
+	r := &Reconciler{
+		Client: c,
 		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
 			return k8sutils.RedisReplicationTopology{Masters: []string{"redis-0"}, Slaves: []string{"redis-1", "redis-2"}}, nil
 		},
