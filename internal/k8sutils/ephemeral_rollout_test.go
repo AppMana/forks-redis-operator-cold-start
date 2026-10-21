@@ -56,6 +56,7 @@ func TestEphemeralRolloutGuardBoundaries(t *testing.T) {
 			stored := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: "RedisReplication", UID: "owner"}}}}
 			if tc.persistent {
 				stored.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "data"}}}
+				stored.Spec.Template.Spec.Containers = []corev1.Container{{Name: stored.Name, VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}}}
 			}
 			if tc.pending {
 				stored.Status.CurrentRevision, stored.Status.UpdateRevision = "old", "new"
@@ -74,6 +75,51 @@ func TestEphemeralRolloutGuardBoundaries(t *testing.T) {
 			} else {
 				require.NoError(t, err)
 			}
+		})
+	}
+}
+
+func TestEphemeralGuardDoesNotTrustUnrelatedClaims(t *testing.T) {
+	stored := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "redis", OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: "RedisReplication", UID: "owner"}}}}
+	stored.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "config"}}}
+	stored.Spec.Template.Spec.Containers = []corev1.Container{{Name: "redis", VolumeMounts: []corev1.VolumeMount{{Name: "config", MountPath: "/etc/redis"}}}}
+	desired := stored.DeepCopy()
+	err := guardEphemeralRollout(stored, desired, []byte(`{"spec":{"template":{"metadata":{"annotations":{"changed":"yes"}}}}}`), false)
+	require.ErrorContains(t, err, "OnDelete")
+}
+
+func TestPersistentRedisStateMount(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, role, path                  string
+		readOnly, sidecar, direct, shadow, want bool
+	}{
+		{name: "data claim", kind: "RedisReplication", path: "/data", want: true},
+		{name: "unrelated config", kind: "RedisReplication", path: "/etc/redis"},
+		{name: "sentinel config", kind: "RedisSentinel", path: "/etc/redis", want: true},
+		{name: "sentinel data not config", kind: "RedisSentinel", path: "/data"},
+		{name: "embedded sentinel", kind: "RedisReplication", role: "sentinel", path: "/etc/redis", want: true},
+		{name: "read only", kind: "RedisReplication", path: "/data", readOnly: true},
+		{name: "sidecar only", kind: "RedisReplication", path: "/data", sidecar: true},
+		{name: "direct PVC", kind: "RedisReplication", path: "/data", direct: true, want: true},
+		{name: "shadowed with emptyDir", kind: "RedisReplication", path: "/data", shadow: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "redis", OwnerReferences: []metav1.OwnerReference{{Kind: tc.kind}}}}
+			sts.Spec.Template.Labels = map[string]string{"redis_setup_type": tc.role}
+			sts.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "state"}}}
+			container := "redis"
+			if tc.sidecar {
+				container = "sidecar"
+			}
+			sts.Spec.Template.Spec.Containers = []corev1.Container{{Name: container, VolumeMounts: []corev1.VolumeMount{{Name: "state", MountPath: tc.path, ReadOnly: tc.readOnly}}}}
+			if tc.direct {
+				sts.Spec.VolumeClaimTemplates = nil
+				sts.Spec.Template.Spec.Volumes = []corev1.Volume{{Name: "state", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "retained"}}}}
+			}
+			if tc.shadow {
+				sts.Spec.Template.Spec.Volumes = []corev1.Volume{{Name: "state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}}
+			}
+			require.Equal(t, tc.want, hasPersistentRedisStateMount(sts))
 		})
 	}
 }

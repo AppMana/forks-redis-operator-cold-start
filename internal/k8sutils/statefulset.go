@@ -280,7 +280,7 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 // Do not let an operator template upgrade automatically replace those pods.
 // OnDelete stages the desired template for an explicitly coordinated migration.
 func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, recreate bool) error {
-	if len(stored.Spec.VolumeClaimTemplates) != 0 {
+	if hasPersistentRedisStateMount(stored) && hasPersistentRedisStateMount(desired) {
 		return nil
 	}
 	managed := false
@@ -305,6 +305,39 @@ func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, 
 		return fmt.Errorf("refusing automatic replacement of ephemeral StatefulSet %s/%s: stage updateStrategy.type=OnDelete with recreation disabled and coordinate data/Sentinel migration", stored.Namespace, stored.Name)
 	}
 	return nil
+}
+
+// A config or sidecar claim is not evidence that the Redis dataset survives
+// pod replacement. Inspect the main container's writable state mount instead.
+func hasPersistentRedisStateMount(sts *appsv1.StatefulSet) bool {
+	statePath := "/data"
+	if sts.Spec.Template.Labels["redis_setup_type"] == "sentinel" {
+		statePath = "/etc/redis"
+	}
+	for _, owner := range sts.OwnerReferences {
+		if owner.Kind == "RedisSentinel" {
+			statePath = "/etc/redis"
+		}
+	}
+	claims := map[string]bool{}
+	for _, claim := range sts.Spec.VolumeClaimTemplates {
+		claims[claim.Name] = true
+	}
+	for _, volume := range sts.Spec.Template.Spec.Volumes {
+		claims[volume.Name] = volume.PersistentVolumeClaim != nil &&
+			volume.PersistentVolumeClaim.ClaimName != "" && !volume.PersistentVolumeClaim.ReadOnly
+	}
+	for _, container := range sts.Spec.Template.Spec.Containers {
+		if container.Name != sts.Name {
+			continue
+		}
+		for _, mount := range container.VolumeMounts {
+			if mount.MountPath == statePath && !mount.ReadOnly && claims[mount.Name] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // syncManagedFields syncs system-managed fields from the stored object to the new object.
