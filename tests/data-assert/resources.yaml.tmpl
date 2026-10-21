@@ -24,6 +24,11 @@ spec:
         - |
           cp /configmap/* /go/src/data-assert/ && 
           sleep 1000000000
+      readinessProbe:
+        exec:
+          command: ["/bin/sh", "-c", "test -s /go/src/data-assert/main.go && test -s /go/src/data-assert/go.mod && test -s /go/src/data-assert/go.sum"]
+        periodSeconds: 2
+        timeoutSeconds: 2
       env:
         # Bound the compiler's parallelism. Two of these pods can be building at
         # once when tests run in parallel, and an unbounded `go build` peaked past

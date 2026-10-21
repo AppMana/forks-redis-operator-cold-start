@@ -135,8 +135,8 @@ spec:
         - script:
             timeout: 120s
             content: |
-              #!/bin/bash
-              set -euo pipefail
+              # Chainsaw runs script content through /bin/sh, not its shebang.
+              set -eu
               cluster=redis-cluster-v1beta2
               [ "$(kubectl -n "${NAMESPACE}" get rediscluster "$cluster" -o jsonpath='{.status.state}')" = Ready ]
               pod_uids() {
@@ -150,9 +150,9 @@ spec:
               for desired in 6000 5000; do
                 kubectl -n "${NAMESPACE}" patch rediscluster "$cluster" --type=merge \
                   -p "{\"spec\":{\"redisConfig\":{\"dynamicConfig\":[\"slowlog-log-slower-than $desired\"]}}}"
-                deadline=$((SECONDS+50))
+                deadline=$(($(date +%s)+50))
                 converged=false
-                while (( SECONDS < deadline )); do
+                while [ "$(date +%s)" -lt "$deadline" ]; do
                   converged=true
                   for role in leader follower; do
                     for ordinal in 0 1 2; do
@@ -187,6 +187,15 @@ spec:
                 exit 1
               fi
               exit 0
+
+    - name: Wait for data assertion helper
+      try:
+        - script:
+            timeout: 190s
+            content: |
+              set -eu
+              kubectl -n "${NAMESPACE}" wait pod/data-assert --for=condition=Ready --timeout=180s
+              kubectl -n "${NAMESPACE}" exec data-assert -c data-assert -- test -s /go/src/data-assert/main.go
 
     - name: Put data
       try:
