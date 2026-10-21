@@ -14,7 +14,8 @@ case "${2:-baseline}" in
   interrupted) namespace=redis-upgrade-canary-cluster-downscale-interrupted-routable ;;
   followers) namespace=redis-upgrade-canary-cluster-follower-downscale; leaders=3; followers=1; shrinking_role=follower ;;
   combined) namespace=redis-upgrade-canary-cluster-combined-downscale; followers=1 ;;
-  *) echo 'Expected baseline, interrupted, followers or combined'; exit 1 ;;
+  failover) namespace=redis-upgrade-canary-cluster-failover-downscale; followers=1 ;;
+  *) echo 'Expected baseline, interrupted, followers, combined or failover'; exit 1 ;;
 esac
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$namespace")
 cluster=redis-cluster-v1beta2
@@ -42,6 +43,25 @@ for i in 0 1 2; do
   [[ "$("${k[@]}" exec "$cluster-leader-$i" -c "$cluster-leader" -- redis-cli --raw DBSIZE)" -gt 0 ]]
   [[ "$("${k[@]}" exec "$cluster-leader-$i" -c "$cluster-leader" -- redis-cli SAVE)" == OK ]]
 done
+if [[ "${2:-baseline}" == failover ]]; then
+  "${k[@]}" annotate rediscluster "$cluster" rediscluster.opstreelabs.in/skip-reconcile=true
+  source_id="$("${k[@]}" exec "$cluster-leader-2" -c "$cluster-leader" -- redis-cli --raw CLUSTER MYID)"
+  [[ "$source_id" =~ ^[a-f0-9]{40}$ ]]
+  [[ "$("${k[@]}" exec "$cluster-follower-2" -c "$cluster-follower" -- redis-cli --raw CLUSTER REPLICATE "$source_id")" == OK ]]
+  deadline=$((SECONDS+60))
+  while ! "${k[@]}" exec "$cluster-follower-2" -c "$cluster-follower" -- redis-cli --raw INFO replication | tr -d '\r' | grep -qx 'master_link_status:up'; do
+    (( SECONDS < deadline )) || { echo 'FAIL: replica did not connect before failover'; exit 1; }
+    sleep 1
+  done
+  [[ "$("${k[@]}" exec "$cluster-follower-2" -c "$cluster-follower" -- redis-cli --raw CLUSTER FAILOVER)" == OK ]]
+  deadline=$((SECONDS+60))
+  while ! "${k[@]}" exec "$cluster-leader-2" -c "$cluster-leader" -- redis-cli --raw INFO replication | tr -d '\r' | grep -qx 'role:slave'; do
+    (( SECONDS < deadline )) || { echo 'FAIL: leader-2 did not become a replica'; exit 1; }
+    sleep 1
+  done
+  "${k[@]}" exec "$cluster-follower-2" -c "$cluster-follower" -- redis-cli --raw INFO replication | tr -d '\r' | grep -qx 'role:master'
+  echo 'Verified retiring leader-2 is a replica after normal failover to follower-2'
+fi
 if [[ "${2:-baseline}" == combined ]]; then
   # Guarantee an obsolete follower is attached to a retained shard. Attachment
   # to retiring leaders alone must not determine which followers get retired.
@@ -71,7 +91,7 @@ if [[ "${2:-baseline}" == interrupted ]]; then
   echo 'Injected interrupted retirement boundary: two members remain, StatefulSet still has three replicas'
   "${k[@]}" annotate rediscluster "$cluster" rediscluster.opstreelabs.in/skip-reconcile-
 else
-  patch="$(jq -cn --argjson leaders "$leaders" --argjson followers "$followers" '{spec:{clusterSize:$leaders,redisLeader:{replicas:$leaders},redisFollower:{replicas:$followers}}}')"
+  patch="$(jq -cn --argjson leaders "$leaders" --argjson followers "$followers" '{metadata:{annotations:{"rediscluster.opstreelabs.in/skip-reconcile":null}},spec:{clusterSize:$leaders,redisLeader:{replicas:$leaders},redisFollower:{replicas:$followers}}}')"
   "${k[@]}" patch rediscluster "$cluster" --type=merge -p "$patch"
 fi
 deadline=$((SECONDS+180))

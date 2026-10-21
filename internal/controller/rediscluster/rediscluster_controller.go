@@ -117,7 +117,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// We handle one failover per reconcile cycle and requeue — the loop will converge
 			// over successive reconciliations until all target pods are masters.
 			for i := int32(0); i < leaderReplicas; i++ {
-				if !(k8sutils.VerifyLeaderPod(ctx, r.K8sClient, instance, i)) {
+				isMaster, err := k8sutils.VerifyLeaderPod(ctx, r.K8sClient, instance, i)
+				if err != nil {
+					return intctrlutil.RequeueE(ctx, err, "cannot observe transfer target role")
+				}
+				if !isMaster {
 					logger.Info("Transfer target leader pod is not a master, initiating failover before scale-down", "Pod.Index", i)
 					if err = k8sutils.ClusterFailover(ctx, r.K8sClient, instance, i); err != nil {
 						logger.Error(err, "Failed to initiate cluster failover for transfer target")
@@ -136,18 +140,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 					continue
 				}
 				logger.Info("Remove the shard", "Shard.Index", shardIdx)
-				//  Imp if the last index of leader sts is not leader make it then
-				// check whether the redis is leader or not ?
-				// if not true then make it leader pod
-				if !(k8sutils.VerifyLeaderPod(ctx, r.K8sClient, instance, shardIdx)) {
-					// lastLeaderPod is slaving right now Make it the master Pod
-					// We have to bring a manual failover here to make it a leaderPod
-					// clusterFailover should also include the clusterReplicate since we have to map the followers to new leader
+				// A retiring leader ordinal may be a replica after failover.
+				// Observe its role rather than treating lookup failure as a replica.
+				isMaster, err := k8sutils.VerifyLeaderPod(ctx, r.K8sClient, instance, shardIdx)
+				if err != nil {
+					return intctrlutil.RequeueE(ctx, err, "cannot observe retiring shard role")
+				}
+				if !isMaster {
+					// OK acknowledges promotion, but does not prove it completed.
+					// Reobserve on the next pass before transferring any slots.
 					logger.Info("Cluster Failover is initiated", "Shard.Index", shardIdx)
 					if err = k8sutils.ClusterFailover(ctx, r.K8sClient, instance, shardIdx); err != nil {
 						logger.Error(err, "Failed to initiate cluster failover")
 						return intctrlutil.RequeueE(ctx, err, "")
 					}
+					return intctrlutil.RequeueAfter(ctx, time.Second*10, "Waiting for retiring shard promotion before resharding")
 				}
 				// Transfer and verify slots before retiring any replica copies.
 				// We round robin over the remaining nodes to pick a node where to move the shard to.

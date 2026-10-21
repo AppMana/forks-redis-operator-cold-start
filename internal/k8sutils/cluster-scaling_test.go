@@ -531,11 +531,12 @@ func Test_clusterStableNoOpenSlots_ReturnsFalse(t *testing.T) {
 
 func Test_verifyLeaderPodInfo(t *testing.T) {
 	tests := []struct {
-		name         string
-		section      string
-		response     string
-		err          error
-		expectedBool bool
+		name          string
+		section       string
+		response      string
+		err           error
+		expectedBool  bool
+		expectedError bool
 	}{
 		{
 			name:         "is master",
@@ -550,11 +551,17 @@ func Test_verifyLeaderPodInfo(t *testing.T) {
 			expectedBool: false,
 		},
 		{
-			name:         "redis info error",
-			section:      "replication",
-			err:          redis.ErrClosed,
-			expectedBool: false,
+			name:          "redis info error",
+			section:       "replication",
+			err:           redis.ErrClosed,
+			expectedBool:  false,
+			expectedError: true,
 		},
+		{name: "missing role", section: "replication", response: "connected_slaves:1\r\n", expectedError: true},
+		{name: "unknown role", section: "replication", response: "role:unknown\r\n", expectedError: true},
+		{name: "duplicate role", section: "replication", response: "role:master\r\nrole:slave\r\n", expectedError: true},
+		{name: "duplicate identical role", section: "replication", response: "role:slave\r\nrole:slave\r\n", expectedError: true},
+		{name: "LF role", section: "replication", response: "# Replication\nrole:master\n", expectedBool: true},
 	}
 
 	for _, tt := range tests {
@@ -568,7 +575,12 @@ func Test_verifyLeaderPodInfo(t *testing.T) {
 				mock.ExpectInfo(tt.section).SetVal(tt.response)
 			}
 
-			result := verifyLeaderPodInfo(ctx, client, "test-pod")
+			result, err := verifyLeaderPodInfo(ctx, client, "test-pod")
+			if tt.expectedError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 
 			assert.Equal(t, tt.expectedBool, result, "Test case: "+tt.name)
 

@@ -629,7 +629,7 @@ func RemoveRedisNodeFromCluster(ctx context.Context, client kubernetes.Interface
 }
 
 // verifyLeaderPod return true if the pod is leader/master
-func VerifyLeaderPod(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, leadIndex int32) bool {
+func VerifyLeaderPod(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, leadIndex int32) (bool, error) {
 	podName := cr.Name + "-leader-" + strconv.Itoa(int(leadIndex))
 
 	redisClient := configureRedisClient(ctx, client, cr, podName)
@@ -637,22 +637,28 @@ func VerifyLeaderPod(ctx context.Context, client kubernetes.Interface, cr *rcvb2
 	return verifyLeaderPodInfo(ctx, redisClient, podName)
 }
 
-func verifyLeaderPodInfo(ctx context.Context, redisClient *redis.Client, podName string) bool {
+func verifyLeaderPodInfo(ctx context.Context, redisClient *redis.Client, podName string) (bool, error) {
 	info, err := redisClient.Info(ctx, "replication").Result()
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to Get the role Info of the", "redis pod", podName)
-		return false
+		return false, fmt.Errorf("cannot observe Redis role for pod %s", podName)
 	}
 
-	lines := strings.Split(info, "\r\n")
+	lines := strings.Split(strings.ReplaceAll(info, "\r\n", "\n"), "\n")
 	var role string
+	seen := false
 	for _, line := range lines {
 		if strings.HasPrefix(line, "role:") {
+			if seen {
+				return false, fmt.Errorf("redis role observation is ambiguous")
+			}
+			seen = true
 			role = strings.TrimPrefix(line, "role:")
-			return role == "master"
 		}
 	}
-	return false
+	if role != "master" && role != "slave" {
+		return false, fmt.Errorf("redis role observation is missing or unknown")
+	}
+	return role == "master", nil
 }
 
 func ClusterFailover(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32) error {
