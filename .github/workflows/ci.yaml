@@ -3,6 +3,7 @@ on:
   pull_request:
     branches:
       - main
+      - cold-start-bootstrap
   # push:
   #   branches:
   #     - main
@@ -51,9 +52,14 @@ jobs:
         with:
           go-version: ${{ env.GOLANG_VERSION }}
       - name: Install integration test dependencies
-        run: make integration-test-setup
+        run: make envtest
       - name: Run Go Tests with coverage
-        run: go test ./... -coverprofile=coverage.txt -covermode=atomic
+        run: |
+          KUBEBUILDER_ASSETS="$(bin/setup-envtest-release-0.17 use --use-deprecated-gcs=false 1.31.0 -p path)"
+          test -n "$KUBEBUILDER_ASSETS"
+          export KUBEBUILDER_ASSETS
+          unset USE_EXISTING_CLUSTER
+          go test ./... -coverprofile=coverage.txt -covermode=atomic
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
