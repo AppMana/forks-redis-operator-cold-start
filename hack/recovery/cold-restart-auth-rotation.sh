@@ -35,5 +35,8 @@ for ordinal in 0 1 2; do
   reply="$("${k[@]}" get secret redis-auth-before-rotation -o json | jq -r '.data.password|@base64d' |
     "${k[@]}" exec -i "upgrade-$ordinal" -c upgrade -- sh -ec 'read -r REDISCLI_AUTH; export REDISCLI_AUTH; redis-cli --raw PING' 2>/dev/null)"
   if [[ "$reply" == PONG ]]; then echo "upgrade-$ordinal old credential still accepted"; else echo "upgrade-$ordinal old credential rejected"; fi
+  if [[ "${REQUIRE_PASSWORD_OVERLAP:-false}" == true ]]; then
+    [[ "$reply" == PONG ]] || { echo 'FAIL: password overlap did not survive bootstrap' >&2; exit 1; }
+  fi
 done
 echo 'PASS: new credentials survive full pod replacement with retained data, PVC UIDs and Sentinel identities'

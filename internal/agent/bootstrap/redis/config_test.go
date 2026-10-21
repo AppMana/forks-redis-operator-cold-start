@@ -353,6 +353,7 @@ func Test_validateACLDefaultUser(t *testing.T) {
 	}{
 		{name: "plaintext password matches", acl: "user alice on >alicepass ~* &* +@all\nuser default on >secret ~* &* +@all\n", password: "secret"},
 		{name: "sha256 hash matches", acl: "user default on #2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b ~* &* +@all\n", password: "secret"},
+		{name: "rotation overlap retains both password hashes", acl: "user default on #cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4 #2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b ~* &* +@all\n", password: "secret"},
 		{name: "trailing newline from secret is trimmed", acl: "user default on >secret ~* &* +@all\n", password: "secret\n"},
 		{name: "quoted arguments skip password comparison", acl: "user default on \">my secret\" ~* &* +@all\n", password: "other"},
 		{name: "empty password skips validation", acl: "user alice on >alicepass ~* &* +@all\n", password: ""},
