@@ -25,6 +25,7 @@ for ordinal in 0 1 2; do
     [[ "$info" == *$'role:slave\n'* && "$info" == *$'master_link_status:up\n'* ]]
   fi
   [[ "$(cli "$pod" GET appmana:upgrade:sentinel-regression)" == "$expected" ]]
+  [[ "$(cli "$pod" -n 1 GET appmana:upgrade:secondary-database)" == "$expected" ]]
 done
 [[ -n "$primary" ]]
 for ordinal in 0 1 2; do

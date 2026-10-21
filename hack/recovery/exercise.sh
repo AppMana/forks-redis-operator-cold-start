@@ -36,6 +36,7 @@ for attempt in {1..90}; do
 done
 [[ -n "$(primary)" ]]
 cli "$(primary)" SET appmana:upgrade:sentinel-regression preserved-20261020
+cli "$(primary)" -n 1 SET appmana:upgrade:secondary-database preserved-20261020
 converge
 echo "Scenario: Sentinel failover"
 before="$(primary)"
@@ -64,6 +65,33 @@ cli upgrade-sentinel-0 -p 26379 SENTINEL FAILOVER upgrade
 "${k[@]}" rollout status statefulset/upgrade --timeout=180s
 converge
 echo "Scenario: simultaneous data and Sentinel restart, PVCs retained"
+pods=(upgrade-0 upgrade-1 upgrade-2 upgrade-sentinel-0 upgrade-sentinel-1 upgrade-sentinel-2)
+uids=()
+sentinel_ids=()
+for pod in "${pods[@]}"; do
+  uids+=("$("${k[@]}" get pod "$pod" -o jsonpath='{.metadata.uid}')")
+done
+for ordinal in 0 1 2; do sentinel_ids+=("$(cli "upgrade-sentinel-$ordinal" -p 26379 SENTINEL MYID)"); done
+persistent="$("${k[@]}" get redissentinel upgrade -o json | jq -r '.spec.configVolumeClaimTemplate != null')"
+claims="$("${k[@]}" get pvc -o json | jq -c '[.items[]|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)')"
 "${k[@]}" delete pods -l 'app in (upgrade,upgrade-sentinel)' --wait=false
+deadline=$((SECONDS + 180))
+while (( SECONDS < deadline )); do
+  replaced=true
+  for i in "${!pods[@]}"; do
+    uid="$("${k[@]}" get pod "${pods[$i]}" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
+    [[ -n "$uid" && "$uid" != "${uids[$i]}" ]] || replaced=false
+  done
+  [[ "$replaced" == true ]] && break
+  sleep 2
+done
+[[ "$replaced" == true ]]
 converge
+[[ "$claims" == "$("${k[@]}" get pvc -o json | jq -c '[.items[]|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)')" ]]
+if [[ "$persistent" == true ]]; then
+  for ordinal in 0 1 2; do
+    [[ "${sentinel_ids[$ordinal]}" == "$(cli "upgrade-sentinel-$ordinal" -p 26379 SENTINEL MYID)" ]]
+  done
+  echo "PASS: all Sentinel identities and PVC UIDs retained across full restart"
+fi
 echo "PASS: recovery exercise"

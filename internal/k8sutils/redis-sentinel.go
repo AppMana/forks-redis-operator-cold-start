@@ -3,10 +3,12 @@ package k8sutils
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	rsvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redissentinel/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,6 +35,9 @@ type RedisSentinelService struct {
 
 // Redis Sentinel Create the Redis Sentinel Setup
 func CreateRedisSentinel(ctx context.Context, client kubernetes.Interface, cr *rsvb2.RedisSentinel, cl kubernetes.Interface, ctrlClient client.Client) error {
+	if cr.Spec.ConfigVolumeClaimTemplate != nil && !features.Enabled(features.GenerateConfigInInitContainer) {
+		return fmt.Errorf("Sentinel config persistence requires GenerateConfigInInitContainer; legacy entrypoints overwrite election state")
+	}
 	prop := RedisSentinelSTS{
 		RedisStateFulType:             "sentinel",
 		Affinity:                      cr.Spec.Affinity,
@@ -92,6 +97,7 @@ func generateRedisSentinelParams(ctx context.Context, cr *rsvb2.RedisSentinel, r
 		minreadyseconds = *cr.Spec.KubernetesConfig.MinReadySeconds
 	}
 	res := statefulSetParameters{
+		ConfigVolumeClaimTemplate:            cr.Spec.ConfigVolumeClaimTemplate,
 		Replicas:                             &replicas,
 		ClusterMode:                          false,
 		NodeConfVolume:                       false,
@@ -171,6 +177,11 @@ func generateRedisSentinelContainerParams(ctx context.Context, client kubernetes
 	}
 	if cr.Spec.EnvVars != nil {
 		containerProp.EnvVars = cr.Spec.EnvVars
+	}
+	if cr.Spec.ConfigVolumeClaimTemplate != nil {
+		env := append(ptr.Deref(containerProp.AdditionalEnvVariable, []corev1.EnvVar{}),
+			corev1.EnvVar{Name: "SENTINEL_PERSISTENCE_ENABLED", Value: "true"})
+		containerProp.AdditionalEnvVariable = &env
 	}
 	if cr.Spec.VolumeMount != nil {
 		containerProp.AdditionalVolume = cr.Spec.VolumeMount.Volume

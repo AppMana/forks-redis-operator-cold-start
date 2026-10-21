@@ -45,6 +45,16 @@ sentinel deny-scripts-reconfig yes
 
 func GenerateConfig() error {
 	confPath, _ := util.CoalesceEnv("SENTINEL_CONFIG_FILE", "/etc/redis/sentinel.conf")
+	var monitor []string
+	var election [][]string
+	persistent := util.CoalesceEnv1("SENTINEL_PERSISTENCE_ENABLED", "false") == "true"
+	if persistent {
+		var err error
+		monitor, election, err = retainedElection(confPath, util.CoalesceEnv1("MASTER_GROUP_NAME", "mymaster"))
+		if err != nil {
+			return err
+		}
+	}
 	cfg := agentutil.NewConfig(confPath, defaultSentinelConfig)
 
 	// set_sentinel_password
@@ -71,12 +81,17 @@ func GenerateConfig() error {
 		resolveHostnames, _ := util.CoalesceEnv("RESOLVE_HOSTNAMES", "no")
 		announceHostnames, _ := util.CoalesceEnv("ANNOUNCE_HOSTNAMES", "no")
 
-		cfg.Append("sentinel monitor", masterGroupName, ip, port, quorum)
+		// DNS must be enabled before Redis parses a retained hostname monitor.
+		cfg.Append("sentinel resolve-hostnames", resolveHostnames)
+		cfg.Append("sentinel announce-hostnames", announceHostnames)
+		if monitor != nil {
+			cfg.Append("sentinel monitor", masterGroupName, monitor[3], monitor[4], quorum)
+		} else {
+			cfg.Append("sentinel monitor", masterGroupName, ip, port, quorum)
+		}
 		cfg.Append("sentinel down-after-milliseconds", masterGroupName, downAfterMilliseconds)
 		cfg.Append("sentinel parallel-syncs", masterGroupName, parallelSyncs)
 		cfg.Append("sentinel failover-timeout", masterGroupName, failoverTimeout)
-		cfg.Append("sentinel resolve-hostnames", resolveHostnames)
-		cfg.Append("sentinel announce-hostnames", announceHostnames)
 
 		// If master password is set
 		if masterPassword, ok := util.CoalesceEnv("MASTER_PASSWORD", ""); ok {
@@ -84,7 +99,7 @@ func GenerateConfig() error {
 		}
 
 		// If sentinel ID is set
-		if sentinelID, ok := util.CoalesceEnv("SENTINEL_ID", ""); ok {
+		if sentinelID, ok := util.CoalesceEnv("SENTINEL_ID", ""); ok && monitor == nil {
 			// Note: We should use SHA1 hash here, but since we don't have a direct SHA1 function,
 			// we're simply using the sentinelID as myid
 			// In a real application, SHA1 hash functionality should be implemented
@@ -148,8 +163,14 @@ func GenerateConfig() error {
 	externalConfigFile, _ := util.CoalesceEnv("EXTERNAL_CONFIG_FILE", "/etc/redis/external.conf.d/redis-sentinel-additional.conf")
 	expandExternal, _ := util.CoalesceEnv(consts.ENV_KEY_EXPAND_EXTERNAL_CONFIG, "false")
 	cfg.AppendExternalConfig(externalConfigFile, expandExternal == "true")
+	for _, fields := range election {
+		cfg.Append(fields...)
+	}
 
 	// Commit configuration
+	if persistent {
+		return cfg.CommitAtomic()
+	}
 	if err := cfg.Commit(); err != nil {
 		return err
 	}

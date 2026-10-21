@@ -61,6 +61,39 @@ func (c *Config) Commit() error {
 	return os.WriteFile(c.path, []byte(c.content), 0o644)
 }
 
+// CommitAtomic never truncates the only persisted copy of an election.
+func (c *Config) CommitAtomic() error {
+	dir := filepath.Dir(c.path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".sentinel-config-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.WriteString(c.content); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(f.Name(), c.path); err != nil {
+		return err
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 func (c *Config) AppendExternalConfig(externalConfigFile string, expand bool) *Config {
 	if _, err := os.Stat(externalConfigFile); err != nil {
 		return c

@@ -7,6 +7,14 @@ import (
 )
 
 type RedisSentinelSpec struct {
+	// ConfigVolumeClaimTemplate persists Sentinel identity, monitor and election
+	// epochs across pod replacement. Requires GenerateConfigInInitContainer.
+	// Enable resolveHostnames and announceHostnames to retain primary identity
+	// when Redis pod IPs change.
+	// Existing StatefulSets need an explicit orphan/adopt migration because
+	// Kubernetes does not allow adding claim templates in place.
+	// +optional
+	ConfigVolumeClaimTemplate *corev1.PersistentVolumeClaim `json:"configVolumeClaimTemplate,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=3
 	Size                          *int32                            `json:"clusterSize"`

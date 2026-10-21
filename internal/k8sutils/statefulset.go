@@ -95,6 +95,7 @@ const (
 
 // statefulSetParameters will define statefulsets input params
 type statefulSetParameters struct {
+	ConfigVolumeClaimTemplate            *corev1.PersistentVolumeClaim
 	Replicas                             *int32
 	ClusterMode                          bool
 	ClusterVersion                       *string
@@ -345,6 +346,12 @@ func generateStatefulSetsDef(stsMeta metav1.ObjectMeta, params statefulSetParame
 	}
 
 	statefulset.Spec.Template.Spec.InitContainers = generateInitContainerDef(containerParams.Role, stsMeta.GetName(), initcontainerParams, params.ExternalConfig, initcontainerParams.AdditionalMountPath, containerParams, params.ClusterVersion)
+	if params.ConfigVolumeClaimTemplate != nil {
+		// The claim supplies the config volume. Do not shadow it with emptyDir.
+		statefulset.Spec.Template.Spec.Volumes = nil
+		statefulset.Spec.VolumeClaimTemplates = append(statefulset.Spec.VolumeClaimTemplates,
+			createPVCTemplate(common.VolumeNameConfig, stsMeta, *params.ConfigVolumeClaimTemplate))
+	}
 
 	if params.PodManagementPolicy != nil {
 		statefulset.Spec.PodManagementPolicy = appsv1.PodManagementPolicyType(*params.PodManagementPolicy)
