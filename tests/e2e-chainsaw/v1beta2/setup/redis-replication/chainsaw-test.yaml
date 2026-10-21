@@ -96,6 +96,20 @@ spec:
             check:
               (contains($stdout, 'matched')): true
 
+    - name: Assert every sentinel has a usable quorum
+      try:
+        - script:
+            timeout: 210s
+            content: |
+              set -eu
+              for ordinal in 0 1 2; do
+                ./wait-for.sh 60 1 "kubectl --request-timeout=5s -n ${NAMESPACE} exec redis-replication-s-${ordinal} -c sentinel -- redis-cli -p 26379 SENTINEL CKQUORUM mymaster | grep -c '^OK 3 usable Sentinels'"
+              done
+              echo 'PASS:all three Sentinels have usable quorum'
+            check:
+              ($error == null): true
+              (contains($stdout, 'PASS:all three Sentinels have usable quorum')): true
+
     - name: Assert hostname announcements are off by default
       try:
         - script:

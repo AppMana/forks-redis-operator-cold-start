@@ -594,6 +594,11 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 	incompleteTopology := !topology.Complete()
 	if r.Client != nil || r.SentinelElectedMaster != nil {
 		if elected, ok := r.sentinelElectedMaster(ctx, instance); ok && (elected == "" || !slices.Contains(masterNodes, elected)) {
+			if elected == "" && r.Client != nil {
+				if _, err := r.initializeEmbeddedSentinelPlaceholder(ctx, instance, topology); err != nil {
+					return intctrlutil.RequeueE(ctx, err, "cannot initialize Sentinel placeholder")
+				}
+			}
 			return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "waiting for Sentinel-elected primary to report master")
 		}
 	}
