@@ -154,49 +154,7 @@ func (c *service) GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, err
 		return nil, err
 	}
 
-	info := &InfoSentinelResult{}
-
-	// Parse sentinel section
-	// Expected format: master0:name=myMaster,status=ok,address=10.233.93.209:6379,slaves=2,sentinels=1
-	for _, line := range strings.Split(result, "\r\n") {
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if strings.HasPrefix(line, "master") && strings.Contains(line, ":") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) != 2 {
-				continue
-			}
-
-			masterData := make(map[string]string)
-			for _, pair := range strings.Split(parts[1], ",") {
-				kv := strings.SplitN(pair, "=", 2)
-				if len(kv) == 2 {
-					masterData[kv[0]] = kv[1]
-				}
-			}
-
-			master := SentinelMasterInfo{
-				Name:    masterData["name"],
-				Status:  masterData["status"],
-				Address: masterData["address"],
-			}
-			if slavesStr, ok := masterData["slaves"]; ok {
-				if slaves, err := strconv.Atoi(slavesStr); err == nil {
-					master.Slaves = slaves
-				}
-			}
-			if sentinelsStr, ok := masterData["sentinels"]; ok {
-				if sentinels, err := strconv.Atoi(sentinelsStr); err == nil {
-					master.Sentinels = sentinels
-				}
-			}
-
-			info.Masters = append(info.Masters, master)
-		}
-	}
-
-	return info, nil
+	return parseSentinelInfo(result)
 }
 
 func (c *service) SentinelGetMasterAddrByName(ctx context.Context, masterGroupName string) (string, string, bool, error) {

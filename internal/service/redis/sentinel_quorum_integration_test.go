@@ -52,6 +52,13 @@ func TestSentinelQuorumIntegration(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, db.Do(ctx, "SENTINEL", "CONFIG", "SET", "resolve-hostnames", "yes").Err())
 	svc := NewClient().Connect(&ConnectionInfo{Host: "127.0.0.1", Port: "26379"})
+	info, err := svc.GetInfoSentinel(ctx)
+	require.NoError(t, err)
+	require.Len(t, info.Masters, 1)
+	observed, found := info.Master("upgrade")
+	require.True(t, found)
+	require.Zero(t, observed.Slaves)
+	require.Equal(t, 1, observed.Sentinels)
 	require.Eventually(t, func() bool {
 		healthy, err := svc.SentinelMonitorHealthy(ctx, "upgrade")
 		return err == nil && healthy
