@@ -5,19 +5,24 @@ set -euo pipefail
 config="${1:?usage: sentinel-partition.sh LOCAL_KUBECONFIG EXPECTED_VALUE}"
 expected="${2:?existing value required}"
 context="$(kubectl --kubeconfig "$config" config current-context)"
-[[ "$context" == kind-redis-recovery-20261020 ]] || exit 2
+case "$context" in
+  kind-redis-recovery-20261020|kind-redis-recovery-qualified-20261021) ;;
+  *) exit 2 ;;
+esac
 server="$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 [[ "$server" == https://127.0.0.1:* ]] || exit 2
 export CANARY_NAMESPACE="${CANARY_NAMESPACE:?explicit canary namespace required}"
 [[ "$CANARY_NAMESPACE" == redis-upgrade-canary* ]] || exit 2
-node=redis-recovery-20261020-control-plane
+cluster=${context#kind-}
+node=$cluster-control-plane
+[[ "$(docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$node")" == "$cluster" ]]
 dir="$(cd "$(dirname "$0")" && pwd)"
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$CANARY_NAMESPACE")
 bash "$dir/check.sh" "$config" "$expected"
 primary="$("${k[@]}" get pods -l app=upgrade,redis-role=master -o json | jq -er 'if (.items|length)==1 then .items[0].metadata.name else error("ambiguous primary") end')"
 [[ "$("${k[@]}" get pod "$primary" -o jsonpath='{.spec.nodeName}')" == "$node" ]]
 container="$("${k[@]}" get pod "$primary" -o jsonpath='{.status.containerStatuses[?(@.name=="upgrade")].containerID}')"
-[[ "$container" == containerd://* ]] || exit 2
+[[ "$container" =~ ^containerd://[a-f0-9]{64}$ ]] || exit 2
 container="${container#containerd://}"
 pid="$(docker exec "$node" crictl inspect "$container" | jq -er '.info.pid')"
 [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || exit 2
@@ -26,17 +31,24 @@ mapfile -t peers < <("${k[@]}" get pods -l app=upgrade-sentinel -o json | jq -r 
 for peer in "${peers[@]}"; do [[ "$peer" =~ ^10\.244\.[0-9]+\.[0-9]+$ ]] || exit 2; done
 # Unique owned chain. Never flush or alter existing chains/rules.
 chain="AMTEST$$"
-net() { docker exec "$node" nsenter -t "$pid" -n -- iptables -w 3 "$@"; }
+netns="$(docker exec "$node" readlink "/proc/$pid/ns/net")"
+net() {
+  # Never target a reused PID after a container exits.
+  [[ "$(docker exec "$node" readlink "/proc/$pid/ns/net")" == "$netns" ]] || return 1
+  docker exec "$node" nsenter -t "$pid" -n -- iptables -w 3 "$@"
+}
 cleanup() {
   net -D INPUT -j "$chain" 2>/dev/null || true
   net -F "$chain" 2>/dev/null || true
   net -X "$chain" 2>/dev/null || true
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 net -N "$chain"
 for peer in "${peers[@]}"; do net -A "$chain" -s "$peer" -p tcp --dport 6379 -j DROP; done
 # Independent bounded cleanup also survives termination of this driver.
-docker exec -d "$node" sh -c 'sleep 120; nsenter -t "$1" -n -- iptables -w 3 -D INPUT -j "$2"; nsenter -t "$1" -n -- iptables -w 3 -F "$2"; nsenter -t "$1" -n -- iptables -w 3 -X "$2"' sh "$pid" "$chain"
+# Enter the namespace before sleeping, so watchdog cleanup cannot follow PID reuse.
+docker exec -d "$node" nsenter -t "$pid" -n -- sh -c 'sleep 120; iptables -w 3 -D INPUT -j "$1"; iptables -w 3 -F "$1"; iptables -w 3 -X "$1"' sh "$chain"
 net -I INPUT 1 -j "$chain"
 echo "Partitioned Sentinel traffic to $primary; operator and replicas remain connected"
 changed=false

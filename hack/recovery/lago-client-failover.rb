@@ -60,7 +60,7 @@ threads = clients.map do |kind, client|
         raise "read-after-write mismatch" unless client.get(key) == value
         process_ids[client.info.fetch("run_id")] = true
         last_success = clock.call
-        puts "READY #{mode}/#{kind}" if acknowledgements.size == 1
+        puts "READY #{mode}/#{kind} retained_prefix=#{prefix}" if acknowledgements.size == 1
       rescue Redis::BaseError, RedisClient::Error => error
         # Do not log URLs or credentials. Failed writes may be ambiguous.
         errors[error.class.name] += 1
@@ -71,8 +71,12 @@ threads = clients.map do |kind, client|
     raise "no observed primary change" unless process_ids.size >= 2
     raise "insufficient acknowledged writes" if acknowledgements.size < 20
     raise "client unhealthy at end" if clock.call - last_success > 2
-    acknowledgements.each do |key, value|
-      raise "acknowledged write missing or changed" unless client.get(key) == value
+    missing = acknowledgements.filter_map do |key, value|
+      key.delete_prefix("#{prefix}:") unless client.get(key) == value
+    end
+    unless missing.empty?
+      puts "FAIL #{mode}/#{kind}: acknowledged=#{acknowledgements.size}, missing_or_changed=#{missing.size}, indices=#{missing.join(',')}, processes=#{process_ids.size}, errors=#{errors}, retained_prefix=#{prefix}"
+      raise "acknowledged write missing or changed"
     end
     puts "PASS #{mode}/#{kind}: acknowledged=#{acknowledgements.size}, processes=#{process_ids.size}, errors=#{errors}, retained_prefix=#{prefix}"
   ensure
