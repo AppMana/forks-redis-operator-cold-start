@@ -10,4 +10,4 @@ docker run --rm --network none \
   --mount "type=bind,src=$testdir/redis.test,dst=/redis.test,readonly" \
   -e REDIS_SENTINEL_QUORUM_TEST=1 \
   "${REDIS_QUORUM_TEST_IMAGE:-redis:7.0.15}" \
-  /redis.test -test.run '^TestSentinelQuorumIntegration$' -test.v
+  /redis.test -test.run '^TestSentinel(Quorum|MigrationInterruption)Integration$' -test.v
