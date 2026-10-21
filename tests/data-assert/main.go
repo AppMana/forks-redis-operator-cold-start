@@ -38,20 +38,27 @@ var (
 )
 
 func main() {
+	if err := newRootCommand().Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newRootCommand() *cobra.Command {
 	rootCmd := &cobra.Command{
-		Use: "data-assert",
+		Use:          "data-assert",
+		SilenceUsage: true,
 	}
 	rootCmd.AddCommand(&cobra.Command{
 		Use: "gen-resource-yaml",
 		Run: genResourceYamlCmd,
 	})
 	rootCmd.AddCommand(&cobra.Command{
-		Use: "gen-redis-data",
-		Run: printFlags(genRedisDataCmd),
+		Use:  "gen-redis-data",
+		RunE: genRedisDataCmd,
 	})
 	rootCmd.AddCommand(&cobra.Command{
-		Use: "chk-redis-data",
-		Run: printFlags(chkRedisDataCmd),
+		Use:  "chk-redis-data",
+		RunE: chkRedisDataCmd,
 	})
 
 	// add flags
@@ -61,21 +68,11 @@ func main() {
 	rootCmd.PersistentFlags().BoolVarP(&tlsFlag, "tls", "T", false, "enable tls")
 	rootCmd.PersistentFlags().StringVarP(&sentinelPass, sentinelPassFlag, "S", "", "redis sentinel password")
 	rootCmd.PersistentFlags().StringVar(&masterName, masterNameFlag, "myMaster", "redis sentinel master name")
-	rootCmd.Execute()
+	return rootCmd
 }
 
-type cmdWrapperFunc func(cmd *cobra.Command, args []string)
-
-// printFlags print flags
-func printFlags(cmdWrapperFunc cmdWrapperFunc) cmdWrapperFunc {
-	return func(cmd *cobra.Command, args []string) {
-		fmt.Printf("host: %s, password: %s, mode: %s\n", host, pass, mode)
-		cmdWrapperFunc(cmd, args)
-	}
-}
-
-func genRedisDataCmd(cmd *cobra.Command, args []string) {
-	ctx := context.Background()
+func genRedisDataCmd(cmd *cobra.Command, args []string) error {
+	ctx := cmd.Context()
 	// Split host string by comma
 	hosts := strings.Split(host, ",")
 	for i := range hosts {
@@ -84,8 +81,7 @@ func genRedisDataCmd(cmd *cobra.Command, args []string) {
 
 	rdb, err := createRedisClient(mode, hosts, pass, sentinelPass, masterName, tlsFlag)
 	if err != nil {
-		fmt.Printf("failed to create redis client: %v\n", err)
-		return
+		return fmt.Errorf("failed to create redis client: %w", err)
 	}
 	defer rdb.Close()
 
@@ -95,11 +91,11 @@ func genRedisDataCmd(cmd *cobra.Command, args []string) {
 		value := fmt.Sprintf("value-%d", i)
 		err := rdb.Set(ctx, key, value, 0).Err()
 		if err != nil {
-			fmt.Printf("failed to set key %s: %v\n", key, err)
-			return
+			return fmt.Errorf("failed to set key %s: %w", key, err)
 		}
 	}
-	fmt.Printf("[OK] successfully generated %d keys\n", totalKey)
+	fmt.Fprintf(cmd.OutOrStdout(), "[OK] successfully generated %d keys\n", totalKey)
+	return nil
 }
 
 // DataError represents data consistency check errors
@@ -113,20 +109,15 @@ func (e *DataError) Error() string {
 		e.ExpectedCount, e.ActualCount, e.ExpectedCount-e.ActualCount)
 }
 
-func chkRedisDataCmd(cmd *cobra.Command, args []string) {
-	if err := checkRedisData(); err != nil {
-		if dataErr, ok := err.(*DataError); ok {
-			fmt.Printf("Data consistency check failed: %s\n", dataErr.Error())
-			os.Exit(1)
-		}
-		fmt.Printf("Error occurred during check: %v\n", err)
-		os.Exit(1)
+func chkRedisDataCmd(cmd *cobra.Command, args []string) error {
+	if err := checkRedisData(cmd.Context()); err != nil {
+		return err
 	}
-	fmt.Printf("[OK] Data consistency check passed! All %d keys exist\n", totalKey)
+	fmt.Fprintf(cmd.OutOrStdout(), "[OK] Data consistency check passed! All %d keys and values match\n", totalKey)
+	return nil
 }
 
-func checkRedisData() error {
-	ctx := context.Background()
+func checkRedisData(ctx context.Context) error {
 	// Split host string by comma
 	hosts := strings.Split(host, ",")
 	for i := range hosts {
