@@ -12,8 +12,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+func TestEmbeddedSentinelHonorsUpdateStrategy(t *testing.T) {
+	for _, strategy := range []appsv1.StatefulSetUpdateStrategy{
+		{Type: appsv1.OnDeleteStatefulSetStrategyType},
+		{Type: appsv1.RollingUpdateStatefulSetStrategyType, RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{Partition: ptr.To(int32(2))}},
+	} {
+		t.Run(string(strategy.Type), func(t *testing.T) {
+			rr := persistentEmbeddedReplication()
+			rr.Spec.Sentinel.UpdateStrategy = strategy
+			sts := newSentinelStatefulSet(rr, rr.SentinelHLService())
+			require.Equal(t, strategy, sts.Spec.UpdateStrategy)
+			if sts.Spec.UpdateStrategy.RollingUpdate != nil {
+				*sts.Spec.UpdateStrategy.RollingUpdate.Partition = 0
+				require.Equal(t, int32(2), *rr.Spec.Sentinel.UpdateStrategy.RollingUpdate.Partition)
+			}
+		})
+	}
+}
 
 func persistentEmbeddedReplication() *rrvb2.RedisReplication {
 	return &rrvb2.RedisReplication{

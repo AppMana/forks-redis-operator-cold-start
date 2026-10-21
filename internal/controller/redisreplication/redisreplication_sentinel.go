@@ -93,6 +93,9 @@ func newSentinelStatefulSet(rr *rrvb2.RedisReplication, svcName string) appsv1.S
 		ServiceName:     svcName,
 		PodTemplateSpec: buildSentinelPodTemplate(rr, labels),
 	})
+	// Respect migration holds and partitioned rollouts rather than silently
+	// allowing the API default (RollingUpdate) to replace every Sentinel pod.
+	rr.Spec.Sentinel.UpdateStrategy.DeepCopyInto(&sts.Spec.UpdateStrategy)
 	if claim := rr.Spec.Sentinel.ConfigVolumeClaimTemplate; claim != nil {
 		copy := claim.DeepCopy()
 		copy.Name = common.VolumeNameConfig
