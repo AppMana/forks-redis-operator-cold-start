@@ -195,7 +195,10 @@ spec:
             content: |
               set -eu
               if ! kubectl -n "${NAMESPACE}" wait pod/data-assert --for=condition=Ready --timeout=180s; then
-                kubectl -n "${NAMESPACE}" get pod/data-assert -o 'custom-columns=PHASE:.status.phase,WAITING:.status.containerStatuses[*].state.waiting.reason,TERMINATED:.status.containerStatuses[*].state.terminated.reason,EXIT:.status.containerStatuses[*].state.terminated.exitCode,RESTARTS:.status.containerStatuses[*].restartCount'
+                columns='PHASE:.status.phase,WAITING:.status.containerStatuses[*].state.waiting.reason'
+                columns="$columns,TERMINATED:.status.containerStatuses[*].state.terminated.reason"
+                columns="$columns,EXIT:.status.containerStatuses[*].state.terminated.exitCode,RESTARTS:.status.containerStatuses[*].restartCount"
+                kubectl -n "${NAMESPACE}" get pod/data-assert -o "custom-columns=$columns"
                 exit 1
               fi
               kubectl -n "${NAMESPACE}" exec data-assert -c data-assert -- test -s /go/src/data-assert/main.go
