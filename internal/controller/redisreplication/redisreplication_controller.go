@@ -54,6 +54,7 @@ type Reconciler struct {
 	RealMaster              func(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string
 	SentinelElectedMaster   func(ctx context.Context, instance *rrvb2.RedisReplication) (string, bool)
 	ResumeSentinelBootstrap func(context.Context, *rrvb2.RedisReplication, k8sutils.RedisReplicationTopology) (bool, error)
+	SentinelClient          redis.Client
 }
 
 func (r *Reconciler) observeRoles(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error) {

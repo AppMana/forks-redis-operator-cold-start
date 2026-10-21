@@ -24,6 +24,10 @@ import (
 // Sentinel cannot hold up role publication for the others.
 const sentinelQueryTimeout = 2 * time.Second
 
+// RecoverySentinelOwnerLabel associates additional voters with a managed
+// Sentinel StatefulSet for read-only election observation, not lifecycle control.
+const RecoverySentinelOwnerLabel = "redis.redis.opstreelabs.in/sentinel-owner"
+
 // sentinelGroup is one Sentinel deployment that monitors a RedisReplication:
 // the embedded Sentinel of spec.sentinel, or a RedisSentinel whose
 // redisReplicationName names it.
@@ -44,9 +48,13 @@ func listSentinelGroups(ctx context.Context, r client.Reader, rr *rrvb2.RedisRep
 		)); err != nil {
 			return nil, err
 		}
+		additional, err := additionalSentinelPods(ctx, r, rr.Namespace, rr.SentinelStatefulSet(), &pods)
+		if err != nil {
+			return nil, err
+		}
 		groups = append(groups, sentinelGroup{
 			masterGroup: masterGroupName,
-			size:        rr.Spec.Sentinel.Size,
+			size:        rr.Spec.Sentinel.Size + additional,
 			pods:        pods.Items,
 			password:    rr.Spec.Sentinel.ExistingPasswordSecret,
 		})
@@ -67,15 +75,39 @@ func listSentinelGroups(ctx context.Context, r client.Reader, rr *rrvb2.RedisRep
 		)); err != nil {
 			return nil, err
 		}
+		additional, err := additionalSentinelPods(ctx, r, rs.Namespace, rs.GetStatefulSetName(), &pods)
+		if err != nil {
+			return nil, err
+		}
 		groups = append(groups, sentinelGroup{
 			masterGroup: config.MasterGroupName,
-			size:        *rs.Spec.Size,
+			size:        *rs.Spec.Size + additional,
 			pods:        pods.Items,
 			password:    rs.Spec.KubernetesConfig.ExistingPasswordSecret,
 			tls:         rs.Spec.TLS,
 		})
 	}
 	return groups, nil
+}
+
+func additionalSentinelPods(ctx context.Context, reader client.Reader, namespace, owner string, pods *corev1.PodList) (int32, error) {
+	var additional corev1.PodList
+	if err := reader.List(ctx, &additional, client.InNamespace(namespace), client.MatchingLabels{RecoverySentinelOwnerLabel: owner}); err != nil {
+		return 0, err
+	}
+	seen := map[string]bool{}
+	for _, pod := range pods.Items {
+		seen[pod.Name] = true
+	}
+	var count int32
+	for _, pod := range additional.Items {
+		if !seen[pod.Name] {
+			pods.Items = append(pods.Items, pod)
+			seen[pod.Name] = true
+			count++
+		}
+	}
+	return count, nil
 }
 
 // sentinelElectedMaster asks every Sentinel that monitors rr which address it
@@ -107,7 +139,10 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 		return "", true
 	}
 	checker := redishealer.NewChecker(r.K8sClient)
-	redisClient := redis.NewClient()
+	redisClient := r.SentinelClient
+	if redisClient == nil {
+		redisClient = redis.NewClient()
+	}
 	elected := ""
 	for _, group := range groups {
 		// Before any Sentinel pods exist, initial Redis bootstrap must be able
@@ -122,9 +157,10 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			return "", true
 		}
 		var (
-			mu      sync.Mutex
-			wg      sync.WaitGroup
-			answers []string
+			mu         sync.Mutex
+			wg         sync.WaitGroup
+			answers    []string
+			electorate = max(group.size, int32(len(group.pods)))
 		)
 		for _, pod := range group.pods {
 			if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
@@ -136,17 +172,29 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 				defer wg.Done()
 				queryCtx, cancel := context.WithTimeout(ctx, sentinelQueryTimeout)
 				defer cancel()
-				host, port, monitored, err := redisClient.Connect(connInfo).SentinelGetMasterAddrByName(queryCtx, group.masterGroup)
+				service := redisClient.Connect(connInfo)
+				host, port, monitored, err := service.SentinelGetMasterAddrByName(queryCtx, group.masterGroup)
 				if err != nil {
 					logger.V(1).Info("Sentinel did not answer", "sentinel", name, "error", err.Error())
 					return
 				}
 				answer := ""
+				known := int32(0)
 				if monitored {
+					info, err := service.GetInfoSentinel(queryCtx)
+					if err != nil {
+						return // Unknown membership cannot contribute an election vote.
+					}
+					master, found := info.Master(group.masterGroup)
+					if !found || master.Sentinels < 1 {
+						return
+					}
+					known = int32(master.Sentinels)
 					answer = canonicalSentinelAddress(pods.Items, net.JoinHostPort(host, port))
 				}
 				mu.Lock()
 				answers = append(answers, answer)
+				electorate = max(electorate, known)
 				mu.Unlock()
 			}(pod.Name)
 		}
@@ -154,7 +202,6 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 		// Include surplus pods during replacement/downscale in the electorate,
 		// including unreachable or terminating members. Otherwise a configured
 		// size smaller than the live inventory can admit competing majorities.
-		electorate := max(group.size, int32(len(group.pods)))
 		addr, ok := majorityAddress(answers, electorate)
 		if !ok {
 			if sentinelsUnconfigured(answers, electorate) {
