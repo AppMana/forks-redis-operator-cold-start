@@ -12,7 +12,8 @@ case "${2:-baseline}" in
   baseline) ;;
   interrupted) namespace=redis-upgrade-canary-cluster-downscale-interrupted-routable ;;
   followers) namespace=redis-upgrade-canary-cluster-follower-downscale; followers=3 ;;
-  *) echo 'Expected baseline, interrupted or followers'; exit 1 ;;
+  combined) namespace=redis-upgrade-canary-cluster-combined-downscale; followers=3 ;;
+  *) echo 'Expected baseline, interrupted, followers or combined'; exit 1 ;;
 esac
 [[ -z "$("${k[@]}" get namespace "$namespace" --ignore-not-found -o name)" ]]
 "${k[@]}" create namespace "$namespace"

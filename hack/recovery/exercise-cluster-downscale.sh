@@ -13,7 +13,8 @@ case "${2:-baseline}" in
   baseline) ;;
   interrupted) namespace=redis-upgrade-canary-cluster-downscale-interrupted-routable ;;
   followers) namespace=redis-upgrade-canary-cluster-follower-downscale; leaders=3; followers=1; shrinking_role=follower ;;
-  *) echo 'Expected baseline, interrupted or followers'; exit 1 ;;
+  combined) namespace=redis-upgrade-canary-cluster-combined-downscale; followers=1 ;;
+  *) echo 'Expected baseline, interrupted, followers or combined'; exit 1 ;;
 esac
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$namespace")
 cluster=redis-cluster-v1beta2
@@ -41,6 +42,15 @@ for i in 0 1 2; do
   [[ "$("${k[@]}" exec "$cluster-leader-$i" -c "$cluster-leader" -- redis-cli --raw DBSIZE)" -gt 0 ]]
   [[ "$("${k[@]}" exec "$cluster-leader-$i" -c "$cluster-leader" -- redis-cli SAVE)" == OK ]]
 done
+if [[ "${2:-baseline}" == combined ]]; then
+  # Guarantee an obsolete follower is attached to a retained shard. Attachment
+  # to retiring leaders alone must not determine which followers get retired.
+  retained_id="$("${k[@]}" exec "$cluster-leader-0" -c "$cluster-leader" -- redis-cli --raw CLUSTER MYID)"
+  [[ "$retained_id" =~ ^[a-f0-9]{40}$ ]]
+  [[ "$("${k[@]}" exec "$cluster-follower-2" -c "$cluster-follower" -- redis-cli --raw CLUSTER REPLICATE "$retained_id")" == OK ]]
+  "${k[@]}" exec "$cluster-follower-2" -c "$cluster-follower" -- redis-cli --raw CLUSTER NODES | awk -v id="$retained_id" '$3 ~ /myself/ {found=1; good=($3 ~ /slave/ && $4==id)} END {exit !(found && good)}'
+  echo 'Verified obsolete follower-2 follows retained leader-0 before combined shrink'
+fi
 if [[ "${2:-baseline}" == interrupted ]]; then
   # Model the persisted boundary after the first retirement succeeded and the
   # reconcile stopped. Do not let the controller race this setup. This is a
@@ -67,9 +77,14 @@ fi
 deadline=$((SECONDS+180))
 converged=false
 while (( SECONDS < deadline )); do
-  replicas="$("${k[@]}" get sts "$cluster-$shrinking_role" -o jsonpath='{.spec.replicas}')"
-  count="$("${k[@]}" get pods -l app="$cluster-$shrinking_role" -o json | jq '.items|length')"
-  if [[ "$replicas" == 1 && "$count" == 1 ]]; then converged=true; break; fi
+  converged=true
+  for role in leader follower; do
+    expected="$leaders"; [[ "$role" == leader ]] || expected="$followers"
+    replicas="$("${k[@]}" get sts "$cluster-$role" -o jsonpath='{.spec.replicas}')"
+    count="$("${k[@]}" get pods -l app="$cluster-$role" -o json | jq '.items|length')"
+    if [[ "$replicas" != "$expected" || "$count" != "$expected" ]]; then converged=false; fi
+  done
+  [[ "$converged" == true ]] && break
   sleep 2
 done
 [[ "$converged" == true ]] || { echo 'FAIL: three-to-one downscale did not finish within 180s; fixture and PVCs retained'; exit 1; }
