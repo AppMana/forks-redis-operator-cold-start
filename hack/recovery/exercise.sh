@@ -7,7 +7,9 @@ context="$(kubectl --kubeconfig "$config" config current-context)"
 server="$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
 [[ "$server" == https://127.0.0.1:* ]] || { echo "Refusing non-local server" >&2; exit 2; }
 dir="$(cd "$(dirname "$0")" && pwd)"
-k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n redis-upgrade-canary)
+export CANARY_NAMESPACE="${CANARY_NAMESPACE:-redis-upgrade-canary}"
+[[ "$CANARY_NAMESPACE" == redis-upgrade-canary* ]] || exit 2
+k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$CANARY_NAMESPACE")
 cli() { "${k[@]}" exec "$1" -- redis-cli --raw "${@:2}"; }
 converge() {
   local deadline=$((SECONDS + 180))
@@ -19,6 +21,13 @@ converge() {
   return 1
 }
 primary() { "${k[@]}" get pods -l app=upgrade,redis-role=master -o json | jq -r '.items[0].metadata.name // empty'; }
+deadline=$((SECONDS + 180))
+while (( SECONDS < deadline )); do
+  count="$("${k[@]}" get pods -l 'app in (upgrade,upgrade-sentinel)' -o json | jq '.items|length')"
+  [[ "$count" -eq 6 ]] && break
+  sleep 2
+done
+[[ "$count" -eq 6 ]]
 "${k[@]}" wait pods -l app=upgrade --for=condition=Ready --timeout=180s
 "${k[@]}" wait pods -l app=upgrade-sentinel --for=condition=Ready --timeout=180s
 for attempt in {1..90}; do
