@@ -168,6 +168,9 @@ func GenerateConfig() error {
 
 	// If external config file exists, include it
 	externalConfigFile, _ := util.CoalesceEnv("EXTERNAL_CONFIG_FILE", "/etc/redis/external.conf.d/redis-sentinel-additional.conf")
+	if err := agentutil.ValidateRequiredExternalConfig(externalConfigFile); err != nil {
+		return err
+	}
 	expandExternal, _ := util.CoalesceEnv(consts.ENV_KEY_EXPAND_EXTERNAL_CONFIG, "false")
 	cfg.AppendExternalConfig(externalConfigFile, expandExternal == "true")
 	for _, fields := range election {

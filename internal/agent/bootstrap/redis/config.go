@@ -208,6 +208,9 @@ func GenerateConfig() error {
 	}
 
 	// External configuration defined by user at the end
+	if err := agentutil.ValidateRequiredExternalConfig(externalConfigFile); err != nil {
+		return err
+	}
 	cfg.AppendExternalConfig(externalConfigFile, expandExternal == "true")
 	return cfg.Commit()
 }

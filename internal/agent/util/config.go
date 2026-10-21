@@ -126,7 +126,7 @@ func (c *Config) CommitAtomic() error {
 }
 
 func (c *Config) AppendExternalConfig(externalConfigFile string, expand bool) *Config {
-	if _, err := os.Stat(externalConfigFile); err != nil {
+	if _, err := os.Stat(externalConfigFile); err != nil && os.Getenv("EXTERNAL_CONFIG_REQUIRED") != "true" {
 		return c
 	}
 	includeFile := externalConfigFile
@@ -139,6 +139,18 @@ func (c *Config) AppendExternalConfig(externalConfigFile string, expand bool) *C
 		}
 	}
 	return c.Append("include", includeFile)
+}
+
+// ValidateRequiredExternalConfig distinguishes an optional default include from
+// an explicitly requested ConfigMap whose required key is missing or unreadable.
+func ValidateRequiredExternalConfig(path string) error {
+	if os.Getenv("EXTERNAL_CONFIG_REQUIRED") != "true" {
+		return nil
+	}
+	if _, err := os.ReadFile(path); err != nil {
+		return fmt.Errorf("required external configuration is not readable: %w", err)
+	}
+	return nil
 }
 
 func ExpandExternalConfig(externalConfigFile, confPath string) (string, error) {

@@ -867,6 +867,9 @@ func generateInitContainerDef(role, name string, initcontainerParams initContain
 			VolumeMounts: VolumeMounts,
 		}
 		// Set init-config resources to match main container if present
+		if externalConfig != nil {
+			container.Env = append(container.Env, corev1.EnvVar{Name: "EXTERNAL_CONFIG_REQUIRED", Value: "true"})
+		}
 		if containerParams.Resources != nil {
 			container.Resources = *containerParams.Resources
 		}

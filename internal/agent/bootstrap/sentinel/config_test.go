@@ -9,6 +9,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestRequiredExternalConfigMissingPreservesSentinelConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sentinel.conf")
+	t.Setenv("SENTINEL_CONFIG_FILE", path)
+	t.Setenv("EXTERNAL_CONFIG_FILE", filepath.Join(dir, "missing.conf"))
+	t.Setenv("EXTERNAL_CONFIG_REQUIRED", "true")
+	t.Setenv("SENTINEL_PERSISTENCE_ENABLED", "false")
+	require.NoError(t, os.WriteFile(path, []byte("retained configuration"), 0o600))
+	require.Error(t, GenerateConfig())
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "retained configuration", string(raw))
+}
+
 func Test_GenerateConfig_SentinelAnnounceIP(t *testing.T) {
 	const fakeFQDN = "redis-replication-s-0.redis-replication-s-hl.ns.svc.cluster.local"
 

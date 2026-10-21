@@ -2626,3 +2626,29 @@ func TestGenerateInitContainerDefMountsACLFile(t *testing.T) {
 		})
 	}
 }
+
+func TestExternalConfigReferenceRequiresBootstrapFile(t *testing.T) {
+	original := features.Enabled(features.GenerateConfigInInitContainer)
+	require.NoError(t, features.MutableFeatureGate.Set("GenerateConfigInInitContainer=true"))
+	t.Cleanup(func() {
+		require.NoError(t, features.MutableFeatureGate.Set(fmt.Sprintf("GenerateConfigInInitContainer=%t", original)))
+	})
+	for _, role := range []string{"replication", "sentinel", "cluster", "standalone"} {
+		for _, referenced := range []bool{false, true} {
+			var ref *string
+			if referenced {
+				ref = ptr.To("additional-config")
+			}
+			containers := generateInitContainerDef(role, "redis", initContainerParameters{}, ref, nil, containerParameters{Role: role}, ptr.To("v7"))
+			require.Len(t, containers, 1)
+			found := false
+			for _, env := range containers[0].Env {
+				if env.Name == "EXTERNAL_CONFIG_REQUIRED" {
+					require.Equal(t, "true", env.Value)
+					found = true
+				}
+			}
+			require.Equal(t, referenced, found, role)
+		}
+	}
+}

@@ -24,6 +24,26 @@ func TestGenerateConfigEscapesPassword(t *testing.T) {
 	require.Contains(t, string(raw), `masterauth " spaced\"quote\\slash "`)
 }
 
+func TestRequiredExternalConfigMissingFailsBootstrap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "redis.conf")
+	t.Setenv("REDIS_CONFIG_FILE", path)
+	t.Setenv("EXTERNAL_CONFIG_FILE", filepath.Join(dir, "missing.conf"))
+	t.Setenv("EXTERNAL_CONFIG_REQUIRED", "true")
+	t.Setenv("ACL_MODE", "false")
+	require.NoError(t, os.WriteFile(path, []byte("retained configuration"), 0o600))
+	require.Error(t, GenerateConfig())
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "retained configuration", string(raw))
+	external := filepath.Join(dir, "missing.conf")
+	require.NoError(t, os.WriteFile(external, []byte("min-replicas-to-write 1\n"), 0o600))
+	require.NoError(t, GenerateConfig(), "a readable explicit configuration must remain supported")
+	raw, err = os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "include "+external)
+}
+
 func Test_GenerateConfig_TLS_CACertFile(t *testing.T) {
 	tests := []struct {
 		name           string
