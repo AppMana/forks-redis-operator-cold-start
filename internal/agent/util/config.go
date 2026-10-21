@@ -40,6 +40,37 @@ func SanitizeConfigValue(s string) string {
 	return configValueSanitizer.Replace(s)
 }
 
+// QuoteConfigArgument encodes one redis.conf argument (not an ACL-file rule).
+// Redis accepts byte escapes, not Go's Unicode escapes. Preserve significant
+// whitespace while retaining the existing CR/LF removal contract.
+func QuoteConfigArgument(value string) string {
+	value = SanitizeConfigValue(value)
+	quote := value == ""
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		quote = quote || b <= ' ' || b == 127 || b == '\'' || b == '"' || b == '\\'
+	}
+	if !quote {
+		return value
+	}
+	var encoded strings.Builder
+	encoded.WriteByte('"')
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		switch {
+		case b == '"' || b == '\\':
+			encoded.WriteByte('\\')
+			encoded.WriteByte(b)
+		case b < ' ' || b == 127:
+			fmt.Fprintf(&encoded, "\\x%02x", b)
+		default:
+			encoded.WriteByte(b)
+		}
+	}
+	encoded.WriteByte('"')
+	return encoded.String()
+}
+
 func (c *Config) Append(config ...string) *Config {
 	if len(config) == 0 {
 		return c

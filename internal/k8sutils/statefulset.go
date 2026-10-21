@@ -589,8 +589,9 @@ func generateContainerDef(name string, containerParams containerParameters, clus
 // redisCLIAuthSanitizer strips CR/LF from REDISCLI_AUTH before redis-cli reads
 // it. Password secrets frequently carry a trailing newline (echo | base64,
 // kubectl create secret --from-file), and every other consumer of the password
-// sees it trimmed: getRedisPassword applies strings.TrimSpace and requirepass
-// is read from a line-based config file. REDISCLI_AUTH is sourced raw from the
+// removes line breaks in init-container mode. That mode preserves significant
+// spaces/tabs and quotes password arguments in redis.conf; the legacy password
+// reader still trims surrounding whitespace. REDISCLI_AUTH is sourced raw from the
 // secretKeyRef, so without this the server holds the trimmed password while
 // redis-cli sends the untrimmed one and every AUTH fails with WRONGPASS.
 // The -n guard keeps the variable unset on password-less deployments, where

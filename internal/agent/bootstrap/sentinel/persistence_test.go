@@ -9,6 +9,20 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestSentinelConfigEscapesPasswords(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sentinel.conf")
+	t.Setenv("SENTINEL_CONFIG_FILE", path)
+	t.Setenv("SENTINEL_PERSISTENCE_ENABLED", "false")
+	t.Setenv("MASTER_GROUP_NAME", "test")
+	t.Setenv("REDIS_PASSWORD", " own\"quote\\slash \r\n")
+	t.Setenv("MASTER_PASSWORD", " master\"quote\\slash \r\n")
+	require.NoError(t, GenerateConfig())
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `requirepass " own\"quote\\slash "`)
+	require.Contains(t, string(raw), `sentinel auth-pass test " master\"quote\\slash "`)
+}
+
 func TestPersistentSentinelRetainsElectionAndRefreshesCredentials(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sentinel.conf")
 	t.Setenv("SENTINEL_CONFIG_FILE", path)

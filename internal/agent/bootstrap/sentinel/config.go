@@ -60,8 +60,8 @@ func GenerateConfig() error {
 	// set_sentinel_password
 	{
 		if val, ok := util.CoalesceEnv("REDIS_PASSWORD", ""); ok {
-			cfg.Append("masterauth", val)
-			cfg.Append("requirepass", val)
+			cfg.Append("masterauth", agentutil.QuoteConfigArgument(val))
+			cfg.Append("requirepass", agentutil.QuoteConfigArgument(val))
 			cfg.Append("protected-mode", "yes")
 		} else {
 			fmt.Println("Sentinel is running without password which is not recommended")
@@ -102,7 +102,7 @@ func GenerateConfig() error {
 
 		// If master password is set
 		if masterPassword, ok := util.CoalesceEnv("MASTER_PASSWORD", ""); ok {
-			cfg.Append("sentinel auth-pass", masterGroupName, masterPassword)
+			cfg.Append("sentinel auth-pass", masterGroupName, agentutil.QuoteConfigArgument(masterPassword))
 		}
 
 		// If sentinel ID is set

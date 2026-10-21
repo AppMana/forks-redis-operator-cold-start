@@ -7,6 +7,23 @@ import (
 	"testing"
 )
 
+func TestQuoteConfigArgument(t *testing.T) {
+	for _, tt := range []struct{ input, want string }{
+		{"simple", "simple"},
+		{"", `""`},
+		{" space ", `" space "`},
+		{"a'b", `"a'b"`},
+		{"a\"b\\c", `"a\"b\\c"`},
+		{"a\tb\x00\x7f", `"a\x09b\x00\x7f"`},
+		{"a\r\nb", "ab"},
+		{"密码", "密码"},
+	} {
+		if got := QuoteConfigArgument(tt.input); got != tt.want {
+			t.Errorf("synthetic argument %q: got %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 // TestAppend_RejectsNewlineInjection guards against CRD-driven Sentinel
 // config injection (issue #1763): a malicious masterGroupName that contains
 // newlines must not be allowed to introduce extra config directives into

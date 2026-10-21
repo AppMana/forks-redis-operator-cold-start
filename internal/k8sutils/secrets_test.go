@@ -3,18 +3,38 @@ package k8sutils
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	common "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	rcvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/rediscluster/v1beta2"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sClientFake "k8s.io/client-go/kubernetes/fake"
 )
+
+func TestPasswordNormalizationMatchesBootstrapMode(t *testing.T) {
+	original := features.Enabled(features.GenerateConfigInInitContainer)
+	t.Cleanup(func() {
+		require.NoError(t, features.MutableFeatureGate.Set(fmt.Sprintf("GenerateConfigInInitContainer=%t", original)))
+	})
+	kube := k8sClientFake.NewSimpleClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "test"}, Data: map[string][]byte{"password": []byte(" spaced\tpassword \r\n")}})
+	for _, enabled := range []bool{true, false} {
+		require.NoError(t, features.MutableFeatureGate.Set(fmt.Sprintf("GenerateConfigInInitContainer=%t", enabled)))
+		value, err := getRedisPassword(context.Background(), kube, "test", "credentials", "password")
+		require.NoError(t, err)
+		if enabled {
+			require.Equal(t, " spaced\tpassword ", value)
+		} else {
+			require.Equal(t, "spaced\tpassword", value)
+		}
+	}
+}
 
 func Test_getRedisPassword(t *testing.T) {
 	tests := []struct {

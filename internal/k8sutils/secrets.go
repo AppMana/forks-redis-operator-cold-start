@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
+	agentutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/agent/util"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util/cryptutil"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -24,6 +26,9 @@ func getRedisPassword(ctx context.Context, client kubernetes.Interface, namespac
 	for key, value := range secretName.Data {
 		if key == secretKey {
 			logf.FromContext(ctx).V(1).Info("Secret key found in the secret", "secretKey", secretKey)
+			if features.Enabled(features.GenerateConfigInInitContainer) {
+				return agentutil.SanitizeConfigValue(string(value)), nil
+			}
 			return strings.TrimSpace(string(value)), nil
 		}
 	}

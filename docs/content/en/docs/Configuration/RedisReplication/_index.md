@@ -193,3 +193,5 @@ spec:
 ```
 
 With the `GenerateConfigInInitContainer` feature gate enabled, the `init-config` container validates this before writing the configuration. It fails with a descriptive error when the ACL file is missing, does not define `default`, leaves it disabled (no `on`), sets it to `nopass`, or defines it with a different password, instead of letting the pod crash-loop on `NOAUTH`.
+
+In init-container mode, Redis and Sentinel password arguments are escaped for Redis configuration syntax. Spaces, tabs, quotes and backslashes remain part of the password; CR/LF characters are removed consistently by bootstrap and credential readers. The legacy bootstrap path retains its existing surrounding-whitespace trimming behavior. External ACL files have different syntax: quotes are literal rather than grouping arguments. Use a SHA-256 password hash in the ACL file for passwords containing spaces, and retain every credential still needed by clients during rotation. Updating the Secret alone does not reload running Redis ACLs or complete credential rotation.

@@ -10,6 +10,8 @@ import (
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	rcvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/rediscluster/v1beta2"
 	rr "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
+	agentutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/agent/util"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	corev1 "k8s.io/api/core/v1"
@@ -50,6 +52,9 @@ func (c *checker) GetPassword(ctx context.Context, ns string, secret *commonapi.
 	}
 	for key, value := range secretName.Data {
 		if key == *secret.Key {
+			if features.Enabled(features.GenerateConfigInInitContainer) {
+				return agentutil.SanitizeConfigValue(string(value)), nil
+			}
 			return strings.TrimSpace(string(value)), nil
 		}
 	}

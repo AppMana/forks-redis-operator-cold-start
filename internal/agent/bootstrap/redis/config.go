@@ -72,8 +72,8 @@ func GenerateConfig() error {
 		}
 	}
 	if redisPassword != "" {
-		cfg.Append("masterauth", redisPassword)
-		cfg.Append("requirepass", redisPassword)
+		cfg.Append("masterauth", agentutil.QuoteConfigArgument(redisPassword))
+		cfg.Append("requirepass", agentutil.QuoteConfigArgument(redisPassword))
 		cfg.Append("protected-mode", "yes")
 	} else {
 		fmt.Println("Redis is running without password which is not recommended")

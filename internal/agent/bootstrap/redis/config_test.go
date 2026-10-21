@@ -11,6 +11,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestGenerateConfigEscapesPassword(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "redis.conf")
+	t.Setenv("REDIS_CONFIG_FILE", path)
+	t.Setenv("SETUP_MODE", "standalone")
+	t.Setenv("REDIS_PASSWORD", " spaced\"quote\\slash \r\n")
+	t.Setenv("ACL_MODE", "false")
+	require.NoError(t, GenerateConfig())
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `requirepass " spaced\"quote\\slash "`)
+	require.Contains(t, string(raw), `masterauth " spaced\"quote\\slash "`)
+}
+
 func Test_GenerateConfig_TLS_CACertFile(t *testing.T) {
 	tests := []struct {
 		name           string

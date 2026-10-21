@@ -2,15 +2,36 @@ package redis
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/features"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/utils/ptr"
 )
+
+func TestGetPasswordMatchesInitBootstrapWhitespace(t *testing.T) {
+	original := features.Enabled(features.GenerateConfigInInitContainer)
+	t.Cleanup(func() {
+		require.NoError(t, features.MutableFeatureGate.Set(fmt.Sprintf("GenerateConfigInInitContainer=%t", original)))
+	})
+	kube := k8sfake.NewSimpleClientset(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "credentials", Namespace: "test"}, Data: map[string][]byte{"password": []byte(" spaced\tpassword \r\n")}})
+	ref := &commonapi.ExistingPasswordSecret{Name: ptr.To("credentials"), Key: ptr.To("password")}
+	for _, enabled := range []bool{true, false} {
+		require.NoError(t, features.MutableFeatureGate.Set(fmt.Sprintf("GenerateConfigInInitContainer=%t", enabled)))
+		value, err := NewChecker(kube).GetPassword(context.Background(), "test", ref)
+		require.NoError(t, err)
+		if enabled {
+			require.Equal(t, " spaced\tpassword ", value)
+		} else {
+			require.Equal(t, "spaced\tpassword", value)
+		}
+	}
+}
 
 func TestGetPasswordRejectsIncompleteReference(t *testing.T) {
 	for _, ref := range []*commonapi.ExistingPasswordSecret{
