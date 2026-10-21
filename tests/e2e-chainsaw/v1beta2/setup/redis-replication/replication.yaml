@@ -8,6 +8,12 @@ spec:
     size: 3
     image: quay.io/opstree/redis-sentinel:latest
     imagePullPolicy: IfNotPresent
+    downAfterMilliseconds: "5000"
+  # Allow Sentinel to fail over before kubelet restarts the deliberately
+  # paused process. Readiness continues to withdraw the unavailable endpoint.
+  livenessProbe:
+    failureThreshold: 30
+    periodSeconds: 10
   clusterSize: 3
   redisConfig:
     maxMemoryPercentOfLimit: 80
