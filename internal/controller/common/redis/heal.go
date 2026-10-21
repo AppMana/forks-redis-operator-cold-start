@@ -526,7 +526,7 @@ func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespa
 	secret, err := client.CoreV1().Secrets(namespace).Get(ctx, tlsSecretName, metav1.GetOptions{})
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Failed in getting TLS secret", "secretName", tlsSecretName, "namespace", namespace)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	caFile, certFile, keyFile := getTLSSecretKeys(tlsConfig)
@@ -536,18 +536,18 @@ func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespa
 
 	if !certExists || !keyExists {
 		log.FromContext(ctx).Error(fmt.Errorf("TLS secret missing required cert/key"), "TLS secret is missing required cert/key", "secretName", tlsSecretName)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	cert, err := tls.X509KeyPair(tlsClientCert, tlsClientKey)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "Failed to load TLS key pair", "secretName", tlsSecretName)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	if !caExists && tlsConfig.CaCertFile != "" {
 		log.FromContext(ctx).Error(fmt.Errorf("configured TLS CA key file is missing in the secret"), "TLS secret is missing configured CA key", "secretName", tlsSecretName, "caKeyFile", tlsConfig.CaCertFile)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	if !caExists {
@@ -555,13 +555,16 @@ func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespa
 		systemCertPool, err := x509.SystemCertPool()
 		if err != nil {
 			log.FromContext(ctx).Error(err, "Failed to load system certificate pool", "secretName", tlsSecretName)
-			return nil
+			return cryptutil.FailClosedTLSConfig()
 		}
 		return newTLSConfigVerifyingChainWithoutHostname(cert, systemCertPool)
 	}
 
 	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(tlsCACert)
+	if !caCertPool.AppendCertsFromPEM(tlsCACert) {
+		log.FromContext(ctx).Error(fmt.Errorf("invalid CA certificate"), "Invalid TLS CA certificate", "secretName", tlsSecretName)
+		return cryptutil.FailClosedTLSConfig()
+	}
 
 	return newTLSConfigVerifyingChainWithoutHostname(cert, caCertPool)
 }

@@ -37,10 +37,10 @@ func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespa
 	}
 
 	tlsSecretName := tlsConfig.Secret.SecretName
-	secret, err := client.CoreV1().Secrets(namespace).Get(context.TODO(), tlsSecretName, metav1.GetOptions{})
+	secret, err := client.CoreV1().Secrets(namespace).Get(ctx, tlsSecretName, metav1.GetOptions{})
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Failed in getting TLS secret", "secretName", tlsSecretName, "namespace", namespace)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	caFile, certFile, keyFile := getTLSSecretKeys(tlsConfig)
@@ -50,19 +50,19 @@ func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespa
 
 	if !certExists || !keyExists {
 		logf.FromContext(ctx).Error(errors.New("required TLS cert or key is missing in the secret"), "Missing TLS cert/key in the secret")
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	cert, err := tls.X509KeyPair(tlsClientCert, tlsClientKey)
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Couldn't load TLS client key pair", "secretName", tlsSecretName, "namespace", namespace)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	// If user explicitly set CA key and it is missing, treat this as misconfiguration.
 	if !caExists && tlsConfig.CaCertFile != "" {
 		logf.FromContext(ctx).Error(errors.New("configured TLS CA key file is missing in the secret"), "Missing configured TLS CA in the secret", "caKeyFile", tlsConfig.CaCertFile)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	if !caExists {
@@ -70,7 +70,7 @@ func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespa
 		systemCertPool, err := x509.SystemCertPool()
 		if err != nil {
 			logf.FromContext(ctx).Error(err, "Failed to load system certificate pool", "secretName", tlsSecretName)
-			return nil
+			return cryptutil.FailClosedTLSConfig()
 		}
 		return newTLSConfigVerifyingChainWithoutHostname(cert, systemCertPool)
 	}
@@ -79,7 +79,7 @@ func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespa
 	ok := tlsCaCertificates.AppendCertsFromPEM(tlsCaCertificate)
 	if !ok {
 		logf.FromContext(ctx).Error(errors.New("invalid CA certificate"), "Invalid CA Certificates", "secretName", tlsSecretName, "namespace", namespace)
-		return nil
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	return newTLSConfigVerifyingChainWithoutHostname(cert, tlsCaCertificates)

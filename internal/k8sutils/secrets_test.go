@@ -2,6 +2,7 @@ package k8sutils
 
 import (
 	"context"
+	"crypto/tls"
 	"os"
 	"path/filepath"
 	"testing"
@@ -344,6 +345,10 @@ func Test_getRedisTLSConfig(t *testing.T) {
 				require.NotNil(t, tlsConfig.RootCAs, "Root CAs should not be nil")
 				require.True(t, tlsConfig.InsecureSkipVerify, "InsecureSkipVerify should be true so the default hostname check is skipped")
 				require.NotNil(t, tlsConfig.VerifyPeerCertificate, "VerifyPeerCertificate must be set to verify the chain without hostname checks")
+			} else if tt.redisCluster.Spec.TLS != nil && tt.redisCluster.Spec.TLS.Secret.SecretName != "" {
+				require.NotNil(t, tlsConfig, "configured TLS must never fall back to plaintext")
+				require.NotNil(t, tlsConfig.VerifyConnection)
+				require.Error(t, tlsConfig.VerifyConnection(tls.ConnectionState{}))
 			} else {
 				assert.Nil(t, tlsConfig, "Expected no TLS configuration but got one")
 			}
