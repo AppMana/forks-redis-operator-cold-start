@@ -63,6 +63,8 @@ jobs:
       - name: Test data integrity assertion helper
         working-directory: tests/data-assert
         run: go test -race ./... -count=1
+      - name: Test data assertion CLI against Redis
+        run: bash hack/recovery/check-data-assert.sh
       - name: Test Sentinel quorum reconciliation against Redis
         run: bash hack/recovery/check-sentinel-quorum.sh
       - name: Upload coverage to Codecov
