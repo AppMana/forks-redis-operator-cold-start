@@ -35,13 +35,27 @@ for ordinal in 0 1 2; do
 done
 [[ -n "$primary" ]]
 [[ "$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')" == "$primary" ]]
-for ordinal in 0 1 2; do
-  pod="$sentinel_prefix-$ordinal"
+sentinel_pods=("$sentinel_prefix-0" "$sentinel_prefix-1" "$sentinel_prefix-2")
+expected_sentinels="${CANARY_SENTINEL_COUNT:-3}"
+[[ "$expected_sentinels" =~ ^[1-9][0-9]*$ ]]
+if [[ -n "${CANARY_RECOVERY_SENTINEL_SELECTOR:-}" ]]; then
+  recovery_pods="$("${k[@]}" get pods -l "$CANARY_RECOVERY_SENTINEL_SELECTOR" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')"
+  [[ -n "$recovery_pods" ]]
+  while IFS= read -r pod; do sentinel_pods+=("$pod"); done <<<"$recovery_pods"
+fi
+[[ "${#sentinel_pods[@]}" == "$expected_sentinels" ]]
+[[ "$(printf '%s\n' "${sentinel_pods[@]}" | sort -u | wc -l)" -eq "$expected_sentinels" ]]
+sentinel_ids=()
+for pod in "${sentinel_pods[@]}"; do
   [[ "$(cli "$pod" -p 26379 SENTINEL CKQUORUM "$master_group")" == OK* ]]
+  sentinel_id="$(cli "$pod" -p 26379 SENTINEL MYID)"
+  [[ "$sentinel_id" =~ ^[0-9a-f]{40}$ ]]
+  sentinel_ids+=("$sentinel_id")
   master="$(cli "$pod" -p 26379 SENTINEL GET-MASTER-ADDR-BY-NAME "$master_group" | head -1)"
   [[ "$master" == "$ips" || "$master" == "$primary.upgrade-headless.$namespace.svc.cluster.local" ]]
   metadata="$(cli "$pod" -p 26379 SENTINEL MASTER "$master_group" | tr -d '\r')"
   [[ "$(printf '%s\n' "$metadata" | awk '$0=="num-slaves" {getline; print}')" == 2 ]]
-  [[ "$(printf '%s\n' "$metadata" | awk '$0=="num-other-sentinels" {getline; print}')" == 2 ]]
+  [[ "$(printf '%s\n' "$metadata" | awk '$0=="num-other-sentinels" {getline; print}')" == "$((expected_sentinels-1))" ]]
 done
-printf 'PASS: %s, one writable endpoint, two linked replicas, three agreeing Sentinels, key preserved\n' "$primary"
+[[ "$(printf '%s\n' "${sentinel_ids[@]}" | sort -u | wc -l)" -eq "$expected_sentinels" ]]
+printf 'PASS: %s, one writable endpoint, two linked replicas, %s agreeing Sentinels, key preserved\n' "$primary" "$expected_sentinels"
