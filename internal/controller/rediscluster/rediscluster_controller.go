@@ -554,7 +554,7 @@ func (r *Reconciler) updateStatus(ctx context.Context, rc *rcvb2.RedisCluster, s
 		copy.Status = status
 		return true, common.UpdateStatus(ctx, r.Client, copy)
 	}
-	return false, nil
+	return false, err
 }
 
 // getStatefulSetReadyReplicas returns the number of ready replicas reported by
