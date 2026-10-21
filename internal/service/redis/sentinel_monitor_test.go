@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 
 	"github.com/go-redis/redismock/v9"
@@ -22,7 +23,7 @@ func TestSentinelMonitorPreservesExistingGroupWhenHostnamesDisabled(t *testing.T
 
 func TestSentinelMonitorAcceptsEnabledResolverMap(t *testing.T) {
 	db, mock := redismock.NewClientMock()
-	svc := &service{redisClient: db}
+	svc := &service{redisClient: db, lookupHost: func(context.Context, string) ([]string, error) { return []string{"10.0.0.2"}, nil }}
 	mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1", "port": "6379"})
 	mock.ExpectDo("SENTINEL", "CONFIG", "GET", "resolve-hostnames").SetVal(map[string]string{"resolve-hostnames": "yes"})
 	mock.ExpectDo("SENTINEL", "REMOVE", "upgrade").SetVal(true)
@@ -30,6 +31,18 @@ func TestSentinelMonitorAcceptsEnabledResolverMap(t *testing.T) {
 	mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", "").SetVal(true)
 	require.NoError(t, svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "redis-0.example", Port: "6379"}, "upgrade", "2"))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSentinelMonitorPreservesGroupWhenTargetDNSFails(t *testing.T) {
+	for _, lookupErr := range []error{&net.DNSError{Err: "no such host", IsNotFound: true}, context.DeadlineExceeded, nil} {
+		db, mock := redismock.NewClientMock()
+		svc := &service{redisClient: db, lookupHost: func(context.Context, string) ([]string, error) { return nil, lookupErr }}
+		mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1", "port": "6379"})
+		mock.ExpectDo("SENTINEL", "CONFIG", "GET", "resolve-hostnames").SetVal(map[string]string{"resolve-hostnames": "yes"})
+		err := svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "missing.invalid", Port: "6379"}, "upgrade", "2")
+		require.ErrorContains(t, err, "resolve replacement Sentinel master")
+		require.NoError(t, mock.ExpectationsWereMet())
+	}
 }
 
 func TestSentinelMonitorPreservesGroupWhenResolverCannotBeChecked(t *testing.T) {

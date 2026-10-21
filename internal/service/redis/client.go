@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	rediscli "github.com/redis/go-redis/v9"
 )
@@ -101,6 +102,7 @@ func (m SentinelMasterInfo) HasStaleEntries(expectedSlaves, expectedSentinels in
 type service struct {
 	connectionInfo *ConnectionInfo
 	redisClient    *rediscli.Client
+	lookupHost     func(context.Context, string) ([]string, error)
 }
 
 func NewService() Service {
@@ -331,6 +333,24 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 		}
 		if settings["resolve-hostnames"] != "yes" {
 			return fmt.Errorf("sentinel resolve-hostnames must be enabled before changing monitor to a hostname; existing monitor preserved")
+		}
+		if masterExists {
+			// This preflight is deliberately before REMOVE. It cannot make
+			// two Redis commands atomic or guarantee the Sentinel's DNS view,
+			// but a failed lookup must never erase the retained monitor.
+			lookup := c.lookupHost
+			if lookup == nil {
+				lookup = net.DefaultResolver.LookupHost
+			}
+			lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			addresses, lookupErr := lookup(lookupCtx, master.Host)
+			cancel()
+			if lookupErr != nil {
+				return fmt.Errorf("resolve replacement Sentinel master; existing monitor preserved: %w", lookupErr)
+			}
+			if len(addresses) == 0 {
+				return errors.New("resolve replacement Sentinel master: no addresses; existing monitor preserved")
+			}
 		}
 	}
 

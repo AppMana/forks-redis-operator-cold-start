@@ -30,6 +30,15 @@ func TestSentinelQuorumIntegration(t *testing.T) {
 	require.Eventually(t, func() bool { return db.Ping(ctx).Err() == nil }, 5*time.Second, 50*time.Millisecond)
 	id, err := db.Do(ctx, "SENTINEL", "MYID").Text()
 	require.NoError(t, err)
+	require.NoError(t, db.Do(ctx, "SENTINEL", "CONFIG", "SET", "resolve-hostnames", "yes").Err())
+	svc := NewClient().Connect(&ConnectionInfo{Host: "127.0.0.1", Port: "26379"})
+	err = svc.SentinelMonitor(ctx, &ConnectionInfo{Host: "missing.invalid", Port: "6379"}, "upgrade", "2")
+	require.ErrorContains(t, err, "resolve replacement Sentinel master")
+	retained := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "MASTER", "upgrade")
+	require.NoError(t, db.Process(ctx, retained))
+	require.Equal(t, "127.0.0.1", retained.Val()["ip"])
+	require.Equal(t, "3", retained.Val()["quorum"])
+	require.Equal(t, "23456", retained.Val()["down-after-milliseconds"])
 	// Invalid replacement parameters must not erase the existing monitor.
 	for _, replacement := range []struct {
 		port, quorum string

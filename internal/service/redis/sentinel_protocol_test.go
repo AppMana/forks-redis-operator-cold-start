@@ -77,7 +77,7 @@ func TestSentinelMonitorWireProtocols(t *testing.T) {
 				}
 			}()
 			db := rediscli.NewClient(&rediscli.Options{Addr: listener.Addr().String(), Protocol: protocol, MaxRetries: -1, ReadTimeout: time.Second, WriteTimeout: time.Second})
-			svc := &service{redisClient: db}
+			svc := &service{redisClient: db, lookupHost: func(context.Context, string) ([]string, error) { return []string{"10.0.0.2"}, nil }}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			require.NoError(t, svc.SentinelMonitor(ctx, &ConnectionInfo{Host: "redis-0.example", Port: "6379"}, "upgrade", "2"))
