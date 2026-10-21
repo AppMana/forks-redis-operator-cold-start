@@ -525,8 +525,11 @@ func getTLSSecretKeys(tlsConfig *commonapi.TLSConfig) (caFile, certFile, keyFile
 
 // getRedisTLSConfig creates a TLS configuration for Redis connections
 func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespace string, tlsConfig *commonapi.TLSConfig) *tls.Config {
-	if tlsConfig == nil || tlsConfig.Secret.SecretName == "" {
+	if tlsConfig == nil {
 		return nil
+	}
+	if tlsConfig.Secret.SecretName == "" {
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	tlsSecretName := tlsConfig.Secret.SecretName
@@ -604,7 +607,7 @@ func createConnectionInfo(ctx context.Context, pod v1.Pod, password string, tlsC
 	}
 
 	// Configure TLS if enabled
-	if tlsConfig != nil && tlsConfig.Secret.SecretName != "" {
+	if tlsConfig != nil {
 		serviceName := common.GetHeadlessServiceNameFromPodName(pod.Name)
 		connInfo.Host = fmt.Sprintf("%s.%s.%s.svc.%s", pod.Name, serviceName, namespace, envs.GetServiceDNSDomain())
 		// Get TLS configuration
