@@ -6,7 +6,7 @@ config="${1:?usage: sentinel-partition.sh LOCAL_KUBECONFIG EXPECTED_VALUE}"
 expected="${2:?existing value required}"
 context="$(kubectl --kubeconfig "$config" config current-context)"
 case "$context" in
-  kind-redis-recovery-20261020|kind-redis-recovery-qualified-20261021) ;;
+  kind-redis-recovery-20261020|kind-redis-recovery-qualified-20261021|kind-redis-recovery-release-20261021) ;;
   *) exit 2 ;;
 esac
 server="$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"

@@ -11,8 +11,12 @@ require "lago/redis_config_builder"
 require "securerandom"
 
 $stdout.sync = true
-namespace = "redis-upgrade-canary-empty-disk"
-raise "lab opt-in required" unless ENV["CANARY_LAGO_TEST"] == namespace
+fixtures = {
+  "redis-upgrade-canary-empty-disk" => "preserved-empty-disk-20261021",
+  "redis-upgrade-canary-migration" => "preserved-release-migration-20261021"
+}.freeze
+namespace = ENV["CANARY_LAGO_TEST"]
+raise "lab opt-in required" unless fixtures.key?(namespace)
 mode = ENV.fetch("CANARY_LAGO_MODE")
 read_only = ENV["CANARY_LAGO_READ_ONLY"] == "1"
 raise "unsupported mode" unless %w[service sentinel].include?(mode)
@@ -42,7 +46,7 @@ clock = -> { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
 threads = clients.map do |kind, client|
   Thread.new do
     prefix = "appmana:canary:lago:#{mode}:#{kind}:#{SecureRandom.hex(12)}"
-    retained = "preserved-empty-disk-20261021"
+    retained = fixtures.fetch(namespace)
     retained_key = kind == :cache ? "appmana:upgrade:secondary-database" : "appmana:upgrade:sentinel-regression"
     acknowledgements = {}
     process_ids = {}
