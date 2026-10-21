@@ -718,10 +718,19 @@ func Test_getAttachedFollowerNodeIDs(t *testing.T) {
 			if tt.clusterSlavesErr != nil {
 				mock.ExpectClusterSlaves(tt.masterNodeID).SetErr(tt.clusterSlavesErr)
 			} else {
-				mock.ExpectClusterSlaves(tt.masterNodeID).SetVal(tt.slaveNodeIDs)
+				var rows []string
+				for _, id := range tt.slaveNodeIDs {
+					rows = append(rows, fmt.Sprintf("%s addr slave %s 0 0 1 connected", id, tt.masterNodeID))
+				}
+				mock.ExpectClusterSlaves(tt.masterNodeID).SetVal(rows)
 			}
 
-			result := getAttachedFollowerNodeIDs(ctx, client, tt.masterNodeID)
+			result, err := getAttachedFollowerNodeIDs(ctx, client, tt.masterNodeID)
+			if tt.clusterSlavesErr != nil {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 
 			assert.ElementsMatch(t, tt.expectedslaveNodeIDs, result, "Test case: "+tt.name)
 

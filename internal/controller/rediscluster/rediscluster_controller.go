@@ -130,10 +130,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 						return intctrlutil.RequeueE(ctx, err, "")
 					}
 				}
-				// Step 1 Remove the Follower Node
-				k8sutils.RemoveRedisFollowerNodesFromCluster(ctx, r.K8sClient, instance, shardIdx)
-				monitoring.RedisClusterRemoveFollowerAttempt.WithLabelValues(instance.Namespace, instance.Name).Inc()
-				// Step 2 Reshard the Cluster
+				// Transfer and verify slots before retiring any replica copies.
 				// We round robin over the remaining nodes to pick a node where to move the shard to.
 				// This helps reduce the chance of overloading/OOMing the remaining nodes
 				// and makes the subsequent rebalancing step more efficient.
@@ -142,6 +139,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				if err := k8sutils.ReshardRedisCluster(ctx, r.K8sClient, instance, shardIdx, shardMoveNodeIdx, true); err != nil {
 					return intctrlutil.RequeueE(ctx, err, "failed to reshard source node")
 				}
+				monitoring.RedisClusterRemoveFollowerAttempt.WithLabelValues(instance.Namespace, instance.Name).Inc()
 				monitoring.RedisClusterReshardTotal.WithLabelValues(instance.Namespace, instance.Name).Inc()
 			}
 			// Step 3 Rebalance the cluster. With a single remaining leader there is

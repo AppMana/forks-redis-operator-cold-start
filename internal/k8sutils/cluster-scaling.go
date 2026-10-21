@@ -274,7 +274,16 @@ func ReshardRedisCluster(ctx context.Context, client kubernetes.Interface, cr *r
 
 	var removeNode func() error
 	if remove {
-		removeNode = func() error { return RemoveRedisNodeFromCluster(ctx, client, cr, removeNodeID) }
+		followers, err := retiringFollowerIDs(ctx, client, cr, redisClient, removeNodeID)
+		if err != nil {
+			return err
+		}
+		removeNode = func() error {
+			if err := RemoveRedisFollowerNodesFromCluster(ctx, client, cr, followers); err != nil {
+				return err
+			}
+			return RemoveRedisNodeFromCluster(ctx, client, cr, removeNodeID)
+		}
 	}
 	return reshardBeforeRemoval(func() (int, error) {
 		return ownedRedisClusterSlots(ctx, redisClient, removeNodeID)
@@ -567,56 +576,32 @@ func AddRedisNodeToCluster(ctx context.Context, client kubernetes.Interface, cr 
 }
 
 // getAttachedFollowerNodeIDs would return a slice of redis followers attached to a redis leader
-func getAttachedFollowerNodeIDs(ctx context.Context, redisClient *redis.Client, masterNodeID string) []string {
+func getAttachedFollowerNodeIDs(ctx context.Context, redisClient *redis.Client, masterNodeID string) ([]string, error) {
 	// 3acb029fead40752f432c84f9bed2e639119a573 192.168.84.239:6379@16379,redis-cluster-v1beta2-follower-5 slave e3299968586dd457a8dba04fc6c747cecd38510f 0 1713595736542 6 connected
 	slaveNodes, err := redisClient.ClusterSlaves(ctx, masterNodeID).Result()
 	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to get attached follower node IDs", "masterNodeID", masterNodeID)
-		return nil
+		return nil, fmt.Errorf("attached follower inventory is unavailable")
 	}
 	slaveIDs := make([]string, 0, len(slaveNodes))
+	seen := map[string]bool{}
 	for _, slave := range slaveNodes {
-		stringSlice := strings.Split(slave, " ")
-		slaveIDs = append(slaveIDs, stringSlice[0])
+		fields := strings.Fields(slave)
+		if len(fields) < 8 || !hasFlag(fields[2], "slave") || fields[3] != masterNodeID || seen[fields[0]] {
+			return nil, fmt.Errorf("attached follower inventory is malformed or ambiguous")
+		}
+		seen[fields[0]] = true
+		slaveIDs = append(slaveIDs, fields[0])
 	}
-	log.FromContext(ctx).V(1).Info("Slaves Nodes attached to", "node", masterNodeID, "are", slaveIDs)
-	return slaveIDs
+	return slaveIDs, nil
 }
 
-// Remove redis follower node would remove all follower nodes of last leader node using redis-cli
-func RemoveRedisFollowerNodesFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, shardIdx int32) {
-	var cmd []string
+// Retire only previously identified obsolete followers, after slot transfer.
+func RemoveRedisFollowerNodesFromCluster(ctx context.Context, client kubernetes.Interface, cr *rcvb2.RedisCluster, ids []string) error {
 	redisClient := configureRedisClient(ctx, client, cr, cr.Name+"-leader-0")
 	defer redisClient.Close()
-
-	existingPod := RedisDetails{
-		PodName:   cr.Name + "-leader-0",
-		Namespace: cr.Namespace,
-	}
-	lastLeaderPod := RedisDetails{
-		PodName:   cr.Name + "-leader-" + strconv.Itoa(int(shardIdx)),
-		Namespace: cr.Namespace,
-	}
-
-	cmd = []string{"redis-cli"}
-
-	authArgs, err := getRedisClusterAuthArgs(ctx, client, cr, cr.Name+"-leader-0")
-	if err != nil {
-		log.FromContext(ctx).Error(err, "Failed to get password authentication arguments")
-	}
-	cmd = append(cmd, authArgs...)
-	cmd = append(cmd, getRedisTLSArgs(cr.Spec.TLS, cr.Name+"-leader-0")...)
-
-	lastLeaderPodNodeID := getRedisNodeID(ctx, client, cr, lastLeaderPod)
-	followerNodeIDs := getAttachedFollowerNodeIDs(ctx, redisClient, lastLeaderPodNodeID)
-
-	cmd = append(cmd, "--cluster", "del-node")
-	cmd = append(cmd, getEndpoint(ctx, client, cr, existingPod))
-	for _, followerNodeID := range followerNodeIDs {
-		cmd = append(cmd, followerNodeID)
-		executeCommand(ctx, client, cr, cmd, cr.Name+"-leader-0")
-		cmd = cmd[:len(cmd)-1]
-	}
+	return retireEmptyFollowers(ids, func(id string) (int, error) {
+		return ownedRedisClusterSlots(ctx, redisClient, id)
+	}, func(id string) error { return RemoveRedisNodeFromCluster(ctx, client, cr, id) })
 }
 
 // Remove redis cluster node would remove last node to the existing redis cluster using redis-cli
