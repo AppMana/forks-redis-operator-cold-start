@@ -215,7 +215,7 @@ func (c *service) SentinelConfigSet(ctx context.Context, key, value string) erro
 		return err
 	}
 	if _, ok := settings[key]; !ok {
-		return fmt.Errorf("Sentinel configuration %s was not returned", key)
+		return fmt.Errorf("sentinel configuration %s was not returned", key)
 	}
 	if settings[key] == value {
 		return nil
