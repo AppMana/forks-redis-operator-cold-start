@@ -1265,6 +1265,17 @@ func CreateMasterSlaveReplication(ctx context.Context, client kubernetes.Interfa
 	return nil
 }
 
+func promoteReplicationClient(ctx context.Context, redisClient *redis.Client) error {
+	role, err := checkRedisServerRole(ctx, redisClient, "recovery candidate")
+	if err != nil {
+		return err
+	}
+	if role == "master" {
+		return nil
+	}
+	return setReplicationRoleAndReconnect(ctx, redisClient, "NO", "ONE")
+}
+
 func reconfigureReplicationClient(ctx context.Context, redisClient *redis.Client, masterAddr string) error {
 	info, err := redisClient.Info(ctx, "Replication").Result()
 	if err != nil {
@@ -1293,13 +1304,17 @@ func reconfigureReplicationClient(ctx context.Context, redisClient *redis.Client
 			return nil
 		}
 	}
+	return setReplicationRoleAndReconnect(ctx, redisClient, masterAddr, "6379")
+}
+
+func setReplicationRoleAndReconnect(ctx context.Context, redisClient *redis.Client, host, port string) error {
 	// Match Sentinel's client-reconfiguration contract. Merely issuing
 	// SLAVEOF leaves read-only clients pinned to the old primary indefinitely.
 	// Queue both commands in one transaction so a role change is not separated
 	// from reconnecting normal clients by a client-side network interruption.
 	// Do not disconnect replication links, pubsub clients, or this connection.
-	_, err = redisClient.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-		pipe.SlaveOf(ctx, masterAddr, "6379")
+	_, err := redisClient.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.SlaveOf(ctx, host, port)
 		pipe.ClientKillByFilter(ctx, "TYPE", "normal", "SKIPME", "yes")
 		return nil
 	})

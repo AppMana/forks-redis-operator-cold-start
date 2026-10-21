@@ -63,3 +63,21 @@ func TestReplicationReconfigurationReportsTransactionFailure(t *testing.T) {
 	require.ErrorContains(t, reconfigureReplicationClient(context.Background(), client, "10.0.0.2"), "EXECABORT")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+func TestColdStartPromotionReconnectsNormalClients(t *testing.T) {
+	client, mock := redismock.NewClientMock()
+	mock.ExpectInfo("Replication").SetVal("role:slave\r\n")
+	mock.ExpectTxPipeline()
+	mock.ExpectSlaveOf("NO", "ONE").SetVal("OK")
+	mock.ExpectClientKillByFilter("TYPE", "normal", "SKIPME", "yes").SetVal(2)
+	mock.ExpectTxPipelineExec()
+	require.NoError(t, promoteReplicationClient(context.Background(), client))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestColdStartPromotionDoesNotDisconnectExistingPrimary(t *testing.T) {
+	client, mock := redismock.NewClientMock()
+	mock.ExpectInfo("Replication").SetVal("role:master\r\n")
+	require.NoError(t, promoteReplicationClient(context.Background(), client))
+	require.NoError(t, mock.ExpectationsWereMet())
+}

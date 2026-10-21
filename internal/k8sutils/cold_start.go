@@ -154,7 +154,7 @@ func PromoteMasterAndReslave(ctx context.Context, client kubernetes.Interface, c
 
 	promoteClient := configureRedisReplicationClient(ctx, client, cr, targetMaster)
 	defer promoteClient.Close()
-	if err := promoteClient.SlaveOf(ctx, "NO", "ONE").Err(); err != nil {
+	if err := promoteReplicationClient(ctx, promoteClient); err != nil {
 		return fmt.Errorf("promote %s to master: %w", targetMaster, err)
 	}
 	log.FromContext(ctx).Info("Promoted pod to master", "pod", targetMaster)
@@ -164,7 +164,7 @@ func PromoteMasterAndReslave(ctx context.Context, client kubernetes.Interface, c
 			continue
 		}
 		c := configureRedisReplicationClient(ctx, client, cr, pod)
-		if err := c.SlaveOf(ctx, targetIP, "6379").Err(); err != nil {
+		if err := reconfigureReplicationClient(ctx, c, targetIP); err != nil {
 			c.Close()
 			return fmt.Errorf("slave %s of %s: %w", pod, targetMaster, err)
 		}
