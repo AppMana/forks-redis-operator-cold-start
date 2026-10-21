@@ -41,6 +41,9 @@ func (c *checker) GetPassword(ctx context.Context, ns string, secret *commonapi.
 	if secret == nil {
 		return "", nil
 	}
+	if secret.Name == nil || secret.Key == nil || *secret.Name == "" || *secret.Key == "" {
+		return "", errors.New("password secret reference requires a non-empty name and key")
+	}
 	secretName, err := c.k8s.CoreV1().Secrets(ns).Get(ctx, *secret.Name, metav1.GetOptions{})
 	if err != nil {
 		return "", err

@@ -78,7 +78,7 @@ func Test_getRedisPassword(t *testing.T) {
 			secretName:  "redis-secret",
 			secretKey:   "missingKey",
 			expected:    "",
-			expectedErr: false,
+			expectedErr: true,
 		},
 	}
 

@@ -438,6 +438,12 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 	}
 
 	var masterPass string
+	// A configured but unsupported source is not equivalent to no password:
+	// passing an empty password would erase the live Sentinel auth-pass.
+	if source := rs.Spec.RedisSentinelConfig.RedisReplicationPassword; source != nil &&
+		(source.SecretKeyRef == nil || source.ConfigMapKeyRef != nil || source.FieldRef != nil || source.ResourceFieldRef != nil) {
+		return errors.New("redis replication password requires only a secretKeyRef")
+	}
 	if rs.Spec.RedisSentinelConfig.RedisReplicationPassword != nil && rs.Spec.RedisSentinelConfig.RedisReplicationPassword.SecretKeyRef != nil {
 		masterPass, err = NewChecker(h.k8s).GetPassword(ctx, rs.Namespace, &commonapi.ExistingPasswordSecret{
 			Name: &rs.Spec.RedisSentinelConfig.RedisReplicationPassword.SecretKeyRef.Name,

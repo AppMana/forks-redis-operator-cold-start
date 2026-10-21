@@ -16,7 +16,7 @@ import (
 
 // getRedisPassword method will return the redis password from the secret
 func getRedisPassword(ctx context.Context, client kubernetes.Interface, namespace, name, secretKey string) (string, error) {
-	secretName, err := client.CoreV1().Secrets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
+	secretName, err := client.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		logf.FromContext(ctx).Error(err, "Failed in getting existing secret for redis")
 		return "", err
@@ -28,7 +28,7 @@ func getRedisPassword(ctx context.Context, client kubernetes.Interface, namespac
 		}
 	}
 	logf.FromContext(ctx).Error(errors.New("secret key not found"), "Secret key not found in the secret")
-	return "", nil
+	return "", errors.New("secret key not found")
 }
 
 func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespace string, tlsConfig *commonapi.TLSConfig) *tls.Config {
