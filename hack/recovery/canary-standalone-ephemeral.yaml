@@ -1,0 +1,21 @@
+# Lab-only approximation of redis-trainer: one Redis, no persistent data mount.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: redis-upgrade-canary-standalone
+---
+apiVersion: redis.redis.opstreelabs.in/v1beta2
+kind: Redis
+metadata:
+  name: trainer
+  namespace: redis-upgrade-canary-standalone
+spec:
+  podSecurityContext:
+    runAsUser: 1000
+    fsGroup: 1000
+  kubernetesConfig:
+    image: quay.io/opstree/redis:v7.0.15
+    imagePullPolicy: IfNotPresent
+    resources:
+      requests: {cpu: 25m, memory: 64Mi}
+      limits: {memory: 256Mi}
