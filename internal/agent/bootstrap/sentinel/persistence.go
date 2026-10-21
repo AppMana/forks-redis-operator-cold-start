@@ -71,5 +71,22 @@ func retainedElection(path, group string) (monitor []string, state [][]string, e
 	if monitor == nil {
 		return nil, nil, fmt.Errorf("retained Sentinel configuration has no monitor; refusing to overwrite election state")
 	}
-	return monitor, state, nil
+	// Discovered replicas are advisory topology, not election identity. Redis
+	// refuses to start with duplicate replica endpoints in a rewritten config.
+	// A former replica may also now be the retained monitored primary. Keep the
+	// monitor and all election/peer state, but emit each other replica once.
+	// Compare literal endpoints only: DNS is not reliable during cold startup.
+	seenReplicas := map[string]bool{net.JoinHostPort(monitor[3], monitor[4]): true}
+	filtered := make([][]string, 0, len(state))
+	for _, fields := range state {
+		if fields[1] == "known-replica" || fields[1] == "known-slave" {
+			endpoint := net.JoinHostPort(fields[3], fields[4])
+			if seenReplicas[endpoint] {
+				continue
+			}
+			seenReplicas[endpoint] = true
+		}
+		filtered = append(filtered, fields)
+	}
+	return monitor, filtered, nil
 }

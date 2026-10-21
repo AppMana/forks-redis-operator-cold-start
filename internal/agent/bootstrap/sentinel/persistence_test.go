@@ -75,6 +75,36 @@ func TestPersistentSentinelFirstBoot(t *testing.T) {
 	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }
 
+func TestPersistentSentinelNormalizesRetainedReplicaInventory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sentinel.conf")
+	t.Setenv("SENTINEL_CONFIG_FILE", path)
+	t.Setenv("SENTINEL_PERSISTENCE_ENABLED", "true")
+	t.Setenv("MASTER_GROUP_NAME", "test")
+	old := "sentinel monitor test redis-2.example 6379 2\n" +
+		"sentinel myid retained-id\nsentinel current-epoch 12\nsentinel config-epoch test 11\nsentinel leader-epoch test 12\n" +
+		"sentinel known-replica test redis-2.example 6379\n" +
+		"sentinel known-replica test redis-2.example 6379\n" +
+		"sentinel known-slave test redis-1.example 6379\n" +
+		"sentinel known-replica test redis-1.example 6379\n" +
+		"sentinel known-replica test redis-1.example 6380\n" +
+		"sentinel known-sentinel test sentinel-1.example 26379 other-id\n"
+	require.NoError(t, os.WriteFile(path, []byte(old), 0o600))
+	require.NoError(t, GenerateConfig())
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	got := string(raw)
+	require.NotContains(t, got, "sentinel known-replica test redis-2.example")
+	require.Equal(t, 1, strings.Count(got, "test redis-1.example 6379"))
+	require.Contains(t, got, "sentinel known-replica test redis-1.example 6380")
+	for _, line := range []string{"sentinel myid retained-id", "sentinel current-epoch 12", "sentinel config-epoch test 11", "sentinel leader-epoch test 12", "sentinel known-sentinel test sentinel-1.example 26379 other-id"} {
+		require.Contains(t, got, line)
+	}
+	require.NoError(t, GenerateConfig())
+	again, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, got, string(again))
+}
+
 func TestPersistentSentinelKeepsResolverUntilHostnameStateIsMigrated(t *testing.T) {
 	for _, state := range []string{
 		"sentinel monitor test localhost 6379 2\n",
