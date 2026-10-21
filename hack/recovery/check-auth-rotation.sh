@@ -5,12 +5,14 @@ config="${1:?local kubeconfig required}"
 context="$(kubectl --kubeconfig "$config" config current-context)"
 [[ "$context" == kind-redis-recovery-* ]]
 [[ "$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" == https://127.0.0.1:* ]]
-namespace=redis-upgrade-canary-auth-rotation
+namespace="${CANARY_AUTH_NAMESPACE:-redis-upgrade-canary-auth-rotation}"
+[[ "$namespace" == redis-upgrade-canary-auth-* ]]
+expected="${CANARY_AUTH_VALUE:-preserved-auth-rotation-20261020}"
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$namespace")
 cli() {
   local secret="$1" pod="$2" container="$3"; shift 3
   "${k[@]}" get secret "$secret" -o json | jq -r '.data.password|@base64d' |
-    "${k[@]}" exec -i "$pod" -c "$container" -- sh -ec 'read -r REDISCLI_AUTH; export REDISCLI_AUTH; exec redis-cli --raw "$@"' sh "$@" 2>/dev/null
+    "${k[@]}" exec -i "$pod" -c "$container" -- sh -ec 'IFS= read -r REDISCLI_AUTH; export REDISCLI_AUTH; exec redis-cli --raw "$@"' sh "$@" 2>/dev/null
 }
 ips="$("${k[@]}" get endpointslices -l kubernetes.io/service-name=upgrade-master -o json | jq -r '[.items[].endpoints[]?|select(.conditions.ready!=false)|.addresses[]]|unique|.[]')"
 [[ "$(printf '%s\n' "$ips" | sed '/^$/d' | wc -l)" -eq 1 ]]
@@ -25,7 +27,7 @@ for ordinal in 0 1 2; do
   else
     [[ "$info" == *$'role:slave\n'* && "$info" == *$'master_link_status:up\n'* ]]
   fi
-  [[ "$(cli redis-auth "$pod" upgrade GET appmana:rotation:retained)" == preserved-auth-rotation-20261020 ]]
+  [[ "$(cli redis-auth "$pod" upgrade GET appmana:rotation:retained)" == "$expected" ]]
 done
 [[ -n "$primary" ]]
 [[ "$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')" == "$primary" ]]

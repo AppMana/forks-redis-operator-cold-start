@@ -5,7 +5,11 @@ config="${1:?local kubeconfig required}"
 context="$(kubectl --kubeconfig "$config" config current-context)"
 [[ "$context" == kind-redis-recovery-* ]]
 [[ "$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" == https://127.0.0.1:* ]]
-k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n redis-upgrade-canary-auth-rotation)
+namespace="${CANARY_AUTH_NAMESPACE:-redis-upgrade-canary-auth-rotation}"
+[[ "$namespace" == redis-upgrade-canary-auth-* ]]
+k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$namespace")
+previous_secret="$("${k[@]}" get secret redis-auth-before-rotation --ignore-not-found -o name)"
+[[ "${REQUIRE_PASSWORD_OVERLAP:-false}" != true || -n "$previous_secret" ]]
 dir="$(cd "$(dirname "$0")" && pwd)"
 bash "$dir/check-auth-rotation.sh" "$config"
 [[ "$("${k[@]}" get redisreplication upgrade -o json | jq '.spec.sentinel.configVolumeClaimTemplate != null')" == true ]]
@@ -31,9 +35,10 @@ done
 [[ "$claims" == "$("${k[@]}" get pvc -o json | jq -Sc '[.items[]|{name:.metadata.name,uid:.metadata.uid}]|sort_by(.name)')" ]]
 for ordinal in 0 1 2; do
   [[ "${identities[$ordinal]}" == "$("${k[@]}" exec "upgrade-s-$ordinal" -c sentinel -- sh -ec 'REDISCLI_AUTH="$REDIS_PASSWORD"; export REDISCLI_AUTH; redis-cli --raw -p 26379 SENTINEL MYID')" ]]
+  [[ -n "$previous_secret" ]] || continue
   # Report whether bootstrap retained the temporary overlap; never print AUTH errors.
   reply="$("${k[@]}" get secret redis-auth-before-rotation -o json | jq -r '.data.password|@base64d' |
-    "${k[@]}" exec -i "upgrade-$ordinal" -c upgrade -- sh -ec 'read -r REDISCLI_AUTH; export REDISCLI_AUTH; redis-cli --raw PING' 2>/dev/null)"
+    "${k[@]}" exec -i "upgrade-$ordinal" -c upgrade -- sh -ec 'IFS= read -r REDISCLI_AUTH; export REDISCLI_AUTH; redis-cli --raw PING' 2>/dev/null)"
   if [[ "$reply" == PONG ]]; then echo "upgrade-$ordinal old credential still accepted"; else echo "upgrade-$ordinal old credential rejected"; fi
   if [[ "${REQUIRE_PASSWORD_OVERLAP:-false}" == true ]]; then
     [[ "$reply" == PONG ]] || { echo 'FAIL: password overlap did not survive bootstrap' >&2; exit 1; }

@@ -6,7 +6,9 @@ config="${1:?local kubeconfig required}"
 context="$(kubectl --kubeconfig "$config" config current-context)"
 [[ "$context" == kind-redis-recovery-* ]]
 [[ "$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" == https://127.0.0.1:* ]]
-k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n redis-upgrade-canary-auth-rotation)
+namespace="${CANARY_AUTH_NAMESPACE:-redis-upgrade-canary-auth-rotation}"
+[[ "$namespace" == redis-upgrade-canary-auth-* ]]
+k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$namespace")
 dir="$(cd "$(dirname "$0")" && pwd)"
 bash "$dir/check-auth-rotation.sh" "$config"
 primary="$("${k[@]}" get redisreplication upgrade -o jsonpath='{.status.masterNode}')"
