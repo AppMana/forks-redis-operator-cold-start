@@ -337,6 +337,9 @@ func (r *Reconciler) reconcileFinalizer(ctx context.Context, instance *rrvb2.Red
 }
 
 func (r *Reconciler) reconcileResources(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
+	if err := validateEmbeddedSentinelQuorum(instance); err != nil {
+		return intctrlutil.RequeueE(ctx, err, "invalid Sentinel quorum")
+	}
 	if err := validatePasswordReferences(instance); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "invalid credential reference")
 	}
@@ -444,6 +447,9 @@ func (r *Reconciler) configureSentinelPod(
 	masterAddr string,
 	masterPassword string,
 ) error {
+	if err := validateEmbeddedSentinelQuorum(inst); err != nil {
+		return err
+	}
 	sentinelPassword, err := r.sentinelPassword(ctx, inst)
 	if err != nil {
 		return err
@@ -473,12 +479,11 @@ func (r *Reconciler) configureSentinelPod(
 		Password: masterPassword,
 	}
 
-	quorum := int(inst.Spec.Sentinel.Size/2) + 1
 	if err := sentinelService.SentinelMonitor(
 		ctx,
 		masterConnInfo,
 		masterGroupName,
-		fmt.Sprintf("%d", quorum),
+		embeddedSentinelQuorum(inst),
 	); err != nil {
 		return err
 	}

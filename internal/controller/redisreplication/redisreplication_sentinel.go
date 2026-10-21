@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
@@ -202,9 +203,27 @@ func buildSentinelContainer(rr *rrvb2.RedisReplication) corev1.Container {
 	return container
 }
 
+func embeddedSentinelQuorum(rr *rrvb2.RedisReplication) string {
+	if rr.Spec.Sentinel.Quorum != "" {
+		return rr.Spec.Sentinel.Quorum
+	}
+	return fmt.Sprintf("%d", rr.Spec.Sentinel.Size/2+1)
+}
+
+func validateEmbeddedSentinelQuorum(rr *rrvb2.RedisReplication) error {
+	if !rr.EnableSentinel() {
+		return nil
+	}
+	value, err := strconv.ParseUint(embeddedSentinelQuorum(rr), 10, 31)
+	if err != nil || value == 0 {
+		return fmt.Errorf("sentinel quorum must be a positive 32-bit integer")
+	}
+	return nil
+}
+
 func buildSentinelEnv(rr *rrvb2.RedisReplication) []corev1.EnvVar {
 	envs := []corev1.EnvVar{
-		{Name: "QUORUM", Value: fmt.Sprintf("%d", rr.Spec.Sentinel.Size/2+1)},
+		{Name: "QUORUM", Value: embeddedSentinelQuorum(rr)},
 		{Name: "RESOLVE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.ResolveHostnames)},
 		{Name: "ANNOUNCE_HOSTNAMES", Value: resolveHostnamesOrDefault(rr.Spec.Sentinel.AnnounceHostnames)},
 	}

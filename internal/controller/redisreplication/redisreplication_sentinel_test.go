@@ -391,6 +391,7 @@ func (f *fakeSentinelRedisService) SentinelGetMasterAddrByName(context.Context, 
 }
 
 type fakeSentinelRedisService struct {
+	monitoredQuorum string
 	hostnameError   error
 	hostnameCalls   []string
 	slaves          int
@@ -408,10 +409,53 @@ func (f *fakeSentinelRedisService) GetAttachedReplicaCount(context.Context) (int
 	return 0, nil
 }
 
-func (f *fakeSentinelRedisService) SentinelMonitor(_ context.Context, master *redis.ConnectionInfo, _, _ string) error {
+func (f *fakeSentinelRedisService) SentinelMonitor(_ context.Context, master *redis.ConnectionInfo, _ string, quorum string) error {
+	f.monitoredQuorum = quorum
 	f.hostnameCalls = append(f.hostnameCalls, "monitor")
 	f.monitoredMaster = master
 	return nil
+}
+
+func TestEmbeddedSentinelHonorsConfiguredQuorum(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		size             int32
+		configured, want string
+	}{
+		{name: "explicit lower", size: 3, configured: "1", want: "1"},
+		{name: "explicit higher", size: 3, configured: "3", want: "3"},
+		{name: "API default retained on five nodes", size: 5, configured: "2", want: "2"},
+		{name: "legacy empty three nodes", size: 3, want: "2"},
+		{name: "legacy empty five nodes", size: 5, want: "3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inst := &rrvb2.RedisReplication{Spec: rrvb2.RedisReplicationSpec{Size: ptr.To(int32(3)), Sentinel: &rrvb2.Sentinel{Size: tc.size}}}
+			inst.Spec.Sentinel.Quorum = tc.configured
+			envs := buildSentinelEnv(inst)
+			require.Equal(t, "QUORUM", envs[0].Name)
+			assert.Equal(t, tc.want, envs[0].Value, "bootstrap")
+			svc := &fakeSentinelRedisService{slaves: 2, sentinels: int(tc.size)}
+			r := &Reconciler{K8sClient: fake.NewSimpleClientset()}
+			err := r.configureSentinelPod(context.Background(), &fakeSentinelRedisClient{svc: svc}, inst, corev1.Pod{Status: corev1.PodStatus{PodIP: "10.0.0.10"}}, "10.0.0.20", "")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, svc.monitoredQuorum, "runtime reconciliation")
+		})
+	}
+}
+
+func TestInvalidEmbeddedQuorumStopsBeforeChanges(t *testing.T) {
+	for _, value := range []string{"0", "-1", "invalid", "2\nport 1234", "2147483648", " 2"} {
+		t.Run(value, func(t *testing.T) {
+			inst := &rrvb2.RedisReplication{Spec: rrvb2.RedisReplicationSpec{Sentinel: &rrvb2.Sentinel{Size: 3}}}
+			inst.Spec.Sentinel.Quorum = value
+			// Nil clients prove validation happens before API or Redis access.
+			r := &Reconciler{}
+			_, err := r.reconcileResources(context.Background(), inst)
+			require.ErrorContains(t, err, "quorum must be a positive")
+			err = r.configureSentinelPod(context.Background(), nil, inst, corev1.Pod{}, "", "")
+			require.ErrorContains(t, err, "quorum must be a positive")
+		})
+	}
 }
 
 func (f *fakeSentinelRedisService) SentinelSet(context.Context, string, string, string) error {

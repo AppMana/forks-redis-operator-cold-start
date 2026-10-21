@@ -1070,6 +1070,12 @@ func TestQuerySentinelMonitoredMaster(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 			assert.ElementsMatch(t, []string{"10.0.1.10", "10.0.1.11", "10.0.1.12"}, redisClient.connectedHosts)
+			// Failure-detection quorum must not lower recovery-primary consensus.
+			lowQuorum := instance.DeepCopy()
+			lowQuorum.Spec.Sentinel.Quorum = "1"
+			got, err = r.querySentinelMonitoredMaster(context.Background(), redisClient, lowQuorum, tt.candidates)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got, "explicit quorum=1 must retain majority agreement")
 		})
 	}
 }
