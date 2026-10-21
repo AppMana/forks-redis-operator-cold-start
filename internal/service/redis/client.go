@@ -266,7 +266,7 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 			return fmt.Errorf("incomplete Sentinel master metadata; existing monitor preserved")
 		}
 		if result["ip"] == master.Host && result["port"] == master.Port {
-			return nil
+			return setSentinelMasterAuth(ctx, client, masterGroupName, master.Password)
 		}
 	}
 
@@ -311,18 +311,18 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 		return err
 	}
 
-	if master.Password != "" {
-		cmd = rediscli.NewBoolCmd(ctx, "SENTINEL", "SET", masterGroupName, "auth-pass", master.Password)
-		err = client.Process(ctx, cmd)
-		if err != nil {
-			return err
-		}
-		if err = cmd.Err(); err != nil {
-			return err
-		}
-	}
+	return setSentinelMasterAuth(ctx, client, masterGroupName, master.Password)
+}
 
-	return nil
+// Reconcile credentials even when the monitored address is unchanged. Empty
+// means authentication was removed and must clear any retained old password.
+// Do not REMOVE/MONITOR for rotation: that would discard election state.
+func setSentinelMasterAuth(ctx context.Context, client *rediscli.Client, group, password string) error {
+	cmd := rediscli.NewBoolCmd(ctx, "SENTINEL", "SET", group, "auth-pass", password)
+	if err := client.Process(ctx, cmd); err != nil {
+		return err
+	}
+	return cmd.Err()
 }
 
 func (c *service) IsMaster(ctx context.Context) (bool, error) {

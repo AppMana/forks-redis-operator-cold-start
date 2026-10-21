@@ -58,7 +58,9 @@ func TestSentinelMonitorWireProtocols(t *testing.T) {
 							_, _ = io.WriteString(conn, "+OK\r\n")
 						case "MONITOR":
 							_, _ = io.WriteString(conn, "+OK\r\n")
-							if strings.Join(commands, ",") != "MASTER,CONFIG,REMOVE,MONITOR" {
+						case "SET":
+							_, _ = io.WriteString(conn, "+OK\r\n")
+							if strings.Join(commands, ",") != "MASTER,CONFIG,REMOVE,MONITOR,SET" {
 								finished <- fmt.Errorf("unexpected sequence %v", commands)
 							} else {
 								finished <- nil

@@ -27,6 +27,7 @@ func TestSentinelMonitorAcceptsEnabledResolverMap(t *testing.T) {
 	mock.ExpectDo("SENTINEL", "CONFIG", "GET", "resolve-hostnames").SetVal(map[string]string{"resolve-hostnames": "yes"})
 	mock.ExpectDo("SENTINEL", "REMOVE", "upgrade").SetVal(true)
 	mock.ExpectDo("SENTINEL", "MONITOR", "upgrade", "redis-0.example", "6379", "2").SetVal(true)
+	mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", "").SetVal(true)
 	require.NoError(t, svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "redis-0.example", Port: "6379"}, "upgrade", "2"))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -41,10 +42,11 @@ func TestSentinelMonitorPreservesGroupWhenResolverCannotBeChecked(t *testing.T) 
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestSentinelMonitorDoesNotTouchAlreadyCorrectHostname(t *testing.T) {
+func TestSentinelMonitorPreservesAlreadyCorrectHostname(t *testing.T) {
 	db, mock := redismock.NewClientMock()
 	svc := &service{redisClient: db}
 	mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "redis-0.example", "port": "6379"})
+	mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", "").SetVal(true)
 	require.NoError(t, svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "redis-0.example", Port: "6379"}, "upgrade", "2"))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -72,6 +74,7 @@ func TestSentinelMonitorCreatesOnlyConfirmedMissingGroup(t *testing.T) {
 	svc := &service{redisClient: db}
 	mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetErr(sentinelTestError("ERR No such master with that name"))
 	mock.ExpectDo("SENTINEL", "MONITOR", "upgrade", "10.0.0.2", "6379", "2").SetVal(true)
+	mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", "").SetVal(true)
 	require.NoError(t, svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, "upgrade", "2"))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -82,5 +85,29 @@ func TestSentinelMonitorPreservesMalformedExistingGroup(t *testing.T) {
 	mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1"})
 	err := svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.2", Port: "6379"}, "upgrade", "2")
 	require.ErrorContains(t, err, "incomplete Sentinel master metadata")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSentinelMonitorReconcilesCredentialsWithoutResettingGroup(t *testing.T) {
+	for _, password := range []string{"synthetic-rotated-password", ""} {
+		t.Run(map[bool]string{true: "remove", false: "rotate"}[password == ""], func(t *testing.T) {
+			db, mock := redismock.NewClientMock()
+			svc := &service{redisClient: db}
+			mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1", "port": "6379"})
+			mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", password).SetVal(true)
+			require.NoError(t, svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.1", Port: "6379", Password: password}, "upgrade", "2"))
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+func TestSentinelMonitorReportsCredentialUpdateFailure(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	svc := &service{redisClient: db}
+	mock.ExpectDo("SENTINEL", "MASTER", "upgrade").SetVal(map[string]string{"ip": "10.0.0.1", "port": "6379"})
+	updateErr := errors.New("credential update unavailable")
+	mock.ExpectDo("SENTINEL", "SET", "upgrade", "auth-pass", "synthetic-password").SetErr(updateErr)
+	err := svc.SentinelMonitor(context.Background(), &ConnectionInfo{Host: "10.0.0.1", Port: "6379", Password: "synthetic-password"}, "upgrade", "2")
+	require.ErrorIs(t, err, updateErr)
 	require.NoError(t, mock.ExpectationsWereMet())
 }

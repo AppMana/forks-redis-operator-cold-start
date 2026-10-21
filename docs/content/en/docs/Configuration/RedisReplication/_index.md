@@ -136,7 +136,7 @@ spec:
 
 When `spec.sentinel` is set, two secrets control authentication:
 
-- `spec.kubernetesConfig.redisSecret` is the Redis password. The embedded Sentinel uses it as `auth-pass` towards the monitored master; it is passed to the Sentinel pod as `MASTER_PASSWORD`, and the operator sets it again with `SENTINEL SET mymaster auth-pass` whenever it points Sentinel at a new master address.
+- `spec.kubernetesConfig.redisSecret` is the Redis password. The embedded Sentinel uses it as `auth-pass` towards the monitored master; it is passed to the Sentinel pod as `MASTER_PASSWORD`. When reconciling a monitor, the operator also applies `SENTINEL SET mymaster auth-pass` even if the master address has not changed, so credential updates do not require resetting the monitor or its election state. An empty desired password clears retained authentication. This does not by itself rotate Redis server credentials or restart pods whose environment references a changed Secret.
 - `spec.sentinel.redisSecret` is the Sentinel's own password (`requirepass` on port 26379), the same role `kubernetesConfig.redisSecret` plays on a standalone `RedisSentinel`. It is passed to the Sentinel pod as `REDIS_PASSWORD`; the operator authenticates to Sentinel with it, and Sentinel-aware clients must send it as well. When it is omitted, the Sentinel port accepts unauthenticated connections.
 
 Previously `spec.sentinel.redisSecret` only changed the boot-time `MASTER_PASSWORD` and the Sentinel port was always unauthenticated. If you already set it, upgrading enables `requirepass` on the Sentinel pods, so clients that discover the master through Sentinel must start sending that password.
