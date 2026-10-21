@@ -40,6 +40,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -151,7 +152,7 @@ func runManager(opts *managerOptions) error {
 		setupLog.Error(err, "unable to start manager")
 		return err
 	}
-	k8sClient, err := createK8sClient(configuredQPS)
+	k8sClient, err := createK8sClient(cfg)
 	if err != nil {
 		return err
 	}
@@ -223,10 +224,10 @@ func createControllerOptions(opts *managerOptions) ctrl.Options {
 }
 
 // createK8sClient creates Kubernetes client
-func createK8sClient(qps float32) (kubernetes.Interface, error) {
-	k8sConfig := k8sutils.GenerateK8sConfig()
-
-	k8sClient, err := k8sutils.GenerateK8sClient(k8sConfig, qps)
+func createK8sClient(cfg *rest.Config) (kubernetes.Interface, error) {
+	// Reuse the selected endpoint, controller-runtime defaults and explicit
+	// rate/timeout settings. Reloading a fresh config silently dropped them.
+	k8sClient, err := kubernetes.NewForConfig(rest.CopyConfig(cfg))
 	if err != nil {
 		setupLog.Error(err, "unable to create k8s client")
 		return nil, err
