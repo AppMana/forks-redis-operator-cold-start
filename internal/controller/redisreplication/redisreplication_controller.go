@@ -537,7 +537,7 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 	observedPods := topology.Observed()
 	incompleteTopology := !topology.Complete()
 	if r.Client != nil || r.SentinelElectedMaster != nil {
-		if elected, ok := r.sentinelElectedMaster(ctx, instance); ok && elected != "" && !slices.Contains(masterNodes, elected) {
+		if elected, ok := r.sentinelElectedMaster(ctx, instance); ok && (elected == "" || !slices.Contains(masterNodes, elected)) {
 			return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "waiting for Sentinel-elected primary to report master")
 		}
 	}

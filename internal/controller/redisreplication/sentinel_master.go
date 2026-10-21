@@ -82,11 +82,10 @@ func listSentinelGroups(ctx context.Context, r client.Reader, rr *rrvb2.RedisRep
 // currently holds as the master, and maps the address a majority of each
 // deployment agrees on to a Redis pod.
 //
-// ok is false when no Sentinel monitors rr, or when no deployment produced a
-// majority answer, or when deployments disagree; callers then fall back to
-// what the Redis pods themselves report. ok is true with pod=="" when the
-// Sentinels agree on an address that no live Redis pod holds, which is the
-// case between a primary dying and Sentinel promoting a replica.
+// ok is false only when no Sentinel group is configured or every group is
+// positively unconfigured during bootstrap. ok is true with pod=="" for
+// unresolved authority (unreachable/minority/conflicting groups, or a real
+// elected address without a live pod). That state must block fallback repair.
 func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisReplication) (string, bool) {
 	if r.SentinelElectedMaster != nil {
 		return r.SentinelElectedMaster(ctx, rr)
@@ -95,7 +94,7 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 	groups, err := listSentinelGroups(ctx, r.Client, rr)
 	if err != nil {
 		logger.Error(err, "list Sentinels monitoring replication")
-		return "", false
+		return "", true
 	}
 	if len(groups) == 0 {
 		return "", false
@@ -104,10 +103,16 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 	redisClient := redis.NewClient()
 	elected := ""
 	for _, group := range groups {
+		// Before any Sentinel pods exist, initial Redis bootstrap must be able
+		// to create the primary they will monitor. Never use this exception for
+		// an already recorded deployment whose Sentinel pods disappeared.
+		if len(group.pods) == 0 && rr.Status.MasterNode == "" {
+			continue
+		}
 		password, err := checker.GetPassword(ctx, rr.Namespace, group.password)
 		if err != nil {
 			logger.Error(err, "get Sentinel password", "masterGroup", group.masterGroup)
-			continue
+			return "", true
 		}
 		var (
 			mu      sync.Mutex
@@ -129,21 +134,27 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 					logger.V(1).Info("Sentinel did not answer", "sentinel", name, "error", err.Error())
 					return
 				}
+				answer := ""
 				if monitored {
-					mu.Lock()
-					answers = append(answers, net.JoinHostPort(host, port))
-					mu.Unlock()
+					answer = net.JoinHostPort(host, port)
 				}
+				mu.Lock()
+				answers = append(answers, answer)
+				mu.Unlock()
 			}(pod.Name)
 		}
 		wg.Wait()
 		addr, ok := majorityAddress(answers, group.size)
 		if !ok {
-			continue
+			if sentinelsUnconfigured(answers, group.size) {
+				continue
+			}
+			logger.Info("Sentinel authority unresolved; refusing fallback election", "masterGroup", group.masterGroup)
+			return "", true
 		}
 		if elected != "" && elected != addr {
 			logger.Info("Sentinel deployments disagree on the master", "first", elected, "second", addr)
-			return "", false
+			return "", true
 		}
 		elected = addr
 	}
@@ -156,9 +167,26 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 		common.GetRedisLabels(rr.Name, common.SetupTypeReplication, "replication", nil),
 	)); err != nil {
 		logger.Error(err, "list Redis pods")
-		return "", false
+		return "", true
 	}
 	return podForAddress(pods.Items, elected), true
+}
+
+func sentinelsUnconfigured(answers []string, size int32) bool {
+	if size <= 0 || len(answers) < int(size) {
+		return false
+	}
+	for _, addr := range answers {
+		if addr == "" {
+			continue // Successful lookup explicitly reported no monitor.
+		}
+		host, _, err := net.SplitHostPort(addr)
+		ip := net.ParseIP(host)
+		if err != nil || ip == nil || !ip.IsUnspecified() {
+			return false
+		}
+	}
+	return true
 }
 
 // majorityAddress returns the address that more than half of a Sentinel
@@ -171,6 +199,9 @@ func majorityAddress(answers []string, size int32) (string, bool) {
 	}
 	votes := map[string]int32{}
 	for _, addr := range answers {
+		if addr == "" {
+			continue
+		}
 		// Init-generated Sentinel configs monitor an unspecified address until
 		// Redis bootstraps. This is not an election for a missing/dead primary:
 		// treating it as authoritative deadlocks first installation. Keep the

@@ -551,6 +551,7 @@ func TestReconcileStatusKeepsLastKnownMasterWhenNoMasterIsObserved(t *testing.T)
 func TestReconcileStatusUpdatesMasterWhenANewMasterIsObserved(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, rrvb2.AddToScheme(scheme))
+	require.NoError(t, rsvb2.AddToScheme(scheme))
 
 	seedInstance := newReplicationInstanceForTest()
 	seedInstance.Status.MasterNode = "example-replication-0"
@@ -590,6 +591,7 @@ func TestReconcileStatusUpdatesMasterWhenANewMasterIsObserved(t *testing.T) {
 func TestReconcileStatusUpdatesMasterWhenANewMasterWithAttachedReplicasIsObservedInAnIncompleteTopology(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, rrvb2.AddToScheme(scheme))
+	require.NoError(t, rsvb2.AddToScheme(scheme))
 
 	seedInstance := newReplicationInstanceForTest()
 	seedInstance.Status.MasterNode = "example-replication-0"
