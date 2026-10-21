@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Local-only credential restart qualification; retain all PVCs and Secrets.
 set -euo pipefail
+trap 'echo "FAIL: cold restart qualification at line $LINENO; PVCs and Secrets retained" >&2' ERR
 config="${1:?local kubeconfig required}"
 context="$(kubectl --kubeconfig "$config" config current-context)"
 [[ "$context" == kind-redis-recovery-* ]]
@@ -10,6 +11,8 @@ namespace="${CANARY_AUTH_NAMESPACE:-redis-upgrade-canary-auth-rotation}"
 k=(kubectl --kubeconfig "$config" --context "$context" --request-timeout=10s -n "$namespace")
 previous_secret="$("${k[@]}" get secret redis-auth-before-rotation --ignore-not-found -o name)"
 [[ "${REQUIRE_PASSWORD_OVERLAP:-false}" != true || -n "$previous_secret" ]]
+[[ "${REQUIRE_OLD_PASSWORD_REJECTED:-false}" != true || -n "$previous_secret" ]]
+[[ "${REQUIRE_PASSWORD_OVERLAP:-false}:${REQUIRE_OLD_PASSWORD_REJECTED:-false}" != true:true ]]
 dir="$(cd "$(dirname "$0")" && pwd)"
 bash "$dir/check-auth-rotation.sh" "$config"
 [[ "$("${k[@]}" get redisreplication upgrade -o json | jq '.spec.sentinel.configVolumeClaimTemplate != null')" == true ]]
@@ -42,6 +45,9 @@ for ordinal in 0 1 2; do
   if [[ "$reply" == PONG ]]; then echo "upgrade-$ordinal old credential still accepted"; else echo "upgrade-$ordinal old credential rejected"; fi
   if [[ "${REQUIRE_PASSWORD_OVERLAP:-false}" == true ]]; then
     [[ "$reply" == PONG ]] || { echo 'FAIL: password overlap did not survive bootstrap' >&2; exit 1; }
+  fi
+  if [[ "${REQUIRE_OLD_PASSWORD_REJECTED:-false}" == true ]]; then
+    [[ "$reply" == 'NOAUTH Authentication required.' ]] || { echo 'FAIL: old credential rejection was not verified' >&2; exit 1; }
   fi
 done
 echo 'PASS: new credentials survive full pod replacement with retained data, PVC UIDs and Sentinel identities'
