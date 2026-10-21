@@ -20,7 +20,8 @@ import (
 func TestSentinelMonitorWireProtocols(t *testing.T) {
 	for _, protocol := range []int{2, 3} {
 		t.Run(fmt.Sprint(protocol), func(t *testing.T) {
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			listenConfig := net.ListenConfig{}
+			listener, err := listenConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
 			require.NoError(t, err)
 			t.Cleanup(func() { _ = listener.Close() })
 			finished := make(chan error, 1)
