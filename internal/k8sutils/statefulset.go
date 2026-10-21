@@ -286,7 +286,7 @@ func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, 
 	managed := false
 	for _, owner := range stored.OwnerReferences {
 		if strings.HasPrefix(owner.APIVersion, "redis.redis.opstreelabs.in/") &&
-			(owner.Kind == "RedisReplication" || owner.Kind == "RedisSentinel") {
+			(owner.Kind == "Redis" || owner.Kind == "RedisCluster" || owner.Kind == "RedisReplication" || owner.Kind == "RedisSentinel") {
 			managed = true
 		}
 	}

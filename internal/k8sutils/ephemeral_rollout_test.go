@@ -12,7 +12,7 @@ import (
 )
 
 func TestEphemeralTemplateUpdateRequiresHold(t *testing.T) {
-	for _, kind := range []string{"RedisReplication", "RedisSentinel"} {
+	for _, kind := range []string{"Redis", "RedisCluster", "RedisReplication", "RedisSentinel"} {
 		for _, held := range []bool{false, true} {
 			t.Run(kind+map[bool]string{false: "/rolling", true: "/held"}[held], func(t *testing.T) {
 				stored := &appsv1.StatefulSet{
