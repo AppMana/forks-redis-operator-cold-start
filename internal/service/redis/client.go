@@ -16,6 +16,8 @@ const (
 	redisRoleMaster = "role:master"
 )
 
+var errConnectionInfoNotSet = errors.New("redis connection info is not set")
+
 type ConnectionInfo struct {
 	// Host is the IP address or hostname for connection
 	Host string
@@ -129,7 +131,7 @@ func (s *service) createClient() *rediscli.Client {
 func (c *service) GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, error) {
 	client := c.createClient()
 	if client == nil {
-		return nil, nil
+		return nil, errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -186,7 +188,7 @@ func (c *service) GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, err
 func (c *service) SentinelGetMasterAddrByName(ctx context.Context, masterGroupName string) (string, string, bool, error) {
 	client := c.createClient()
 	if client == nil {
-		return "", "", false, nil
+		return "", "", false, errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -205,6 +207,9 @@ func (c *service) SentinelGetMasterAddrByName(ctx context.Context, masterGroupNa
 
 func (c *service) SentinelConfigSet(ctx context.Context, key, value string) error {
 	client := c.createClient()
+	if client == nil {
+		return errConnectionInfoNotSet
+	}
 	defer client.Close()
 	current := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "CONFIG", "GET", key)
 	if err := client.Process(ctx, current); err != nil {
@@ -226,7 +231,7 @@ func (c *service) SentinelConfigSet(ctx context.Context, key, value string) erro
 func (c *service) SentinelSet(ctx context.Context, masterGroupName, key, value string) error {
 	client := c.createClient()
 	if client == nil {
-		return nil
+		return errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -244,7 +249,7 @@ func (c *service) SentinelSet(ctx context.Context, masterGroupName, key, value s
 func (c *service) SentinelReset(ctx context.Context, masterGroupName string) error {
 	client := c.createClient()
 	if client == nil {
-		return nil
+		return errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -267,7 +272,7 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 
 	client := c.createClient()
 	if client == nil {
-		return nil
+		return errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -356,7 +361,7 @@ func setSentinelMasterAuth(ctx context.Context, client *rediscli.Client, group, 
 func (c *service) IsMaster(ctx context.Context) (bool, error) {
 	client := c.createClient()
 	if client == nil {
-		return false, nil
+		return false, errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -370,7 +375,7 @@ func (c *service) IsMaster(ctx context.Context) (bool, error) {
 func (c *service) GetAttachedReplicaCount(ctx context.Context) (int, error) {
 	client := c.createClient()
 	if client == nil {
-		return 0, nil
+		return 0, errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -395,7 +400,7 @@ func (c *service) GetAttachedReplicaCount(ctx context.Context) (int, error) {
 func (c *service) GetKeyCount(ctx context.Context) (int64, error) {
 	client := c.createClient()
 	if client == nil {
-		return 0, errors.New("redis connection info is not set")
+		return 0, errConnectionInfoNotSet
 	}
 	defer client.Close()
 
@@ -436,7 +441,7 @@ func countKeyspaceKeys(info string) (int64, error) {
 func (c *service) GetClusterInfo(ctx context.Context) (*ClusterStatus, error) {
 	client := c.createClient()
 	if client == nil {
-		return nil, nil
+		return nil, errConnectionInfoNotSet
 	}
 	defer client.Close()
 
