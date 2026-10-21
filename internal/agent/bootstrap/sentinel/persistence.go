@@ -3,9 +3,28 @@ package bootstrap
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 )
+
+func retainedElectionNeedsResolver(monitor []string, state [][]string) bool {
+	if len(monitor) >= 4 && net.ParseIP(monitor[3]) == nil {
+		return true
+	}
+	for _, fields := range state {
+		if len(fields) < 4 {
+			continue
+		}
+		switch fields[1] {
+		case "known-replica", "known-slave", "known-sentinel":
+			if net.ParseIP(fields[3]) == nil {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // Keep only Sentinel-owned election state. Desired credentials, TLS and tuning
 // are regenerated, so a retained config never prevents credential rotation.

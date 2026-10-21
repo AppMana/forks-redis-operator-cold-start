@@ -60,3 +60,37 @@ func TestPersistentSentinelFirstBoot(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }
+
+func TestPersistentSentinelKeepsResolverUntilHostnameStateIsMigrated(t *testing.T) {
+	for _, state := range []string{
+		"sentinel monitor test localhost 6379 2\n",
+		"sentinel monitor test 127.0.0.1 6379 2\nsentinel known-replica test localhost 6379\n",
+		"sentinel monitor test 127.0.0.1 6379 2\nsentinel known-slave test localhost 6379\n",
+		"sentinel monitor test 127.0.0.1 6379 2\nsentinel known-sentinel test localhost 26379 abcdef\n",
+	} {
+		t.Run(state, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "sentinel.conf")
+			t.Setenv("SENTINEL_CONFIG_FILE", path)
+			t.Setenv("SENTINEL_PERSISTENCE_ENABLED", "true")
+			t.Setenv("MASTER_GROUP_NAME", "test")
+			t.Setenv("RESOLVE_HOSTNAMES", "no")
+			t.Setenv("ANNOUNCE_HOSTNAMES", "no")
+			require.NoError(t, os.WriteFile(path, []byte(state), 0o600))
+			require.NoError(t, GenerateConfig())
+			got, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.Contains(t, string(got), "sentinel resolve-hostnames yes")
+			require.Contains(t, string(got), "sentinel announce-hostnames no")
+			for _, line := range strings.Split(strings.TrimSpace(state), "\n") {
+				require.Contains(t, string(got), line)
+			}
+			// Once the controller has replaced DNS monitor/topology with IPs,
+			// subsequent restarts can honor resolver=no without losing state.
+			require.NoError(t, os.WriteFile(path, []byte("sentinel monitor test 127.0.0.1 6379 2\nsentinel known-replica test ::1 6379\n"), 0o600))
+			require.NoError(t, GenerateConfig())
+			got, err = os.ReadFile(path)
+			require.NoError(t, err)
+			require.Contains(t, string(got), "sentinel resolve-hostnames no")
+		})
+	}
+}

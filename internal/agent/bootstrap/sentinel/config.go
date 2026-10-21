@@ -80,6 +80,13 @@ func GenerateConfig() error {
 		failoverTimeout, _ := util.CoalesceEnv("FAILOVER_TIMEOUT", "180000")
 		resolveHostnames, _ := util.CoalesceEnv("RESOLVE_HOSTNAMES", "no")
 		announceHostnames, _ := util.CoalesceEnv("ANNOUNCE_HOSTNAMES", "no")
+		// A requested transition to IP mode must not make retained election
+		// state unparsable. Keep DNS resolution until the running controller
+		// has migrated the monitor and discovered peers to IP addresses. This
+		// does not enable hostname announcements or discard any election state.
+		if retainedElectionNeedsResolver(monitor, election) {
+			resolveHostnames = "yes"
+		}
 
 		// DNS must be enabled before Redis parses a retained hostname monitor.
 		cfg.Append("sentinel resolve-hostnames", resolveHostnames)
