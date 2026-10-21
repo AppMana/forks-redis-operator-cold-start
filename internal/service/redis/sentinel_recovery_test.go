@@ -77,7 +77,7 @@ func TestSentinelBatchRepairsInterruptedMonitorBeforeHealthyPeers(t *testing.T) 
 	require.Equal(t, []string{"b"}, mutations, "fresh coordinator must repair b before touching a or c")
 	fail = false
 	mutations = nil
-	require.ErrorContains(t, ReconcileSentinelMonitorBatch(context.Background(), makePeers()), "waiting to verify")
+	require.ErrorIs(t, ReconcileSentinelMonitorBatch(context.Background(), makePeers()), ErrSentinelMonitorPending)
 	require.Equal(t, []string{"b"}, mutations)
 	mutations = nil
 	require.NoError(t, ReconcileSentinelMonitorBatch(context.Background(), makePeers()))

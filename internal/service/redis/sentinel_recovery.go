@@ -50,6 +50,10 @@ type SentinelMonitorPeer struct {
 	Reconcile func(context.Context) error
 }
 
+// ErrSentinelMonitorPending means a repair succeeded but needs a fresh health
+// observation. It is progress, not a failure requiring exponential backoff.
+var ErrSentinelMonitorPending = errors.New("waiting to verify repaired Sentinel")
+
 // ReconcileSentinelMonitorBatch repairs damaged monitors before permitting
 // changes to healthy peers. Callers must include every configured peer, and
 // Healthy must require a positively observed, connected monitor (not just pod
@@ -91,7 +95,7 @@ func ReconcileSentinelMonitorBatch(ctx context.Context, peers []SentinelMonitorP
 		if err := peer.Reconcile(ctx); err != nil {
 			return fmt.Errorf("repair Sentinel %s: %w", peer.Name, err)
 		}
-		return fmt.Errorf("waiting to verify repaired Sentinel %s", peer.Name)
+		return fmt.Errorf("%w %s", ErrSentinelMonitorPending, peer.Name)
 	}
 	for i, peer := range peers {
 		// The initial inventory expires as soon as reconciliation starts.
