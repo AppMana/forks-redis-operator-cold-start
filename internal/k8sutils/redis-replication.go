@@ -84,7 +84,12 @@ func CreateReplicationRedis(ctx context.Context, cr *rrvb2.RedisReplication, cl 
 	annotations := generateStatefulSetsAnots(cr.ObjectMeta, cr.Spec.KubernetesConfig.IgnoreAnnotations)
 	objectMetaInfo := generateObjectMetaInformation(stateFulName, cr.Namespace, labels, annotations)
 
-	err := CreateOrUpdateStateFul(
+	containerParams, err := generateRedisReplicationContainerParams(ctx, cr, ctrlClient)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Cannot discover Sentinel hostname settings; leaving Redis StatefulSet unchanged")
+		return err
+	}
+	err = CreateOrUpdateStateFul(
 		ctx,
 		cl,
 		cr.GetNamespace(),
@@ -92,7 +97,7 @@ func CreateReplicationRedis(ctx context.Context, cr *rrvb2.RedisReplication, cl 
 		generateRedisReplicationParams(cr),
 		redisReplicationAsOwner(cr),
 		generateRedisReplicationInitContainerParams(cr),
-		generateRedisReplicationContainerParams(ctx, cr, ctrlClient),
+		containerParams,
 		cr.Spec.Sidecars,
 	)
 	if err != nil {
@@ -152,7 +157,7 @@ func generateRedisReplicationParams(cr *rrvb2.RedisReplication) statefulSetParam
 }
 
 // generateRedisReplicationContainerParams generates Redis container information
-func generateRedisReplicationContainerParams(ctx context.Context, cr *rrvb2.RedisReplication, ctrlClient client.Client) containerParameters {
+func generateRedisReplicationContainerParams(ctx context.Context, cr *rrvb2.RedisReplication, ctrlClient client.Client) (containerParameters, error) {
 	trueProperty := true
 	falseProperty := false
 	containerProp := containerParameters{
@@ -219,7 +224,10 @@ func generateRedisReplicationContainerParams(ctx context.Context, cr *rrvb2.Redi
 		containerProp.SentinelPort = 26379
 		containerProp.PreStopWaitSeconds = preStopWaitSeconds(cr.Spec.TerminationGracePeriodSeconds)
 	}
-	resolve, announce := sentinelHostnameSettings(ctx, ctrlClient, cr)
+	resolve, announce, err := sentinelHostnameSettings(ctx, ctrlClient, cr)
+	if err != nil {
+		return containerParameters{}, err
+	}
 	hostnameEnv := []corev1.EnvVar{
 		{Name: "RESOLVE_HOSTNAMES", Value: resolve},
 		{Name: "ANNOUNCE_HOSTNAMES", Value: announce},
@@ -229,22 +237,22 @@ func generateRedisReplicationContainerParams(ctx context.Context, cr *rrvb2.Redi
 	}
 	containerProp.EnvVars = &hostnameEnv
 
-	return containerProp
+	return containerProp, nil
 }
 
-func sentinelHostnameSettings(ctx context.Context, ctrlClient client.Client, cr *rrvb2.RedisReplication) (string, string) {
+func sentinelHostnameSettings(ctx context.Context, ctrlClient client.Client, cr *rrvb2.RedisReplication) (string, string, error) {
 	if cr.EnableSentinel() {
-		return sentinelHostnameFlag(cr.Spec.Sentinel.ResolveHostnames), sentinelHostnameFlag(cr.Spec.Sentinel.AnnounceHostnames)
+		return sentinelHostnameFlag(cr.Spec.Sentinel.ResolveHostnames), sentinelHostnameFlag(cr.Spec.Sentinel.AnnounceHostnames), nil
 	}
 	if ctrlClient == nil {
-		return "no", "no"
+		return "no", "no", nil
 	}
 	var sentinels rsvb2.RedisSentinelList
 	if err := ctrlClient.List(ctx, &sentinels, client.InNamespace(cr.Namespace)); err != nil {
-		log.FromContext(ctx).Error(err, "failed to list RedisSentinel, assuming hostnames are disabled")
-		return "no", "no"
+		return "", "", err
 	}
-	return externalSentinelHostnameSettings(sentinels.Items, cr.Name)
+	resolve, announce := externalSentinelHostnameSettings(sentinels.Items, cr.Name)
+	return resolve, announce, nil
 }
 
 func externalSentinelHostnameSettings(sentinels []rsvb2.RedisSentinel, replicationName string) (string, string) {
