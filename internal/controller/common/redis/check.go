@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	rcvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/rediscluster/v1beta2"
@@ -134,7 +135,11 @@ func (c *checker) GetReplicationKeyCounts(ctx context.Context, rr *rr.RedisRepli
 			continue
 		}
 		connInfo := createConnectionInfo(ctx, *pod, password, rr.Spec.TLS, c.k8s, rr.Namespace, "6379")
-		keys, err := c.redis.Connect(connInfo).GetKeyCount(ctx)
+		// Metadata/credential lookups can wait on the Kubernetes rate limiter.
+		// Start the network probe budget only after those lookups complete.
+		probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+		keys, err := c.redis.Connect(connInfo).GetKeyCount(probeCtx)
+		cancel()
 		if err != nil {
 			log.FromContext(ctx).Error(err, "failed to get key count, skipping pod", "pod", podName)
 			continue

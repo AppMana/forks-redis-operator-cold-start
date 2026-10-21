@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
+	redisservice "github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
@@ -14,8 +16,43 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 )
+
+type deadlineKeyClient struct{ service redisservice.Service }
+
+func (c deadlineKeyClient) Connect(*redisservice.ConnectionInfo) redisservice.Service {
+	return c.service
+}
+
+type deadlineKeyService struct {
+	redisservice.Service
+	t *testing.T
+}
+
+func (s deadlineKeyService) GetKeyCount(ctx context.Context) (int64, error) {
+	deadline, ok := ctx.Deadline()
+	require.True(s.t, ok)
+	remaining := time.Until(deadline)
+	require.LessOrEqual(s.t, remaining, time.Second)
+	require.Greater(s.t, remaining, 500*time.Millisecond, "metadata reads must not consume the network probe budget")
+	return 7, nil
+}
+
+func TestKeyCountNetworkDeadlineStartsAfterMetadata(t *testing.T) {
+	rr, objects := newReplicationFixture("10.0.0.10")
+	kube := k8sfake.NewSimpleClientset(objects...)
+	kube.PrependReactor("get", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		time.Sleep(1100 * time.Millisecond)
+		return false, nil, nil
+	})
+	c := &checker{k8s: kube, redis: deadlineKeyClient{service: deadlineKeyService{t: t}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	counts := c.GetReplicationKeyCounts(ctx, rr, []string{rr.Name + "-0"})
+	require.Equal(t, int64(7), counts[rr.Name+"-0"])
+}
 
 func TestGetMasterFromReplicationSkipsUnreachableAndUnreadyPods(t *testing.T) {
 	rr, objects := newReplicationFixture("10.0.0.10", "10.0.0.11")

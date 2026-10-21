@@ -19,7 +19,9 @@ func (r *Reconciler) masterDataSafeForPublication(ctx context.Context, instance 
 	if r.Checker == nil {
 		return false, false
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	// Include bounded Kubernetes metadata/Secret lookup time; the checker
+	// separately limits each Redis network probe to one second.
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	counts := r.Checker.GetReplicationKeyCounts(probeCtx, instance, []string{primary})
 	cancel()
 	keys, known := counts[primary]
@@ -39,7 +41,7 @@ func (r *Reconciler) masterDataSafeForPublication(ctx context.Context, instance 
 			peers = append(peers, pod)
 		}
 	}
-	probeCtx, cancel = context.WithTimeout(ctx, time.Second)
+	probeCtx, cancel = context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	counts = r.Checker.GetReplicationKeyCounts(probeCtx, instance, peers)
 	for _, pod := range peers {

@@ -67,6 +67,24 @@ func TestPublicationDataGuard(t *testing.T) {
 
 type blockedPublicationChecker struct{ redishealer.Checker }
 
+type delayedMetadataChecker struct{ redishealer.Checker }
+
+func (delayedMetadataChecker) GetReplicationKeyCounts(ctx context.Context, _ *rrvb2.RedisReplication, pods []string) map[string]int64 {
+	select {
+	case <-time.After(1100 * time.Millisecond):
+		return map[string]int64{pods[0]: 1}
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+func TestPublicationAllowsMetadataLookupBeforeRedisProbe(t *testing.T) {
+	r := &Reconciler{Checker: delayedMetadataChecker{}}
+	publish, reject := r.masterDataSafeForPublication(context.Background(), newReplicationInstanceForTest(), "example-replication-0")
+	require.True(t, publish, "Kubernetes rate limiting must not consume the entire Redis probe budget")
+	require.False(t, reject)
+}
+
 func (blockedPublicationChecker) GetReplicationKeyCounts(ctx context.Context, _ *rrvb2.RedisReplication, _ []string) map[string]int64 {
 	<-ctx.Done()
 	return nil
@@ -78,5 +96,5 @@ func TestPublicationProbeHasDeadline(t *testing.T) {
 	publish, reject := r.masterDataSafeForPublication(context.Background(), newReplicationInstanceForTest(), "example-replication-0")
 	require.False(t, publish)
 	require.False(t, reject)
-	require.Less(t, time.Since(start), 2*time.Second)
+	require.Less(t, time.Since(start), 6*time.Second)
 }
