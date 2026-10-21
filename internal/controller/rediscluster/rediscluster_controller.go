@@ -103,7 +103,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if !r.IsStatefulSetReady(ctx, instance.Namespace, instance.Name+"-leader") || !r.IsStatefulSetReady(ctx, instance.Namespace, instance.Name+"-follower") {
 			return intctrlutil.Reconciled()
 		}
-		if masterCount := k8sutils.CheckRedisNodeCount(ctx, r.K8sClient, instance, "leader"); masterCount == leaderCount {
+		if err := k8sutils.VerifyClusterScaleDownReady(ctx, r.K8sClient, instance); err != nil {
 			r.Recorder.Event(instance, corev1.EventTypeNormal, events.EventReasonRedisClusterDownscale, "Redis cluster is downscaling...")
 			logger.Info("Redis cluster is downscaling...", "Current.LeaderReplicas", leaderCount, "Desired.LeaderReplicas", leaderReplicas)
 
@@ -124,6 +124,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			}
 
 			for shardIdx := leaderCount - 1; shardIdx >= leaderReplicas; shardIdx-- {
+				retired, err := k8sutils.ClusterLeaderRetired(ctx, r.K8sClient, instance, shardIdx)
+				if err != nil {
+					return intctrlutil.RequeueE(ctx, err, "cannot determine shard retirement progress")
+				}
+				if retired {
+					continue
+				}
 				logger.Info("Remove the shard", "Shard.Index", shardIdx)
 				//  Imp if the last index of leader sts is not leader make it then
 				// check whether the redis is leader or not ?
@@ -163,10 +170,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				logger.Info("Redis cluster is downscaled... Skipping rebalance for single-node cluster")
 			}
 			return intctrlutil.RequeueAfter(ctx, time.Second*10, "")
-		} else {
-			if err := k8sutils.VerifyClusterScaleDownReady(ctx, r.K8sClient, instance); err != nil {
-				return intctrlutil.RequeueE(ctx, err, "refusing StatefulSet downscale before retained topology is verified")
-			}
 		}
 	}
 
