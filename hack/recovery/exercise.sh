@@ -2,6 +2,7 @@
 # Mutates only the explicitly named, dedicated local canary; never deletes PVCs.
 set -euo pipefail
 config="${1:?usage: exercise.sh LOCAL_KUBECONFIG}"
+expected="${CANARY_VALUE:-preserved-$(date +%s)-$$}"
 context="$(kubectl --kubeconfig "$config" config current-context)"
 [[ "$context" == kind-redis-recovery-* ]] || { echo "Refusing non-canary context" >&2; exit 2; }
 server="$(kubectl --kubeconfig "$config" config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
@@ -14,7 +15,7 @@ cli() { "${k[@]}" exec "$1" -- redis-cli --raw "${@:2}"; }
 converge() {
   local deadline=$((SECONDS + 180))
   while (( SECONDS < deadline )); do
-    if timeout 20s bash "$dir/check.sh" "$config" 2>/dev/null; then return 0; fi
+    if timeout 20s bash "$dir/check.sh" "$config" "$expected" 2>/dev/null; then return 0; fi
     sleep 2
   done
   echo "FAIL: convergence deadline" >&2
@@ -35,8 +36,9 @@ for attempt in {1..90}; do
   sleep 2
 done
 [[ -n "$(primary)" ]]
-cli "$(primary)" SET appmana:upgrade:sentinel-regression preserved-20261020
-cli "$(primary)" -n 1 SET appmana:upgrade:secondary-database preserved-20261020
+echo "Canary value: $expected"
+cli "$(primary)" SET appmana:upgrade:sentinel-regression "$expected"
+cli "$(primary)" -n 1 SET appmana:upgrade:secondary-database "$expected"
 converge
 echo "Scenario: Sentinel failover"
 before="$(primary)"
