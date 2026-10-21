@@ -37,8 +37,12 @@ func getRedisPassword(ctx context.Context, client kubernetes.Interface, namespac
 }
 
 func getRedisTLSConfig(ctx context.Context, client kubernetes.Interface, namespace string, tlsConfig *commonapi.TLSConfig) *tls.Config {
-	if tlsConfig == nil || tlsConfig.Secret.SecretName == "" {
+	if tlsConfig == nil {
 		return nil
+	}
+	if tlsConfig.Secret.SecretName == "" {
+		logf.FromContext(ctx).Error(errors.New("TLS secret reference is empty"), "Invalid TLS configuration")
+		return cryptutil.FailClosedTLSConfig()
 	}
 
 	tlsSecretName := tlsConfig.Secret.SecretName

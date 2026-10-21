@@ -376,6 +376,16 @@ func Test_getRedisTLSConfig(t *testing.T) {
 	}
 }
 
+func TestEmptyTLSSecretReferenceFailsClosed(t *testing.T) {
+	client := k8sClientFake.NewSimpleClientset()
+	require.Nil(t, getRedisTLSConfig(context.Background(), client, "default", nil))
+	config := getRedisTLSConfig(context.Background(), client, "default", &common.TLSConfig{})
+	require.NotNil(t, config, "explicit TLS must not silently downgrade to plaintext")
+	require.NotNil(t, config.VerifyConnection)
+	require.Error(t, config.VerifyConnection(tls.ConnectionState{}))
+	require.Empty(t, client.Actions(), "an empty secret reference should fail before API access")
+}
+
 func helperReadFile(filename string) []byte {
 	data, err := os.ReadFile(filename)
 	if err != nil {
