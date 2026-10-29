@@ -263,14 +263,14 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 
 	log.FromContext(ctx).V(1).Info("Changes detected in statefulset, updating...", "patch", string(patchResult.Patch), "VCT modified", vctModified)
 
-	// Merge missing annotations from the stored object into the new object.
-	mergeAnnotations(storedStateful, newStateful)
-
 	// Set the last applied annotation for future patch comparisons.
-	if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(newStateful); err != nil {
+	if err := setDesiredLastApplied(newStateful); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to set last applied annotation for redis statefulset")
 		return err
 	}
+
+	// Merge missing annotations from the stored object into the new object.
+	mergeAnnotations(storedStateful, newStateful)
 
 	return updateStatefulSet(ctx, cl, namespace, newStateful, recreateStatefulSet, deletePropagation)
 }

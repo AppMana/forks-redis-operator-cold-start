@@ -208,14 +208,14 @@ func patchPodDisruptionBudget(ctx context.Context, storedPdb *policyv1.PodDisrup
 			"Original", string(patchResult.Original),
 			"Modified", string(patchResult.Modified),
 		)
+		if err := setDesiredLastApplied(newPdb); err != nil {
+			log.FromContext(ctx).Error(err, "Unable to patch redis PodDisruptionBudget with comparison object")
+			return err
+		}
 		for key, value := range storedPdb.Annotations {
 			if _, present := newPdb.Annotations[key]; !present {
 				newPdb.Annotations[key] = value
 			}
-		}
-		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(newPdb); err != nil {
-			log.FromContext(ctx).Error(err, "Unable to patch redis PodDisruptionBudget with comparison object")
-			return err
 		}
 		return updatePodDisruptionBudget(ctx, namespace, newPdb, cl)
 	}

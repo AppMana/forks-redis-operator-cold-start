@@ -174,12 +174,12 @@ func patchService(ctx context.Context, storedService *corev1.Service, newService
 	if !patchResult.IsEmpty() {
 		log.FromContext(ctx).V(1).Info("Changes in service Detected, Updating...", "patch", string(patchResult.Patch))
 
-		maps.MergePreservingExistingKeys(newService.Annotations, storedService.Annotations)
-		// util.MergePreservingExistingKeys(newService.Labels, storedService.Labels)
-		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(newService); err != nil {
+		if err := setDesiredLastApplied(newService); err != nil {
 			log.FromContext(ctx).Error(err, "Unable to patch redis service with comparison object")
 			return err
 		}
+		maps.MergePreservingExistingKeys(newService.Annotations, storedService.Annotations)
+		// util.MergePreservingExistingKeys(newService.Labels, storedService.Labels)
 		log.FromContext(ctx).V(1).Info("Syncing Redis service with defined properties")
 		return updateService(ctx, cl, namespace, newService)
 	}
