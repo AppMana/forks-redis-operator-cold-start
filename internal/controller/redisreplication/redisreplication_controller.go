@@ -2,12 +2,14 @@ package redisreplication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"time"
 
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
+	rsvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redissentinel/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
 	redishealer "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/service"
@@ -51,10 +53,51 @@ type Reconciler struct {
 
 	// Test seams; nil uses the live Redis and Sentinel probes.
 	ObserveRoles            func(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error)
+	ObserveReplicationInfo  func(ctx context.Context, instance *rrvb2.RedisReplication, pods []string) map[string]k8sutils.ReplicationNodeInfo
 	RealMaster              func(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) string
 	SentinelElectedMaster   func(ctx context.Context, instance *rrvb2.RedisReplication) (string, bool)
 	ResumeSentinelBootstrap func(context.Context, *rrvb2.RedisReplication, k8sutils.RedisReplicationTopology) (bool, error)
 	SentinelClient          redis.Client
+}
+
+func (r *Reconciler) observeReplicationInfo(ctx context.Context, instance *rrvb2.RedisReplication, pods []string) map[string]k8sutils.ReplicationNodeInfo {
+	if r.ObserveReplicationInfo != nil {
+		return r.ObserveReplicationInfo(ctx, instance, pods)
+	}
+	return k8sutils.ObserveReplicationNodeInfos(ctx, r.K8sClient, instance, pods)
+}
+
+// isLoneMasterEmptyReplacement reports whether a single observed master with
+// zero attached replicas is an empty restarted pod (offset==0 or keys==0) while
+// surviving replicas hold replication history (offset>0) or data (keys>0).
+func (r *Reconciler) isLoneMasterEmptyReplacement(ctx context.Context, instance *rrvb2.RedisReplication, topology k8sutils.RedisReplicationTopology) bool {
+	if len(topology.Masters) != 1 || len(topology.Slaves) == 0 {
+		return false
+	}
+	candidate := topology.Masters[0]
+	if r.realMaster(ctx, instance, topology.Masters) == candidate {
+		return false
+	}
+	allPods := append(append([]string{}, topology.Masters...), topology.Slaves...)
+	infos := r.observeReplicationInfo(ctx, instance, allPods)
+	if candInfo, ok := infos[candidate]; ok && candInfo.EffectiveOffset() == 0 {
+		for _, slave := range topology.Slaves {
+			if sInfo, sOk := infos[slave]; sOk && sInfo.EffectiveOffset() > 0 && sInfo.MasterLinkStatus != "up" {
+				return true
+			}
+		}
+	}
+	if r.Checker != nil {
+		counts := r.Checker.GetReplicationKeyCounts(ctx, instance, allPods)
+		if candCount, ok := counts[candidate]; ok && candCount == 0 {
+			for _, slave := range topology.Slaves {
+				if counts[slave] > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func (r *Reconciler) observeRoles(ctx context.Context, instance *rrvb2.RedisReplication) (map[string]string, error) {
@@ -263,7 +306,9 @@ func (r *Reconciler) observedRedisReplicationMaster(ctx context.Context, instanc
 			if slices.Contains(topology.Masters, elected) {
 				return elected, true
 			}
-			return "", false
+			if !r.sentinelMonitoredMasterDeadOrStuck(ctx, instance, topology) {
+				return "", false
+			}
 		}
 	}
 	switch len(topology.Masters) {
@@ -271,6 +316,12 @@ func (r *Reconciler) observedRedisReplicationMaster(ctx context.Context, instanc
 		return "", false
 	case 1:
 		candidate := topology.Masters[0]
+		if r.isLoneMasterEmptyReplacement(ctx, instance, topology) {
+			log.FromContext(ctx).Info("Not trusting lone observed master: pod has zero offset/keys while disconnected replicas retain data",
+				"candidate", candidate,
+				"slaves", topology.Slaves)
+			return "", false
+		}
 		if topology.Complete() {
 			return candidate, true
 		}
@@ -549,23 +600,149 @@ func (r *Reconciler) sentinelResetIfNeed(ctx context.Context, inst *rrvb2.RedisR
 	if !ok {
 		return fmt.Errorf("master group %s not found in sentinel info", masterGroupName)
 	}
+	if masterInfo.Status != "" && masterInfo.Status != "ok" {
+		return nil
+	}
 
 	expectedSlaves := int(inst.Spec.GetReplicationCounts("replication")) - 1
 	expectedSentinels := int(inst.Spec.Sentinel.Size)
 
-	if !masterInfo.HasStaleEntries(expectedSlaves, expectedSentinels) {
+	liveSentinelHosts := map[string]bool{}
+	readySentinelHosts := map[string]bool{}
+	if r.K8sClient != nil && inst.Name != "" {
+		if pods, err := r.getSentinelPods(ctx, inst); err == nil {
+			for _, pod := range pods.Items {
+				if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
+					continue
+				}
+				liveSentinelHosts[pod.Status.PodIP] = true
+				fqdn := fmt.Sprintf("%s.%s.%s.svc.%s", pod.Name, common.GetHeadlessServiceNameFromPodName(pod.Name), inst.Namespace, envs.GetServiceDNSDomain())
+				liveSentinelHosts[fqdn] = true
+				if k8sutils.IsRedisPodProbeable(&pod) {
+					readySentinelHosts[pod.Status.PodIP] = true
+					readySentinelHosts[fqdn] = true
+				}
+			}
+		}
+		if extraPods, extraErr := r.K8sClient.CoreV1().Pods(inst.Namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: fmt.Sprintf("%s=%s", RecoverySentinelOwnerLabel, inst.SentinelStatefulSet()),
+		}); extraErr == nil {
+			for _, pod := range extraPods.Items {
+				if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
+					continue
+				}
+				if !liveSentinelHosts[pod.Status.PodIP] {
+					liveSentinelHosts[pod.Status.PodIP] = true
+					expectedSentinels++
+				}
+				if k8sutils.IsRedisPodProbeable(&pod) {
+					readySentinelHosts[pod.Status.PodIP] = true
+				}
+			}
+		}
+	}
+
+	hasDeadPeer := false
+	if len(liveSentinelHosts) > 0 {
+		if peers, peerErr := redisService.SentinelPeers(ctx, masterGroupName); peerErr == nil {
+			seenPeerHosts := map[string]bool{}
+			for _, peer := range peers {
+				host := strings.TrimSuffix(peer.IP, ".")
+				if host == "" {
+					continue
+				}
+				if !liveSentinelHosts[host] || seenPeerHosts[host] {
+					hasDeadPeer = true
+					break
+				}
+				seenPeerHosts[host] = true
+				if peer.DisconnectedOrDown() && !readySentinelHosts[host] {
+					hasDeadPeer = true
+					break
+				}
+			}
+		}
+	}
+
+	if !hasDeadPeer && !masterInfo.HasStaleEntries(expectedSlaves, expectedSentinels) {
 		return nil
 	}
-	// Surplus entries may be live recovery voters or partitioned members.
-	// Their count alone cannot authorize clearing election state or reducing
-	// the failover majority. Preserve them until explicit safe retirement.
-	logger.Info("Sentinel has surplus topology entries; preserving membership pending explicit retirement",
+	if err := redisService.SentinelReset(ctx, masterGroupName); err != nil {
+		return fmt.Errorf("reset sentinel %s: %w", masterGroupName, err)
+	}
+	logger.Info("Reset embedded Sentinel topology to retire stale entries",
 		"expectedSlaves", expectedSlaves,
 		"slaves", masterInfo.Slaves,
 		"expectedSentinels", expectedSentinels,
-		"sentinels", masterInfo.Sentinels)
+		"sentinels", masterInfo.Sentinels,
+		"hasDeadPeer", hasDeadPeer)
 
 	return nil
+}
+
+func (r *Reconciler) reconcileSentinelsAfterRecovery(ctx context.Context, instance *rrvb2.RedisReplication, realMaster string) {
+	if realMaster == "" {
+		return
+	}
+	if instance.EnableSentinel() {
+		if err := r.configureReplicationSentinel(ctx, instance, realMaster); err != nil && !errors.Is(err, redis.ErrSentinelMonitorPending) {
+			log.FromContext(ctx).Error(err, "failed to configure embedded sentinel after recovery", "master", realMaster)
+		}
+	}
+	if _, err := r.reconcileExternalSentinels(ctx, instance, realMaster); err != nil {
+		log.FromContext(ctx).Error(err, "failed to configure external sentinel after recovery", "master", realMaster)
+	}
+}
+
+func (r *Reconciler) reconcileExternalSentinels(ctx context.Context, instance *rrvb2.RedisReplication, masterPodName string) (bool, error) {
+	if r.Client == nil || r.Healer == nil || r.K8sClient == nil || masterPodName == "" {
+		return false, nil
+	}
+	var sentinels rsvb2.RedisSentinelList
+	if err := r.List(ctx, &sentinels, client.InNamespace(instance.Namespace)); err != nil {
+		return false, err
+	}
+	if len(sentinels.Items) == 0 {
+		return false, nil
+	}
+	var masterPod *corev1.Pod
+	pending := false
+	for i := range sentinels.Items {
+		rs := &sentinels.Items[i]
+		if rs.Spec.RedisSentinelConfig == nil || rs.Spec.RedisSentinelConfig.RedisReplicationName != instance.Name {
+			continue
+		}
+		if masterPod == nil {
+			pod, err := r.K8sClient.CoreV1().Pods(instance.Namespace).Get(ctx, masterPodName, metav1.GetOptions{})
+			if err != nil {
+				return false, err
+			}
+			masterPod = pod
+		}
+		var monitorAddr string
+		if rs.Spec.RedisSentinelConfig.ResolveHostnames == "yes" {
+			monitorAddr = replicationPodHostname(instance, masterPodName)
+		} else {
+			monitorAddr = masterPod.Status.PodIP
+		}
+		if monitorAddr == "" {
+			continue
+		}
+		if err := r.Healer.SentinelMonitor(ctx, rs, monitorAddr); err != nil {
+			if errors.Is(err, redis.ErrSentinelMonitorPending) {
+				pending = true
+				continue
+			}
+			return false, err
+		}
+		if err := r.Healer.SentinelSet(ctx, rs, monitorAddr); err != nil {
+			return false, err
+		}
+		if err := r.Healer.SentinelReset(ctx, rs, instance); err != nil {
+			return false, err
+		}
+	}
+	return pending, nil
 }
 
 func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisReplication) (ctrl.Result, error) {
@@ -596,35 +773,41 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 	incompleteTopology := !topology.Complete()
 	if r.Client != nil || r.SentinelElectedMaster != nil {
 		if elected, ok := r.sentinelElectedMaster(ctx, instance); ok && (elected == "" || !slices.Contains(masterNodes, elected)) {
-			if elected == "" && r.Client != nil {
-				if _, err := r.initializeEmbeddedSentinelPlaceholder(ctx, instance, topology); err != nil {
-					return intctrlutil.RequeueE(ctx, err, "cannot initialize Sentinel placeholder")
+			if !r.sentinelMonitoredMasterDeadOrStuck(ctx, instance, topology) {
+				if elected == "" && r.Client != nil {
+					if _, err := r.initializeEmbeddedSentinelPlaceholder(ctx, instance, topology); err != nil {
+						return intctrlutil.RequeueE(ctx, err, "cannot initialize Sentinel placeholder")
+					}
 				}
+				return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "waiting for Sentinel-elected primary to report master")
 			}
-			return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "waiting for Sentinel-elected primary to report master")
+			log.FromContext(ctx).Info("Sentinel monitors a dead or unconfigured master while all Redis pods are observed; proceeding with operator recovery",
+				"sentinelMaster", elected,
+				"masters", masterNodes,
+				"slaves", slaveNodes)
 		}
 	}
 	realMaster, masterPositivelyIdentified := r.observedRedisReplicationMaster(ctx, instance, topology)
-	if !incompleteTopology && (len(masterNodes) == 0 || (len(masterNodes) > 1 && realMaster == "")) {
-		candidates := masterNodes
-		if len(candidates) == 0 {
-			candidates = slaveNodes
-		}
-		realMaster = k8sutils.PickPreferredMaster(instance, candidates)
+	if !incompleteTopology && (len(masterNodes) == 0 || realMaster == "") {
 		if r.Checker == nil {
 			return intctrlutil.RequeueAfter(ctx, 30*time.Second, "recovery checker unavailable")
 		}
-		counts := r.Checker.GetReplicationKeyCounts(ctx, instance, append(append([]string{}, masterNodes...), slaveNodes...))
+		allPods := append(append([]string{}, masterNodes...), slaveNodes...)
+		counts := r.Checker.GetReplicationKeyCounts(ctx, instance, allPods)
+		infos := r.observeReplicationInfo(ctx, instance, allPods)
+		realMaster = k8sutils.SelectRecoveryMaster(instance, masterNodes, slaveNodes, counts, infos)
 		validate := r.ValidateRecoveryLineage
 		if validate == nil {
 			validate = k8sutils.ValidateRecoveryLineage
 		}
-		allPods := append(append([]string{}, masterNodes...), slaveNodes...)
 		if err := validate(ctx, r.K8sClient, instance, allPods, realMaster, counts); err != nil {
 			log.FromContext(ctx).Error(err, "Cold-start recovery refused: data authority is ambiguous")
+			if len(masterNodes) == 1 {
+				return intctrlutil.RequeueAfter(ctx, 60*time.Second, "ambiguous recovery data")
+			}
 			return intctrlutil.RequeueAfter(ctx, 30*time.Second, "ambiguous recovery data")
 		}
-		if len(masterNodes) == 0 {
+		if len(masterNodes) == 0 || !slices.Contains(masterNodes, realMaster) {
 			promote := r.PromoteRecoveryMaster
 			if promote == nil {
 				promote = k8sutils.PromoteMasterAndReslave
@@ -632,12 +815,14 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 			if err := promote(ctx, r.K8sClient, instance, allPods, realMaster); err != nil {
 				return intctrlutil.RequeueE(ctx, err, "cold-start recovery failed")
 			}
+			r.reconcileSentinelsAfterRecovery(ctx, instance, realMaster)
 			return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "observe recovered primary")
 		}
 		// Include ghost-linked replicas in the repair, not just the masters.
 		if err := r.createRedisReplicationLink(ctx, instance, allPods, realMaster); err != nil {
 			return intctrlutil.RequeueE(ctx, err, "cold-start replication repair failed")
 		}
+		r.reconcileSentinelsAfterRecovery(ctx, instance, realMaster)
 		return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "observe recovered primary")
 	}
 	if len(masterNodes) > 1 {
@@ -691,7 +876,18 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 				"observedPods", observedPods,
 				"unobservedPods", topology.Unobserved)
 		} else if err := r.configureReplicationSentinel(ctx, instance, realMaster); err != nil {
+			if errors.Is(err, redis.ErrSentinelMonitorPending) {
+				return intctrlutil.RequeueAfter(ctx, time.Second, "verify repaired embedded Sentinel monitors")
+			}
 			log.FromContext(ctx).Error(err, "failed to configure sentinel")
+		}
+	}
+
+	if realMaster != "" && (!incompleteTopology || masterPositivelyIdentified) {
+		if pending, err := r.reconcileExternalSentinels(ctx, instance, realMaster); err != nil {
+			log.FromContext(ctx).Error(err, "failed to configure external sentinel")
+		} else if pending {
+			return intctrlutil.RequeueAfter(ctx, time.Second, "verify repaired Sentinel monitors")
 		}
 	}
 
@@ -783,15 +979,24 @@ func (r *Reconciler) electedMaster(ctx context.Context, instance *rrvb2.RedisRep
 		if slices.Contains(masters, elected) {
 			return elected
 		}
-		logger.Info("Sentinel-elected master is not serving as master",
-			"sentinelMaster", elected, "observedMasters", masters)
-		return ""
+		topology := k8sutils.RedisReplicationTopology{Masters: masters, Slaves: slaves}
+		if !r.sentinelMonitoredMasterDeadOrStuck(ctx, instance, topology) {
+			logger.Info("Sentinel-elected master is not serving as master",
+				"sentinelMaster", elected, "observedMasters", masters)
+			return ""
+		}
 	}
 	switch len(masters) {
 	case 0:
 		return ""
 	case 1:
 		candidate := masters[0]
+		topology := k8sutils.RedisReplicationTopology{Masters: masters, Slaves: slaves}
+		if r.isLoneMasterEmptyReplacement(ctx, instance, topology) {
+			logger.Info("Not trusting lone observed master as elected primary: pod is an empty replacement while replicas retain data",
+				"candidate", candidate, "slaves", slaves)
+			return ""
+		}
 		if instance.Spec.Size != nil && len(masters)+len(slaves) == int(*instance.Spec.Size) {
 			return candidate
 		}

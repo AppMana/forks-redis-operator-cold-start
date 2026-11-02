@@ -61,3 +61,73 @@ func TestPickPreferredMaster(t *testing.T) {
 		})
 	}
 }
+
+func TestParseReplicationNodeInfo(t *testing.T) {
+	info, err := ParseReplicationNodeInfo(`# Replication
+role:slave
+master_host:10.3.239.142
+master_port:6379
+master_link_status:down
+slave_repl_offset:421168632
+connected_slaves:0
+master_replid:abc123def456
+master_replid2:0000000000000000000000000000000000000000
+master_repl_offset:421168632
+second_repl_offset:-1
+`)
+	assert.NoError(t, err)
+	assert.Equal(t, "slave", info.Role)
+	assert.Equal(t, "10.3.239.142", info.MasterHost)
+	assert.Equal(t, "down", info.MasterLinkStatus)
+	assert.Equal(t, int64(421168632), info.SlaveReplOffset)
+	assert.Equal(t, int64(421168632), info.MasterReplOffset)
+	assert.Equal(t, int64(421168632), info.EffectiveOffset())
+}
+
+func TestSelectRecoveryMasterNeverPicksEmptyRestartedMasterOverHighOffsetSlaves(t *testing.T) {
+	cr := &rrvb2.RedisReplication{
+		Status: rrvb2.RedisReplicationStatus{MasterNode: "redis-master-2"},
+	}
+	masters := []string{"redis-master-2"}
+	slaves := []string{"redis-master-0", "redis-master-1"}
+	counts := map[string]int64{
+		"redis-master-0": 2,
+		"redis-master-1": 2,
+		"redis-master-2": 0,
+	}
+	infos := map[string]ReplicationNodeInfo{
+		"redis-master-0": {
+			Role:             "slave",
+			MasterHost:       "10.3.239.142",
+			MasterLinkStatus: "down",
+			SlaveReplOffset:  421168632,
+			MasterReplOffset: 421168632,
+		},
+		"redis-master-1": {
+			Role:             "slave",
+			MasterHost:       "10.3.239.142",
+			MasterLinkStatus: "down",
+			SlaveReplOffset:  421168632,
+			MasterReplOffset: 421168632,
+		},
+		"redis-master-2": {
+			Role:             "master",
+			MasterReplOffset: 0,
+		},
+	}
+
+	got := SelectRecoveryMaster(cr, masters, slaves, counts, infos)
+	assert.Equal(t, "redis-master-0", got)
+
+	// When redis-master-1 has a strictly higher offset than redis-master-0,
+	// SelectRecoveryMaster deterministically chooses redis-master-1.
+	infos["redis-master-1"] = ReplicationNodeInfo{
+		Role:             "slave",
+		MasterHost:       "10.3.239.142",
+		MasterLinkStatus: "down",
+		SlaveReplOffset:  421169999,
+		MasterReplOffset: 421169999,
+	}
+	got = SelectRecoveryMaster(cr, masters, slaves, counts, infos)
+	assert.Equal(t, "redis-master-1", got)
+}

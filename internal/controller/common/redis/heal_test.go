@@ -594,7 +594,7 @@ func TestSentinelResetSkipsSentinelsStillDiscoveringTopology(t *testing.T) {
 	assert.Empty(t, redisClient.resetHosts)
 }
 
-func TestSentinelResetPreservesSurplusMembersWithoutRetirementEvidence(t *testing.T) {
+func TestSentinelResetResetsSentinelsWithStaleEntriesAndPreservesAssociatedRecoveryVoters(t *testing.T) {
 	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
 	redisClient := &fakeRedisClient{
 		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
@@ -607,7 +607,56 @@ func TestSentinelResetPreservesSurplusMembersWithoutRetirementEvidence(t *testin
 
 	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
 
-	assert.Empty(t, redisClient.resetHosts, "surplus peers or replicas do not prove that any member can be safely forgotten")
+	assert.Equal(t, []string{"10.0.1.10", "10.0.1.11"}, redisClient.resetHosts)
+}
+
+func TestSentinelResetRetiresDeadPeerIPEvenWhenSentinelCountMatchesExpected(t *testing.T) {
+	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	redisClient := &fakeRedisClient{
+		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
+			"10.0.1.10": sentinelInfo(2, 3),
+			"10.0.1.11": sentinelInfo(2, 3),
+			"10.0.1.12": sentinelInfo(2, 3),
+		},
+		sentinelPeersByHost: map[string][]redisservice.SentinelPeerInfo{
+			"10.0.1.11": {
+				{IP: "10.0.1.12", Port: "26379", Flags: "sentinel"},
+				{IP: "10.0.1.99", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+			},
+		},
+	}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+
+	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
+
+	assert.Equal(t, []string{"10.0.1.11"}, redisClient.resetHosts)
+}
+
+func TestSentinelResetPreservesAssociatedRecoveryVoterPod(t *testing.T) {
+	rs, rr, objects := newSentinelFixture("10.0.1.10", "10.0.1.11", "10.0.1.12")
+	voter := newLabeledRedisPod("recovery-voter-0", map[string]string{
+		recoverySentinelOwnerLabel: rs.GetStatefulSetName(),
+	}, "10.0.1.50", corev1.PodRunning, true)
+	objects = append(objects, voter)
+	redisClient := &fakeRedisClient{
+		sentinelInfoByHost: map[string]*redisservice.InfoSentinelResult{
+			"10.0.1.10": sentinelInfo(2, 4),
+			"10.0.1.11": sentinelInfo(2, 4),
+			"10.0.1.12": sentinelInfo(2, 4),
+		},
+		sentinelPeersByHost: map[string][]redisservice.SentinelPeerInfo{
+			"10.0.1.10": {
+				{IP: "10.0.1.11", Port: "26379", Flags: "sentinel"},
+				{IP: "10.0.1.12", Port: "26379", Flags: "sentinel"},
+				{IP: "10.0.1.50", Port: "26379", Flags: "sentinel"},
+			},
+		},
+	}
+	h := &healer{redis: redisClient, k8s: k8sfake.NewSimpleClientset(objects...)}
+
+	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
+
+	assert.Empty(t, redisClient.resetHosts)
 }
 
 func TestSentinelResetSkipsSentinelsWithoutMasterGroup(t *testing.T) {
@@ -623,7 +672,7 @@ func TestSentinelResetSkipsSentinelsWithoutMasterGroup(t *testing.T) {
 
 	require.NoError(t, h.SentinelReset(context.Background(), rs, rr))
 
-	assert.Empty(t, redisClient.resetHosts)
+	assert.Equal(t, []string{"10.0.1.12"}, redisClient.resetHosts)
 }
 
 func TestExternalSentinelEnablesHostnameSettingsBeforeMonitor(t *testing.T) {
@@ -770,6 +819,7 @@ type fakeRedisClient struct {
 	keyCountByHost       map[string]int64
 	keyCountErrByHost    map[string]error
 	sentinelInfoByHost   map[string]*redisservice.InfoSentinelResult
+	sentinelPeersByHost  map[string][]redisservice.SentinelPeerInfo
 	monitorHosts         []string
 	setHosts             []string
 	resetHosts           []string
@@ -784,6 +834,16 @@ func (f *fakeRedisService) SentinelMyID(context.Context) (string, error) { retur
 
 func (f *fakeRedisService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return "", "", false, nil
+}
+
+func (f *fakeRedisService) SentinelPeers(context.Context, string) ([]redisservice.SentinelPeerInfo, error) {
+	if err := f.client.errByHost[f.host]; err != nil {
+		return nil, err
+	}
+	if f.client.sentinelPeersByHost != nil {
+		return f.client.sentinelPeersByHost[f.host], nil
+	}
+	return nil, nil
 }
 
 func (f *fakeRedisService) SentinelMonitorHealthy(context.Context, string) (bool, error) {

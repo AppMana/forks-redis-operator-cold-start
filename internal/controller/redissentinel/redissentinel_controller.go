@@ -2,6 +2,7 @@ package redissentinel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	intctrlutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/controllerutil"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
+	redisservice "github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -147,6 +149,9 @@ func (r *RedisSentinelReconciler) reconcileSentinel(ctx context.Context, instanc
 		monitorAddr = master.Status.PodIP
 	}
 	if err := r.Healer.SentinelMonitor(ctx, instance, monitorAddr); err != nil {
+		if errors.Is(err, redisservice.ErrSentinelMonitorPending) {
+			return intctrlutil.RequeueAfter(ctx, time.Second, "waiting to verify repaired Sentinel monitors")
+		}
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 	if err := r.Healer.SentinelSet(ctx, instance, monitorAddr); err != nil {

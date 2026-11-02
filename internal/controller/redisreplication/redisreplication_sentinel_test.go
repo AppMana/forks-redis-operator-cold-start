@@ -392,6 +392,10 @@ func (f *fakeSentinelRedisService) SentinelGetMasterAddrByName(context.Context, 
 	return "", "", false, nil
 }
 
+func (f *fakeSentinelRedisService) SentinelPeers(context.Context, string) ([]redis.SentinelPeerInfo, error) {
+	return nil, nil
+}
+
 type fakeSentinelRedisService struct {
 	monitorError    error
 	monitoredQuorum string

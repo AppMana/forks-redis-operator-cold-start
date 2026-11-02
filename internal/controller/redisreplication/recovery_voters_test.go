@@ -24,12 +24,17 @@ type electorateService struct {
 	master string
 	known  int
 	id     string
+	peers  []redis.SentinelPeerInfo
 }
 
 func (s electorateService) SentinelMyID(context.Context) (string, error) { return s.id, nil }
 
 func (s electorateService) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
 	return s.master, "6379", true, nil
+}
+
+func (s electorateService) SentinelPeers(context.Context, string) ([]redis.SentinelPeerInfo, error) {
+	return s.peers, nil
 }
 
 func (s electorateService) GetInfoSentinel(context.Context) (*redis.InfoSentinelResult, error) {
@@ -106,4 +111,69 @@ func TestRecoveryVotersParticipateWithoutGrantingManagedMinorityAuthority(t *tes
 			}
 		})
 	}
+}
+
+func TestSentinelElectedMasterIgnoresDeadGhostSentinelPeers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, rrvb2.AddToScheme(scheme))
+	require.NoError(t, rsvb2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	rr := newReplicationInstanceForTest()
+	rs := &rsvb2.RedisSentinel{ObjectMeta: metav1.ObjectMeta{Name: "redis-master-sentinel", Namespace: rr.Namespace}}
+	rs.Spec.Size = ptr.To(int32(3))
+	rs.Spec.RedisSentinelConfig = &rsvb2.RedisSentinelConfig{}
+	rs.Spec.RedisSentinelConfig.RedisReplicationName = rr.Name
+	rs.Spec.RedisSentinelConfig.MasterGroupName = "upgrade"
+
+	redisLabels := common.GetRedisLabels(rr.Name, common.SetupTypeReplication, "replication", nil)
+	sentinelLabels := common.GetRedisLabels(rs.GetStatefulSetName(), common.SetupTypeSentinel, "sentinel", nil)
+
+	objects := []client.Object{
+		rr, rs,
+		newRunningPodForTest(rr.Namespace, rr.Name+"-0", "10.3.104.38", redisLabels, true),
+		newRunningPodForTest(rr.Namespace, rr.Name+"-1", "10.3.22.21", redisLabels, true),
+		newRunningPodForTest(rr.Namespace, rr.Name+"-2", "10.3.174.183", redisLabels, true),
+		newRunningPodForTest(rr.Namespace, rs.GetStatefulSetName()+"-0", "10.3.100.10", sentinelLabels, true),
+		newRunningPodForTest(rr.Namespace, rs.GetStatefulSetName()+"-1", "10.3.100.11", sentinelLabels, true),
+		newRunningPodForTest(rr.Namespace, rs.GetStatefulSetName()+"-2", "10.3.100.12", sentinelLabels, true),
+	}
+
+	// sentinel-1 and sentinel-2 agree on 10.3.104.38, while sentinel-0 is on 0.0.0.0.
+	// Both sentinel-1 and sentinel-2 retain 2 dead ghost peer IPs (10.3.200.91, 10.3.200.92)
+	// that belong to no live pod in the namespace (known=4 in INFO sentinel).
+	probes := electorateClient{
+		"10.3.100.10": {
+			master: "0.0.0.0",
+			known:  1,
+		},
+		"10.3.100.11": {
+			master: "10.3.104.38",
+			known:  4,
+			peers: []redis.SentinelPeerInfo{
+				{IP: "10.3.100.12", Port: "26379", Flags: "sentinel"},
+				{IP: "10.3.200.91", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+				{IP: "10.3.200.92", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+			},
+		},
+		"10.3.100.12": {
+			master: "10.3.104.38",
+			known:  4,
+			peers: []redis.SentinelPeerInfo{
+				{IP: "10.3.100.11", Port: "26379", Flags: "sentinel"},
+				{IP: "10.3.200.91", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+				{IP: "10.3.200.92", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+			},
+		},
+	}
+
+	r := &Reconciler{
+		Client:         clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build(),
+		K8sClient:      k8sfake.NewSimpleClientset(),
+		SentinelClient: probes,
+	}
+
+	master, authoritative := r.sentinelElectedMaster(context.Background(), rr)
+	require.True(t, authoritative)
+	require.Equal(t, rr.Name+"-0", master)
 }

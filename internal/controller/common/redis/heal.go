@@ -35,8 +35,8 @@ type Healer interface {
 	// SentinelSet sets the config for a specific master
 	// See: https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#reconfiguring-sentinel-at-runtime
 	SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, master string) error
-	// SentinelReset retains its historical interface name but only observes
-	// surplus topology. Counts alone never authorize a destructive RESET.
+	// SentinelReset resets the master group on Sentinels that retain dead peer IPs
+	// or stale slave/sentinel entries once the monitored master is reachable.
 	SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel, rr *rrvb2.RedisReplication) error
 
 	// UpdatePodRoleLabel connect to all redis pods and update pod role label `redis-role` to `master` or `slave` according to their role.
@@ -369,6 +369,8 @@ func (h *healer) SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, maste
 	return errors.Join(errs...)
 }
 
+const recoverySentinelOwnerLabel = "redis.redis.opstreelabs.in/sentinel-owner"
+
 func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel, rr *rrvb2.RedisReplication) error {
 	pods, err := h.getSentinelPods(ctx, rs)
 	if err != nil {
@@ -380,9 +382,41 @@ func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel, rr 
 		return err
 	}
 
+	liveSentinelHosts := map[string]bool{}
+	readySentinelHosts := map[string]bool{}
+	for _, pod := range pods.Items {
+		if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
+			continue
+		}
+		liveSentinelHosts[pod.Status.PodIP] = true
+		fqdn := fmt.Sprintf("%s.%s.%s.svc.%s", pod.Name, common.GetHeadlessServiceNameFromPodName(pod.Name), rs.Namespace, envs.GetServiceDNSDomain())
+		liveSentinelHosts[fqdn] = true
+		if k8sutils.IsRedisPodProbeable(&pod) {
+			readySentinelHosts[pod.Status.PodIP] = true
+			readySentinelHosts[fqdn] = true
+		}
+	}
+	additionalSentinels := 0
+	if extraPods, extraErr := h.k8s.CoreV1().Pods(rs.Namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s", recoverySentinelOwnerLabel, rs.GetStatefulSetName()),
+	}); extraErr == nil {
+		for _, pod := range extraPods.Items {
+			if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
+				continue
+			}
+			if !liveSentinelHosts[pod.Status.PodIP] {
+				liveSentinelHosts[pod.Status.PodIP] = true
+				additionalSentinels++
+			}
+			if k8sutils.IsRedisPodProbeable(&pod) {
+				readySentinelHosts[pod.Status.PodIP] = true
+			}
+		}
+	}
+
 	masterGroupName := rs.Spec.RedisSentinelConfig.MasterGroupName
 	expectedSlaves := int(rr.Spec.GetReplicationCounts("replication")) - 1
-	expectedSentinels := int(rs.Spec.GetSentinelCounts("sentinel"))
+	expectedSentinels := int(rs.Spec.GetSentinelCounts("sentinel")) + additionalSentinels
 
 	var errs []error
 	for _, pod := range pods.Items {
@@ -408,18 +442,47 @@ func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel, rr 
 			)
 			continue
 		}
-		if !masterInfo.HasStaleEntries(expectedSlaves, expectedSentinels) {
+		if masterInfo.Status != "" && masterInfo.Status != "ok" {
 			continue
 		}
-		// Counts cannot distinguish recovery voters or partitioned members from
-		// retired ones. RESET changes the election denominator and clears state;
-		// retirement requires a separately verified, coordinated procedure.
-		log.FromContext(ctx).Info("sentinel has surplus topology entries; preserving membership pending explicit retirement",
+		peers, peerErr := sentinel.SentinelPeers(ctx, masterGroupName)
+		hasDeadPeer := false
+		if peerErr == nil {
+			seenPeerHosts := map[string]bool{}
+			for _, peer := range peers {
+				host := strings.TrimSuffix(peer.IP, ".")
+				if host == "" {
+					continue
+				}
+				if host == pod.Status.PodIP || !liveSentinelHosts[host] || seenPeerHosts[host] {
+					hasDeadPeer = true
+					break
+				}
+				seenPeerHosts[host] = true
+				if peer.DisconnectedOrDown() && !readySentinelHosts[host] {
+					hasDeadPeer = true
+					break
+				}
+			}
+		}
+		if !hasDeadPeer && !masterInfo.HasStaleEntries(expectedSlaves, expectedSentinels) {
+			continue
+		}
+		if err := sentinel.SentinelReset(ctx, masterGroupName); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			errs = append(errs, fmt.Errorf("sentinel reset on pod %s: %w", pod.Name, err))
+			continue
+		}
+		log.FromContext(ctx).Info("reset sentinel topology to retire stale entries",
 			"pod", pod.Name,
+			"masterGroupName", masterGroupName,
 			"expectedSlaves", expectedSlaves,
 			"slaves", masterInfo.Slaves,
 			"expectedSentinels", expectedSentinels,
 			"sentinels", masterInfo.Sentinels,
+			"hasDeadPeer", hasDeadPeer,
 		)
 	}
 	return errors.Join(errs...)

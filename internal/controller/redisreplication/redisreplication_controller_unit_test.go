@@ -1179,6 +1179,10 @@ func (f *fakeSentinelInfoService) SentinelGetMasterAddrByName(context.Context, s
 	return "", "", false, nil
 }
 
+func (f *fakeSentinelInfoService) SentinelPeers(context.Context, string) ([]redis.SentinelPeerInfo, error) {
+	return nil, nil
+}
+
 type fakeSentinelInfoService struct {
 	info *redis.InfoSentinelResult
 	err  error
@@ -1309,9 +1313,12 @@ func (f *fakeStatefulSetService) GetStatefulSetReplicas(context.Context, string,
 type fakeHealer struct {
 	updateCalled bool
 	master       string
+	monitoredAddr string
+	resetCalled   bool
 }
 
-func (f *fakeHealer) SentinelMonitor(context.Context, *rsvb2.RedisSentinel, string) error {
+func (f *fakeHealer) SentinelMonitor(_ context.Context, _ *rsvb2.RedisSentinel, addr string) error {
+	f.monitoredAddr = addr
 	return nil
 }
 
@@ -1320,6 +1327,7 @@ func (f *fakeHealer) SentinelSet(context.Context, *rsvb2.RedisSentinel, string) 
 }
 
 func (f *fakeHealer) SentinelReset(context.Context, *rsvb2.RedisSentinel, *rrvb2.RedisReplication) error {
+	f.resetCalled = true
 	return nil
 }
 
@@ -1335,4 +1343,139 @@ func (f *fakeHealer) UpdateRedisRoleLabel(_ context.Context, _ string, _ map[str
 	f.updateCalled = true
 	f.master = masterPod
 	return nil
+}
+
+func TestReconcileRedisRecoversWhenRestartedMasterIsEmptyAndSentinelsAreStuckOnDeadIPAndPlaceholder(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, rrvb2.AddToScheme(scheme))
+	require.NoError(t, rsvb2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	instance := newReplicationInstanceForTest()
+	instance.Name = "redis-master"
+	instance.Status.MasterNode = "redis-master-2"
+
+	rs := &rsvb2.RedisSentinel{
+		ObjectMeta: metav1.ObjectMeta{Name: "redis-master-sentinel", Namespace: instance.Namespace},
+		Spec: rsvb2.RedisSentinelSpec{
+			Size: ptr.To(int32(3)),
+			RedisSentinelConfig: &rsvb2.RedisSentinelConfig{
+				RedisSentinelConfig: commonapi.RedisSentinelConfig{
+					RedisReplicationName: instance.Name,
+					MasterGroupName:      "upgrade",
+				},
+			},
+		},
+	}
+
+	redisLabels := common.GetRedisLabels(instance.Name, common.SetupTypeReplication, "replication", nil)
+	sentinelLabels := common.GetRedisLabels(rs.GetStatefulSetName(), common.SetupTypeSentinel, "sentinel", nil)
+
+	pod0 := newRunningPodForTest(instance.Namespace, "redis-master-0", "10.3.104.38", redisLabels, true)
+	pod1 := newRunningPodForTest(instance.Namespace, "redis-master-1", "10.3.22.21", redisLabels, true)
+	pod2 := newRunningPodForTest(instance.Namespace, "redis-master-2", "10.3.174.183", redisLabels, true)
+	sent0 := newRunningPodForTest(instance.Namespace, rs.GetStatefulSetName()+"-0", "10.3.100.10", sentinelLabels, true)
+	sent1 := newRunningPodForTest(instance.Namespace, rs.GetStatefulSetName()+"-1", "10.3.100.11", sentinelLabels, true)
+	sent2 := newRunningPodForTest(instance.Namespace, rs.GetStatefulSetName()+"-2", "10.3.100.12", sentinelLabels, true)
+
+	ctrlClient := clientfake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(&rrvb2.RedisReplication{}).
+		WithObjects(instance, rs, pod0, pod1, pod2, sent0, sent1, sent2).
+		Build()
+
+	// sentinel-0 booted on 0.0.0.0:6379; sentinel-1 and sentinel-2 are stuck on
+	// dead master IP 10.3.239.142:6379 with 2 dead ghost peer IPs.
+	probes := electorateClient{
+		"10.3.100.10": {master: "0.0.0.0", known: 1},
+		"10.3.100.11": {
+			master: "10.3.239.142",
+			known:  4,
+			peers: []redis.SentinelPeerInfo{
+				{IP: "10.3.100.12", Port: "26379", Flags: "sentinel"},
+				{IP: "10.3.200.91", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+				{IP: "10.3.200.92", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+			},
+		},
+		"10.3.100.12": {
+			master: "10.3.239.142",
+			known:  4,
+			peers: []redis.SentinelPeerInfo{
+				{IP: "10.3.100.11", Port: "26379", Flags: "sentinel"},
+				{IP: "10.3.200.91", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+				{IP: "10.3.200.92", Port: "26379", Flags: "s_down,sentinel,disconnected"},
+			},
+		},
+	}
+
+	healer := &fakeHealer{}
+	promotedMaster := ""
+	var promotedPods []string
+
+	r := &Reconciler{
+		Client:         ctrlClient,
+		StatefulSet:    &fakeStatefulSetService{},
+		K8sClient:      fake.NewSimpleClientset(pod0, pod1, pod2, sent0, sent1, sent2),
+		Healer:         healer,
+		SentinelClient: probes,
+		RedisReplicationTopology: topologyOf(
+			[]string{"redis-master-2"},
+			[]string{"redis-master-0", "redis-master-1"},
+			nil,
+		),
+		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
+			return ""
+		},
+		Checker: keyCountsOf(map[string]int64{
+			"redis-master-0": 2,
+			"redis-master-1": 2,
+			"redis-master-2": 0,
+		}),
+		ObserveReplicationInfo: func(context.Context, *rrvb2.RedisReplication, []string) map[string]k8sutils.ReplicationNodeInfo {
+			return map[string]k8sutils.ReplicationNodeInfo{
+				"redis-master-0": {
+					Role:             "slave",
+					MasterHost:       "10.3.239.142",
+					MasterLinkStatus: "down",
+					SlaveReplOffset:  421168632,
+					MasterReplOffset: 421168632,
+				},
+				"redis-master-1": {
+					Role:             "slave",
+					MasterHost:       "10.3.239.142",
+					MasterLinkStatus: "down",
+					SlaveReplOffset:  421168632,
+					MasterReplOffset: 421168632,
+				},
+				"redis-master-2": {
+					Role:             "master",
+					MasterReplOffset: 0,
+				},
+			}
+		},
+		ValidateRecoveryLineage: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string, string, map[string]int64) error {
+			return nil
+		},
+		PromoteRecoveryMaster: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, pods []string, realMaster string) error {
+			promotedPods = append([]string{}, pods...)
+			promotedMaster = realMaster
+			return nil
+		},
+	}
+
+	// 1. reconcileStatus must refuse to publish the empty replacement redis-master-2.
+	statusRes, err := r.reconcileStatus(context.Background(), instance)
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{RequeueAfter: noMasterRequeue}, statusRes)
+	assert.Empty(t, healer.master, "empty replacement redis-master-2 must never be published as master")
+
+	// 2. reconcileRedis must deterministically promote redis-master-0 (highest offset)
+	// and reconcile external RedisSentinel to monitor redis-master-0 (10.3.104.38).
+	redisRes, err := r.reconcileRedis(context.Background(), instance)
+	require.NoError(t, err)
+	assert.Equal(t, noMasterRequeue, redisRes.RequeueAfter)
+	assert.Equal(t, "redis-master-0", promotedMaster, "highest-offset surviving replica must be promoted, never empty redis-master-2")
+	assert.ElementsMatch(t, []string{"redis-master-2", "redis-master-0", "redis-master-1"}, promotedPods)
+	assert.Equal(t, "10.3.104.38", healer.monitoredAddr)
+	assert.True(t, healer.resetCalled)
 }

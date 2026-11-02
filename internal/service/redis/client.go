@@ -77,6 +77,7 @@ type Service interface {
 	SentinelSet(ctx context.Context, masterGroupName, key, value string) error
 	SentinelConfigSet(ctx context.Context, key, value string) error
 	SentinelReset(ctx context.Context, masterGroupName string) error
+	SentinelPeers(ctx context.Context, masterGroupName string) ([]SentinelPeerInfo, error)
 	GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, error)
 	// SentinelGetMasterAddrByName returns the address this Sentinel currently
 	// considers the master of masterGroupName. ok is false when the Sentinel
@@ -111,6 +112,22 @@ type SentinelMasterInfo struct {
 	Address   string
 	Slaves    int
 	Sentinels int
+}
+
+type SentinelPeerInfo struct {
+	IP    string
+	Port  string
+	RunID string
+	Flags string
+}
+
+func (p SentinelPeerInfo) DisconnectedOrDown() bool {
+	for _, flag := range strings.Split(p.Flags, ",") {
+		if flag == "s_down" || flag == "o_down" || flag == "disconnected" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *InfoSentinelResult) Master(name string) (SentinelMasterInfo, bool) {
@@ -252,6 +269,36 @@ func (c *service) SentinelReset(ctx context.Context, masterGroupName string) err
 		return err
 	}
 	return nil
+}
+
+func (c *service) SentinelPeers(ctx context.Context, masterGroupName string) ([]SentinelPeerInfo, error) {
+	client := c.createClient()
+	if client == nil {
+		return nil, errConnectionInfoNotSet
+	}
+	defer client.Close()
+
+	cmd := rediscli.NewMapStringStringSliceCmd(ctx, "SENTINEL", "SENTINELS", masterGroupName)
+	if err := client.Process(ctx, cmd); err != nil {
+		if rediscli.HasErrorPrefix(err, "No such master with that name") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	rawPeers, err := cmd.Result()
+	if err != nil {
+		return nil, err
+	}
+	peers := make([]SentinelPeerInfo, 0, len(rawPeers))
+	for _, entry := range rawPeers {
+		peers = append(peers, SentinelPeerInfo{
+			IP:    entry["ip"],
+			Port:  entry["port"],
+			RunID: entry["runid"],
+			Flags: entry["flags"],
+		})
+	}
+	return peers, nil
 }
 
 func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, masterGroupName, quorum string) error {

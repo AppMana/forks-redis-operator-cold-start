@@ -14,6 +14,7 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
 	redishealer "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/service/redis"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -138,6 +139,9 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 		logger.Error(err, "list Redis pods")
 		return "", true
 	}
+	var namespacePods corev1.PodList
+	_ = r.List(ctx, &namespacePods, client.InNamespace(rr.Namespace))
+	liveHosts := liveNamespaceHosts(namespacePods.Items)
 	checker := redishealer.NewChecker(r.K8sClient)
 	redisClient := r.SentinelClient
 	if redisClient == nil {
@@ -170,7 +174,7 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			}
 			connInfo := redishealer.ConnectionInfoForPod(ctx, pod, password, group.tls, r.K8sClient, rr.Namespace, "26379")
 			wg.Add(1)
-			go func(name string) {
+			go func(name, selfIP string) {
 				defer wg.Done()
 				queryCtx, cancel := context.WithTimeout(ctx, sentinelQueryTimeout)
 				defer cancel()
@@ -202,13 +206,28 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 						return
 					}
 					known = int32(master.Sentinels)
+					if peers, peerErr := service.SentinelPeers(queryCtx, group.masterGroup); peerErr == nil && len(peers) > 0 {
+						liveKnown := int32(1)
+						seenPeerHosts := map[string]bool{selfIP: true}
+						for _, peer := range peers {
+							peerHost := strings.TrimSuffix(peer.IP, ".")
+							if peerHost == "" || seenPeerHosts[peerHost] {
+								continue
+							}
+							if liveHosts[peerHost] {
+								seenPeerHosts[peerHost] = true
+								liveKnown++
+							}
+						}
+						known = liveKnown
+					}
 					answer = canonicalSentinelAddress(pods.Items, net.JoinHostPort(host, port))
 				}
 				mu.Lock()
 				answers = append(answers, answer)
 				electorate = max(electorate, known)
 				mu.Unlock()
-			}(pod.Name)
+			}(pod.Name, pod.Status.PodIP)
 		}
 		wg.Wait()
 		if duplicate {
@@ -321,4 +340,144 @@ func podForAddress(pods []corev1.Pod, addr string) string {
 		}
 	}
 	return ""
+}
+
+func liveNamespaceHosts(pods []corev1.Pod) map[string]bool {
+	hosts := make(map[string]bool, len(pods)*2)
+	for _, pod := range pods {
+		if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
+			continue
+		}
+		hosts[pod.Status.PodIP] = true
+		fqdn := fmt.Sprintf("%s.%s.%s.svc.%s", pod.Name, common.GetHeadlessServiceNameFromPodName(pod.Name), pod.Namespace, envs.GetServiceDNSDomain())
+		hosts[fqdn] = true
+	}
+	return hosts
+}
+
+func isUnspecifiedSentinelAddr(addr string) bool {
+	if addr == "" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
+// sentinelMonitoredMasterDeadOrStuck reports whether all configured Sentinel
+// groups monitoring rr are reachable by a live majority yet stuck monitoring a
+// dead pod IP (an IP that belongs to no live Redis pod in rr.Namespace) or
+// unconfigured placeholder (0.0.0.0) while all configured Redis pods are live
+// and observed. In that state, Sentinel cannot complete failover on its own
+// (for example, when dead sentinel peer IPs or a restarted 0.0.0.0 sentinel
+// prevent leader election, or when all replicas point at the dead master IP),
+// so the operator must proceed with deterministic recovery and re-point Sentinel.
+func (r *Reconciler) sentinelMonitoredMasterDeadOrStuck(ctx context.Context, rr *rrvb2.RedisReplication, topology k8sutils.RedisReplicationTopology) bool {
+	if r.Client == nil || r.SentinelElectedMaster != nil {
+		return false
+	}
+	if !topology.Complete() || rr.Spec.Size == nil || topology.Observed() != int(*rr.Spec.Size) {
+		return false
+	}
+	groups, err := listSentinelGroups(ctx, r.Client, rr)
+	if err != nil || len(groups) == 0 {
+		return false
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(rr.Namespace), client.MatchingLabels(
+		common.GetRedisLabels(rr.Name, common.SetupTypeReplication, "replication", nil),
+	)); err != nil {
+		return false
+	}
+	confirmedMaster := ""
+	if len(topology.Masters) == 1 && !r.isLoneMasterEmptyReplacement(ctx, rr, topology) {
+		confirmedMaster = topology.Masters[0]
+	}
+	checker := redishealer.NewChecker(r.K8sClient)
+	redisClient := r.SentinelClient
+	if redisClient == nil {
+		redisClient = redis.NewClient()
+	}
+	anyDeadOrStuckGroup := false
+	for _, group := range groups {
+		if len(group.pods) == 0 {
+			return false
+		}
+		password, err := checker.GetPassword(ctx, rr.Namespace, group.password)
+		if err != nil {
+			return false
+		}
+		var (
+			mu         sync.Mutex
+			wg         sync.WaitGroup
+			answers    []string
+			identities = map[string]bool{}
+			duplicate  bool
+		)
+		for _, pod := range group.pods {
+			if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+				continue
+			}
+			connInfo := redishealer.ConnectionInfoForPod(ctx, pod, password, group.tls, r.K8sClient, rr.Namespace, "26379")
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				queryCtx, cancel := context.WithTimeout(ctx, sentinelQueryTimeout)
+				defer cancel()
+				service := redisClient.Connect(connInfo)
+				identity, err := service.SentinelMyID(queryCtx)
+				if err != nil || identity == "" {
+					return
+				}
+				mu.Lock()
+				if identities[identity] {
+					duplicate = true
+				}
+				identities[identity] = true
+				mu.Unlock()
+				host, port, monitored, err := service.SentinelGetMasterAddrByName(queryCtx, group.masterGroup)
+				if err != nil {
+					return
+				}
+				answer := ""
+				if monitored {
+					answer = canonicalSentinelAddress(pods.Items, net.JoinHostPort(host, port))
+				}
+				mu.Lock()
+				answers = append(answers, answer)
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+		if duplicate {
+			return false
+		}
+		liveElectorate := max(group.size, int32(len(group.pods)))
+		if liveElectorate <= 0 || int32(len(answers)) <= liveElectorate/2 {
+			return false
+		}
+		hasDeadOrPlaceholder := false
+		for _, addr := range answers {
+			if isUnspecifiedSentinelAddr(addr) {
+				hasDeadOrPlaceholder = true
+				continue
+			}
+			podName := podForAddress(pods.Items, addr)
+			if podName == "" {
+				hasDeadOrPlaceholder = true
+				continue
+			}
+			if confirmedMaster != "" && podName == confirmedMaster {
+				continue
+			}
+			return false
+		}
+		if hasDeadOrPlaceholder {
+			anyDeadOrStuckGroup = true
+		}
+	}
+	return anyDeadOrStuckGroup
 }

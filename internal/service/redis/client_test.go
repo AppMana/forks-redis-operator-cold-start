@@ -64,6 +64,7 @@ func TestServiceWithoutConnectionFailsClosed(t *testing.T) {
 		"sentinel config": func(s Service) error { return s.SentinelConfigSet(ctx, "resolve-hostnames", "yes") },
 		"sentinel set":    func(s Service) error { return s.SentinelSet(ctx, "upgrade", "quorum", "2") },
 		"sentinel reset":  func(s Service) error { return s.SentinelReset(ctx, "upgrade") },
+		"sentinel peers":  func(s Service) error { _, err := s.SentinelPeers(ctx, "upgrade"); return err },
 		"sentinel monitor": func(s Service) error {
 			return s.SentinelMonitor(ctx, &ConnectionInfo{Host: "127.0.0.1", Port: "6379"}, "upgrade", "2")
 		},
