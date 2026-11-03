@@ -9,33 +9,74 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/utils/ptr"
 )
 
-func TestEphemeralTemplateUpdateRequiresHold(t *testing.T) {
-	for _, kind := range []string{"Redis", "RedisCluster", "RedisReplication", "RedisSentinel"} {
-		for _, held := range []bool{false, true} {
-			t.Run(kind+map[bool]string{false: "/rolling", true: "/held"}[held], func(t *testing.T) {
-				stored := &appsv1.StatefulSet{
-					ObjectMeta: metav1.ObjectMeta{Name: "redis", Namespace: "test", OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: kind, Name: "redis", UID: "owner"}}},
-					Spec:       appsv1.StatefulSetSpec{UpdateStrategy: appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType}, Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "redis", Image: "redis:old"}}}}},
-				}
-				desired := stored.DeepCopy()
-				desired.Spec.Template.Spec.Containers[0].Image = "redis:new"
-				if held {
-					desired.Spec.UpdateStrategy.Type = appsv1.OnDeleteStatefulSetStrategyType
-				}
-				client := fake.NewSimpleClientset(stored)
-				err := patchStatefulSet(context.Background(), stored, desired, "test", false, nil, client)
-				if held {
-					require.NoError(t, err)
-				} else {
-					require.ErrorContains(t, err, "OnDelete")
-					for _, action := range client.Actions() {
-						require.NotContains(t, []string{"update", "patch", "delete"}, action.GetVerb())
-					}
-				}
-			})
-		}
+func TestEphemeralTemplateUpdateAutomaticallyPacesMultiPodRollout(t *testing.T) {
+	for _, kind := range []string{"RedisCluster", "RedisReplication", "RedisSentinel"} {
+		t.Run(kind, func(t *testing.T) {
+			replicas := int32(3)
+			stored := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:            "redis",
+					Namespace:       "test",
+					Generation:      1,
+					OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: kind, Name: "redis", UID: "owner"}},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas:       &replicas,
+					UpdateStrategy: appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
+					Template:       corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "redis", Image: "redis:old"}}}},
+				},
+				Status: appsv1.StatefulSetStatus{
+					ObservedGeneration: 1,
+					Replicas:           3,
+					ReadyReplicas:      3,
+					UpdatedReplicas:    3,
+					CurrentRevision:    "rev-1",
+					UpdateRevision:     "rev-1",
+				},
+			}
+			desired := stored.DeepCopy()
+			desired.Spec.Template.Spec.Containers[0].Image = "redis:new"
+
+			// Step 1: Template changes -> operator automatically sets Partition = 2 (replicas - 1)
+			client := fake.NewSimpleClientset(stored)
+			require.NoError(t, patchStatefulSet(context.Background(), stored, desired.DeepCopy(), "test", false, nil, client))
+			updated, err := client.AppsV1().StatefulSets("test").Get(context.Background(), "redis", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.NotNil(t, updated.Spec.UpdateStrategy.RollingUpdate)
+			require.NotNil(t, updated.Spec.UpdateStrategy.RollingUpdate.Partition)
+			require.Equal(t, int32(2), *updated.Spec.UpdateStrategy.RollingUpdate.Partition)
+
+			// Step 2: Pod-2 updated and Ready (UpdatedReplicas=1, ReadyReplicas=3) -> Partition steps down to 1
+			updated.Generation = 2
+			updated.Status.ObservedGeneration = 2
+			updated.Status.CurrentRevision = "rev-1"
+			updated.Status.UpdateRevision = "rev-2"
+			updated.Status.UpdatedReplicas = 1
+			updated.Status.ReadyReplicas = 3
+			nextDesired := desired.DeepCopy()
+			nextDesired.Spec.UpdateStrategy.RollingUpdate = nil
+			require.NoError(t, patchStatefulSet(context.Background(), updated, nextDesired, "test", false, nil, client))
+			updated2, err := client.AppsV1().StatefulSets("test").Get(context.Background(), "redis", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.NotNil(t, updated2.Spec.UpdateStrategy.RollingUpdate)
+			require.NotNil(t, updated2.Spec.UpdateStrategy.RollingUpdate.Partition)
+			require.Equal(t, int32(1), *updated2.Spec.UpdateStrategy.RollingUpdate.Partition)
+
+			// Step 3: Pod-1 updated and Ready (UpdatedReplicas=2, ReadyReplicas=3) -> Partition clears (nil / 0)
+			updated2.Generation = 3
+			updated2.Status.ObservedGeneration = 3
+			updated2.Status.UpdatedReplicas = 2
+			updated2.Status.ReadyReplicas = 3
+			finalDesired := desired.DeepCopy()
+			finalDesired.Spec.UpdateStrategy.RollingUpdate = nil
+			require.NoError(t, patchStatefulSet(context.Background(), updated2, finalDesired, "test", false, nil, client))
+			updated3, err := client.AppsV1().StatefulSets("test").Get(context.Background(), "redis", metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Nil(t, updated3.Spec.UpdateStrategy.RollingUpdate)
+		})
 	}
 }
 
@@ -43,17 +84,36 @@ func TestEphemeralRolloutGuardBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		name                                                     string
 		persistent, held, recreate, pending, template, wantError bool
+		updatedReplicas, currentReplicas                         int32
+		wantPartition                                            *int32
 	}{
 		{name: "metadata only"},
 		{name: "persistent unchanged policy", persistent: true, template: true},
 		{name: "held template", held: true, template: true},
-		{name: "rolling template", template: true, wantError: true},
+		{name: "rolling template starts at highest ordinal", template: true, wantPartition: ptr.To(int32(2))},
 		{name: "held recreation still unsafe", held: true, recreate: true, wantError: true},
-		{name: "releasing pending revision", pending: true, wantError: true},
+		{name: "pending revision with 1 updated replica steps partition to 1", pending: true, updatedReplicas: 1, currentReplicas: 2, wantPartition: ptr.To(int32(1))},
+		{name: "pending revision with all replicas updated clears partition", pending: true, updatedReplicas: 3, currentReplicas: 0, wantPartition: nil},
 		{name: "keeping pending revision held", pending: true, held: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			stored := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: "RedisReplication", UID: "owner"}}}}
+			replicas := int32(3)
+			stored := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Generation:      1,
+					OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: "RedisReplication", UID: "owner"}},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas: &replicas,
+				},
+				Status: appsv1.StatefulSetStatus{
+					ObservedGeneration: 1,
+					Replicas:           3,
+					ReadyReplicas:      3,
+					UpdatedReplicas:    tc.updatedReplicas,
+					CurrentReplicas:    tc.currentReplicas,
+				},
+			}
 			if tc.persistent {
 				stored.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "data"}}}
 				stored.Spec.Template.Spec.Containers = []corev1.Container{{Name: stored.Name, VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data"}}}}
@@ -74,18 +134,31 @@ func TestEphemeralRolloutGuardBoundaries(t *testing.T) {
 				require.ErrorContains(t, err, "OnDelete")
 			} else {
 				require.NoError(t, err)
+				if tc.wantPartition == nil {
+					require.Nil(t, desired.Spec.UpdateStrategy.RollingUpdate)
+				} else {
+					require.NotNil(t, desired.Spec.UpdateStrategy.RollingUpdate)
+					require.NotNil(t, desired.Spec.UpdateStrategy.RollingUpdate.Partition)
+					require.Equal(t, *tc.wantPartition, *desired.Spec.UpdateStrategy.RollingUpdate.Partition)
+				}
 			}
 		})
 	}
 }
 
 func TestEphemeralGuardDoesNotTrustUnrelatedClaims(t *testing.T) {
-	stored := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "redis", OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: "RedisReplication", UID: "owner"}}}}
+	replicas := int32(3)
+	stored := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "redis", OwnerReferences: []metav1.OwnerReference{{APIVersion: "redis.redis.opstreelabs.in/v1beta2", Kind: "RedisReplication", UID: "owner"}}},
+		Spec:       appsv1.StatefulSetSpec{Replicas: &replicas},
+	}
 	stored.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: "config"}}}
 	stored.Spec.Template.Spec.Containers = []corev1.Container{{Name: "redis", VolumeMounts: []corev1.VolumeMount{{Name: "config", MountPath: "/etc/redis"}}}}
 	desired := stored.DeepCopy()
 	err := guardEphemeralRollout(stored, desired, []byte(`{"spec":{"template":{"metadata":{"annotations":{"changed":"yes"}}}}}`), false)
-	require.ErrorContains(t, err, "OnDelete")
+	require.NoError(t, err)
+	require.NotNil(t, desired.Spec.UpdateStrategy.RollingUpdate)
+	require.Equal(t, int32(2), *desired.Spec.UpdateStrategy.RollingUpdate.Partition)
 }
 
 func TestPersistentRedisStateMount(t *testing.T) {

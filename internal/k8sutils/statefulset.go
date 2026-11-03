@@ -260,6 +260,20 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 	if err := guardEphemeralRollout(storedStateful, newStateful, patchResult.Patch, recreateStatefulSet); err != nil {
 		return err
 	}
+	patchResult, err = patch.DefaultPatchMaker.Calculate(storedStateful, newStateful,
+		patch.IgnoreStatusFields(),
+		patch.IgnoreVolumeClaimTemplateTypeMetaAndStatus(),
+		patch.IgnoreField("kind"),
+		patch.IgnoreField("apiVersion"),
+	)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Unable to recalculate patch for redis statefulset")
+		return err
+	}
+	if patchResult.IsEmpty() && !vctModified {
+		log.FromContext(ctx).V(1).Info("Reconciliation complete, no changes required.")
+		return nil
+	}
 
 	log.FromContext(ctx).V(1).Info("Changes detected in statefulset, updating...", "patch", string(patchResult.Patch), "VCT modified", vctModified)
 
@@ -275,12 +289,15 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 	return updateStatefulSet(ctx, cl, namespace, newStateful, recreateStatefulSet, deletePropagation)
 }
 
-// PING readiness cannot prove that ephemeral replicas have copied the dataset,
-// or that replacement Sentinels have learned the surviving election history.
-// Do not let an operator template upgrade automatically replace those pods.
-// OnDelete stages the desired template for an explicitly coordinated migration.
+// guardEphemeralRollout protects StatefulSets without retained persistent state
+// from destructive whole-set recreation or switching away from an existing PVC,
+// and automatically paces multi-pod ephemeral RollingUpdates one ordinal at a
+// time via RollingUpdate.Partition so pods are never replaced faster than
+// replication and Sentinel reconciliation can heal them.
 func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, recreate bool) error {
-	if state := persistentRedisStateMount(stored); state != "" && state == persistentRedisStateMount(desired) {
+	storedMount := persistentRedisStateMount(stored)
+	desiredMount := persistentRedisStateMount(desired)
+	if storedMount != "" && storedMount == desiredMount {
 		return nil
 	}
 	managed := false
@@ -300,11 +317,71 @@ func guardEphemeralRollout(stored, desired *appsv1.StatefulSet, changes []byte, 
 		return fmt.Errorf("inspect ephemeral rollout patch: %w", err)
 	}
 	_, templateChanged := delta.Spec["template"]
-	pendingRollout := stored.Status.CurrentRevision != stored.Status.UpdateRevision
-	if recreate || (desired.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType && (templateChanged || pendingRollout)) {
+	if recreate {
 		return fmt.Errorf("refusing automatic replacement of ephemeral StatefulSet %s/%s: stage updateStrategy.type=OnDelete with recreation disabled and coordinate data/Sentinel migration", stored.Namespace, stored.Name)
 	}
+	// Switching an existing persistent StatefulSet to a different/empty mount still requires OnDelete.
+	if storedMount != "" && storedMount != desiredMount && desired.Spec.UpdateStrategy.Type != appsv1.OnDeleteStatefulSetStrategyType && templateChanged {
+		return fmt.Errorf("refusing automatic replacement of ephemeral StatefulSet %s/%s: stage updateStrategy.type=OnDelete with recreation disabled and coordinate data/Sentinel migration", stored.Namespace, stored.Name)
+	}
+	if desired.Spec.UpdateStrategy.Type == appsv1.OnDeleteStatefulSetStrategyType {
+		return nil
+	}
+	// If the user explicitly configured a custom partition on the CR, honor it.
+	if desired.Spec.UpdateStrategy.RollingUpdate != nil && desired.Spec.UpdateStrategy.RollingUpdate.Partition != nil {
+		return nil
+	}
+	replicas := int32(1)
+	if desired.Spec.Replicas != nil {
+		replicas = *desired.Spec.Replicas
+	} else if stored.Spec.Replicas != nil {
+		replicas = *stored.Spec.Replicas
+	}
+	if replicas <= 1 {
+		return nil
+	}
+	if templateChanged {
+		partition := replicas - 1
+		desired.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
+		desired.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{
+			Partition: &partition,
+		}
+		return nil
+	}
+	if !hasPendingEphemeralRollout(stored, replicas) {
+		return nil
+	}
+	currentPartition := replicas - 1
+	if stored.Spec.UpdateStrategy.RollingUpdate != nil && stored.Spec.UpdateStrategy.RollingUpdate.Partition != nil {
+		currentPartition = *stored.Spec.UpdateStrategy.RollingUpdate.Partition
+	}
+	if stored.Status.ObservedGeneration < stored.Generation || stored.Status.ReadyReplicas < replicas {
+		if currentPartition > 0 {
+			desired.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
+			desired.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{
+				Partition: &currentPartition,
+			}
+		}
+		return nil
+	}
+	nextPartition := replicas - 1 - stored.Status.UpdatedReplicas
+	if nextPartition > 0 {
+		desired.Spec.UpdateStrategy.Type = appsv1.RollingUpdateStatefulSetStrategyType
+		desired.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{
+			Partition: &nextPartition,
+		}
+	}
 	return nil
+}
+
+func hasPendingEphemeralRollout(stored *appsv1.StatefulSet, replicas int32) bool {
+	if stored.Status.CurrentRevision == stored.Status.UpdateRevision {
+		return false
+	}
+	if replicas > 0 && stored.Status.UpdatedReplicas >= replicas && stored.Status.CurrentReplicas == 0 {
+		return false
+	}
+	return true
 }
 
 // A config or sidecar claim is not evidence that the Redis dataset survives
