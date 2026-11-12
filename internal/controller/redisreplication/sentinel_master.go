@@ -2,8 +2,10 @@ package redisreplication
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -119,6 +121,11 @@ func additionalSentinelPods(ctx context.Context, reader client.Reader, namespace
 // positively unconfigured during bootstrap. ok is true with pod=="" for
 // unresolved authority (unreachable/minority/conflicting groups, or a real
 // elected address without a live pod). That state must block fallback repair.
+//
+// A group without a majority still names its master when every Sentinel in it
+// answered and each one either monitors that same address or holds no
+// election at all (see uncontestedSentinelAddress), provided the Redis data
+// proves that following it discards nothing (see verifySoleDataMaster).
 func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisReplication) (string, bool) {
 	if r.SentinelElectedMaster != nil {
 		return r.SentinelElectedMaster(ctx, rr)
@@ -148,6 +155,9 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 		redisClient = redis.NewClient()
 	}
 	elected := ""
+	// uncontested is set when a group named its master without a majority,
+	// which is only accepted together with proof from the Redis data itself.
+	uncontested := false
 	for _, group := range groups {
 		// Before any Sentinel pods exist, initial Redis bootstrap must be able
 		// to create the primary they will monitor. Never use this exception for
@@ -242,8 +252,13 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			if sentinelsUnconfigured(answers, electorate) {
 				continue
 			}
-			logger.Info("Sentinel authority unresolved; refusing fallback election", "masterGroup", group.masterGroup)
-			return "", true
+			named, ok := uncontestedSentinelAddress(answers, electorate)
+			if !ok {
+				logger.Info("Sentinel authority unresolved; refusing fallback election", "masterGroup", group.masterGroup)
+				return "", true
+			}
+			addr = named
+			uncontested = true
 		}
 		if elected != "" && elected != addr {
 			logger.Info("Sentinel deployments disagree on the master", "first", elected, "second", addr)
@@ -255,7 +270,100 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 		return "", false
 	}
 
-	return podForAddress(pods.Items, elected), true
+	pod := podForAddress(pods.Items, elected)
+	if uncontested {
+		if pod == "" {
+			logger.Info("Sentinel authority unresolved; refusing fallback election", "reason", "the only monitored address belongs to no live Redis pod")
+			return "", true
+		}
+		if err := r.verifySoleDataMaster(ctx, rr, pod); err != nil {
+			logger.Info("Sentinel authority unresolved; refusing fallback election", "sentinelMaster", pod, "reason", err.Error())
+			return "", true
+		}
+		logger.Info("Following the configured Sentinels: the others are unconfigured and every other self-declared master is empty",
+			"sentinelMaster", pod)
+	}
+	return pod, true
+}
+
+// uncontestedSentinelAddress returns the single real address monitored by the
+// Sentinels of a deployment in which every member answered and every other
+// member holds no election at all: it monitors nothing, or only the
+// unspecified-address placeholder an init-generated config starts with.
+//
+// A placeholder Sentinel never observed a master, so it has no election that
+// following its configured peers could override. A Sentinel that did not
+// answer is different: it may hold a newer election, so one missing answer
+// refuses. So do two different real addresses.
+//
+// The result is not a majority. Callers must additionally prove from the
+// Redis data that following it cannot discard anything.
+func uncontestedSentinelAddress(answers []string, electorate int32) (string, bool) {
+	if electorate <= 0 || int32(len(answers)) < electorate {
+		return "", false
+	}
+	named := ""
+	for _, addr := range answers {
+		if isUnspecifiedSentinelAddr(addr) {
+			continue
+		}
+		if named != "" && named != addr {
+			return "", false
+		}
+		named = addr
+	}
+	return named, named != ""
+}
+
+// verifySoleDataMaster proves that making candidate the master of every other
+// pod cannot discard data. It returns nil only when
+//   - every configured pod was observed, with its key count and replication
+//     state (a missing observation is never treated as empty),
+//   - candidate itself reports role:master,
+//   - every other self-declared master is empty: no keys, no replication
+//     offset and no attached replicas, and
+//   - the recovery lineage rules accept candidate against every remaining
+//     pod, so a replica holding data shares its replication ID and is not
+//     ahead of it.
+func (r *Reconciler) verifySoleDataMaster(ctx context.Context, rr *rrvb2.RedisReplication, candidate string) error {
+	if r.Checker == nil {
+		return errors.New("no checker configured")
+	}
+	topology, err := r.redisReplicationTopology(ctx, rr)
+	if err != nil {
+		return fmt.Errorf("observe Redis roles: %w", err)
+	}
+	if !topology.Complete() || rr.Spec.Size == nil || topology.Observed() != int(*rr.Spec.Size) {
+		return fmt.Errorf("incomplete Redis role observation, unobserved pods %v", topology.Unobserved)
+	}
+	if !slices.Contains(topology.Masters, candidate) {
+		return fmt.Errorf("%s is not serving as master", candidate)
+	}
+	allPods := append(append([]string{}, topology.Masters...), topology.Slaves...)
+	counts := r.Checker.GetReplicationKeyCounts(ctx, rr, allPods)
+	infos := r.observeReplicationInfo(ctx, rr, allPods)
+	for _, pod := range allPods {
+		if _, ok := counts[pod]; !ok {
+			return fmt.Errorf("key count of %s is unknown", pod)
+		}
+		if _, ok := infos[pod]; !ok {
+			return fmt.Errorf("replication state of %s is unknown", pod)
+		}
+	}
+	for _, master := range topology.Masters {
+		if master == candidate {
+			continue
+		}
+		if info := infos[master]; counts[master] != 0 || info.EffectiveOffset() != 0 || info.ConnectedSlaves != 0 {
+			return fmt.Errorf("master %s is not empty: %d keys, replication offset %d, %d attached replicas",
+				master, counts[master], info.EffectiveOffset(), info.ConnectedSlaves)
+		}
+	}
+	validate := r.ValidateRecoveryLineage
+	if validate == nil {
+		validate = k8sutils.ValidateRecoveryLineage
+	}
+	return validate(ctx, r.K8sClient, rr, allPods, candidate, counts)
 }
 
 func sentinelsUnconfigured(answers []string, size int32) bool {
