@@ -222,6 +222,47 @@ func (r *Reconciler) UpdateRedisReplicationMaster(ctx context.Context, instance 
 	})
 }
 
+// recordedMasterIsEmptyReplacement reports whether the recorded master is
+// positively an empty replacement pod (role:master with no keys, no
+// replication offset and no attached replicas) while another observed master
+// positively holds keys. Such a record is disproved, not merely unconfirmed:
+// keeping it would name an empty pod as the master of a group whose data lives
+// elsewhere, and offer it as the preferred recovery candidate. Unknown
+// observations never count as empty.
+func (r *Reconciler) recordedMasterIsEmptyReplacement(ctx context.Context, instance *rrvb2.RedisReplication, masters []string) bool {
+	recorded := instance.Status.MasterNode
+	if recorded == "" || r.Checker == nil || len(masters) < 2 || !slices.Contains(masters, recorded) {
+		return false
+	}
+	counts := r.Checker.GetReplicationKeyCounts(ctx, instance, masters)
+	infos := r.observeReplicationInfo(ctx, instance, masters)
+	keys, known := counts[recorded]
+	info, observed := infos[recorded]
+	if !known || !observed || keys != 0 || info.EffectiveOffset() != 0 || info.ConnectedSlaves != 0 {
+		return false
+	}
+	for _, master := range masters {
+		if master != recorded && counts[master] > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Reconciler) clearRecordedEmptyMaster(ctx context.Context, instance *rrvb2.RedisReplication) error {
+	log.FromContext(ctx).Info("Recorded master is an empty replacement while another master holds data, clearing the recorded master node",
+		"statusMasterNode", instance.Status.MasterNode)
+	monitoring.RedisReplicationHasMaster.WithLabelValues(instance.Namespace, instance.Name).Set(0)
+	monitoring.RedisReplicationMasterRoleChangesTotal.WithLabelValues(instance.Namespace, instance.Name).Inc()
+	if err := r.updateStatus(ctx, instance, rrvb2.RedisReplicationStatus{
+		ConnectionInfo: instance.GetConnectionInfo(envs.GetServiceDNSDomain()),
+	}); err != nil {
+		return err
+	}
+	instance.Status.MasterNode = ""
+	return nil
+}
+
 func connectionInfoEqual(a, b *rrvb2.ConnectionInfo) bool {
 	if a == nil && b == nil {
 		return true
@@ -939,6 +980,10 @@ func (r *Reconciler) reconcileStatus(ctx context.Context, instance *rrvb2.RedisR
 	// Preserve it for the existing conservative bootstrap recovery policy.
 	if realMaster != "" {
 		if err = r.UpdateRedisReplicationMaster(ctx, instance, realMaster, false); err != nil {
+			return intctrlutil.RequeueE(ctx, err, "")
+		}
+	} else if r.recordedMasterIsEmptyReplacement(ctx, instance, masterNodes) {
+		if err = r.clearRecordedEmptyMaster(ctx, instance); err != nil {
 			return intctrlutil.RequeueE(ctx, err, "")
 		}
 	}

@@ -412,3 +412,88 @@ func TestReconcileStatusRecordsSurvivingDataMaster(t *testing.T) {
 	require.NotNil(t, h.healer.published)
 	require.Equal(t, podName(0), *h.healer.published, "the data-holding master must enter the writable Service")
 }
+
+// While Sentinel authority is unresolved no master is published. The recorded
+// master is kept as a recovery hint unless it is positively an empty
+// replacement next to a master that holds data.
+func TestReconcileStatusNeverKeepsAnEmptyReplacementRecordedAsMaster(t *testing.T) {
+	unresolved := func(s *placeholderScenario) { s.sentinels[2] = sentinelOpinion{unreachable: true} }
+	for _, tc := range []struct {
+		name         string
+		arrange      func(*placeholderScenario)
+		wantRecorded string
+	}{
+		{
+			name:         "recorded master is an empty replacement next to a data-holding master",
+			arrange:      unresolved,
+			wantRecorded: "",
+		},
+		{
+			name: "recorded master's key count is unknown",
+			arrange: func(s *placeholderScenario) {
+				unresolved(s)
+				delete(s.counts, podName(2))
+			},
+			wantRecorded: podName(2),
+		},
+		{
+			name: "recorded master's replication state is unknown",
+			arrange: func(s *placeholderScenario) {
+				unresolved(s)
+				delete(s.infos, podName(2))
+			},
+			wantRecorded: podName(2),
+		},
+		{
+			name: "recorded master has replication history",
+			arrange: func(s *placeholderScenario) {
+				unresolved(s)
+				s.infos[podName(2)] = k8sutils.ReplicationNodeInfo{Role: "master", ReplID: "c3", MasterReplOffset: 77}
+			},
+			wantRecorded: podName(2),
+		},
+		{
+			name: "recorded master holds data too",
+			arrange: func(s *placeholderScenario) {
+				unresolved(s)
+				s.counts[podName(2)] = 9
+			},
+			wantRecorded: podName(2),
+		},
+		{
+			name: "no master is known to hold data",
+			arrange: func(s *placeholderScenario) {
+				unresolved(s)
+				s.counts[podName(0)] = 0
+			},
+			wantRecorded: podName(2),
+		},
+		{
+			name: "the data-holding master's key count is unknown",
+			arrange: func(s *placeholderScenario) {
+				unresolved(s)
+				delete(s.counts, podName(0))
+			},
+			wantRecorded: podName(2),
+		},
+		{
+			name: "recorded master is the data-holding master",
+			arrange: func(s *placeholderScenario) {
+				unresolved(s)
+				s.recorded = podName(0)
+			},
+			wantRecorded: podName(0),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scenario := newPlaceholderScenario()
+			tc.arrange(scenario)
+			h := scenario.build(t)
+			_, err := h.reconciler.reconcileStatus(context.Background(), h.instance)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantRecorded, h.recordedMaster(t))
+			require.NotNil(t, h.healer.published)
+			require.Empty(t, *h.healer.published, "no master may be published while Sentinel authority is unresolved")
+		})
+	}
+}

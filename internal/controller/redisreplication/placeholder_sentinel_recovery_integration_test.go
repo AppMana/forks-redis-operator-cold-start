@@ -434,6 +434,9 @@ func runPlaceholderSentinelRecovery(t *testing.T, secondDataMaster bool) {
 		state, err := observeSentinel(sentinel0IP)
 		require.NoError(t, err)
 		require.Equal(t, survivorIP, state.host, "the configured Sentinel must keep its monitor")
+		current := &rrvb2.RedisReplication{}
+		require.NoError(t, ctrlClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: rrName}, current))
+		require.Empty(t, current.Status.MasterNode, "the empty replacement must not stay recorded as master, and no ambiguous master may be recorded")
 		for _, pod := range pods[:3] {
 			live, err := k8sClient.CoreV1().Pods(ns).Get(ctx, pod.Name, metav1.GetOptions{})
 			require.NoError(t, err)
