@@ -836,6 +836,16 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 		allPods := append(append([]string{}, masterNodes...), slaveNodes...)
 		counts := r.Checker.GetReplicationKeyCounts(ctx, instance, allPods)
 		infos := r.observeReplicationInfo(ctx, instance, allPods)
+		if recorded, ok := k8sutils.RecordedMasterAmongUnrelatedMasters(instance, masterNodes, slaveNodes, counts, infos); ok && r.noSentinelNamesAnotherPod(ctx, instance, recorded) {
+			log.FromContext(ctx).Info("Every Redis pod is an unattached master with a replication history of its own and no Sentinel names another live pod; restoring the recorded master",
+				"master", recorded,
+				"masters", masterNodes)
+			if err := r.createRedisReplicationLink(ctx, instance, allPods, recorded); err != nil {
+				return intctrlutil.RequeueE(ctx, err, "cold-start replication repair failed")
+			}
+			r.reconcileSentinelsAfterRecovery(ctx, instance, recorded)
+			return intctrlutil.RequeueAfter(ctx, noMasterRequeue, "observe recovered primary")
+		}
 		realMaster = k8sutils.SelectRecoveryMaster(instance, masterNodes, slaveNodes, counts, infos)
 		validate := r.ValidateRecoveryLineage
 		if validate == nil {

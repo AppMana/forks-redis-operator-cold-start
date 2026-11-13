@@ -343,3 +343,51 @@ func PromoteMasterAndReslave(ctx context.Context, client kubernetes.Interface, c
 	}
 	return nil
 }
+
+// RecordedMasterAmongUnrelatedMasters returns the recorded master when every
+// configured pod is an unattached master and the recorded master holds data.
+//
+// That is the state after every pod of a persistent replication restarted
+// from its own disk: each one loads its copy of the dataset, reports
+// role:master and generates a new replication ID. No pod replicates from
+// another, so the histories share nothing that ValidateRecoveryLineage could
+// compare, and the offsets only count what each pod did since it started.
+// Waiting cannot resolve it either: the IDs never converge on their own.
+//
+// The record is then the only remaining statement about which copy was the
+// primary: it names the last pod that was positively identified as the elected
+// master and published for writes, and the other pods were its replicas. It
+// is used only when it is not contradicted: the pod is observed as a master,
+// it holds keys, and no master has an attached replica. A master that shares
+// the recorded master's replication ID has a comparable history, which stays
+// subject to the lineage rules instead. Missing observations never count as
+// empty or unattached.
+//
+// Callers must separately establish that no Sentinel holds an election for
+// another live pod.
+func RecordedMasterAmongUnrelatedMasters(cr *rrvb2.RedisReplication, masters, slaves []string, counts map[string]int64, infos map[string]ReplicationNodeInfo) (string, bool) {
+	if cr == nil || cr.Spec.Size == nil || len(slaves) != 0 || len(masters) < 2 || len(masters) != int(*cr.Spec.Size) {
+		return "", false
+	}
+	recorded := cr.Status.MasterNode
+	if recorded == "" || !slices.Contains(masters, recorded) {
+		return "", false
+	}
+	recordedInfo, ok := infos[recorded]
+	if !ok || recordedInfo.ReplID == "" || strings.Trim(recordedInfo.ReplID, "0") == "" {
+		return "", false
+	}
+	if keys, ok := counts[recorded]; !ok || keys <= 0 {
+		return "", false
+	}
+	for _, master := range masters {
+		info, observed := infos[master]
+		if _, counted := counts[master]; !counted || !observed || info.Role != "master" || info.ConnectedSlaves != 0 {
+			return "", false
+		}
+		if master != recorded && info.ReplID == recordedInfo.ReplID {
+			return "", false
+		}
+	}
+	return recorded, true
+}

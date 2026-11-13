@@ -131,3 +131,75 @@ func TestSelectRecoveryMasterNeverPicksEmptyRestartedMasterOverHighOffsetSlaves(
 	got = SelectRecoveryMaster(cr, masters, slaves, counts, infos)
 	assert.Equal(t, "redis-master-1", got)
 }
+
+func TestRecordedMasterAmongUnrelatedMasters(t *testing.T) {
+	pods := []string{"r-0", "r-1", "r-2"}
+	type state struct {
+		recorded string
+		masters  []string
+		slaves   []string
+		counts   map[string]int64
+		infos    map[string]ReplicationNodeInfo
+	}
+	// Every pod restarted from its own disk: each is a master holding a copy
+	// of the dataset under a replication ID of its own. The offsets only count
+	// what each pod did since it started.
+	restarted := func() *state {
+		return &state{
+			recorded: "r-0",
+			masters:  pods,
+			counts:   map[string]int64{"r-0": 1053, "r-1": 7695, "r-2": 7001},
+			infos: map[string]ReplicationNodeInfo{
+				"r-0": {Role: "master", ReplID: "a1", MasterReplOffset: 12},
+				"r-1": {Role: "master", ReplID: "b2", MasterReplOffset: 6160},
+				"r-2": {Role: "master", ReplID: "c3", MasterReplOffset: 5900},
+			},
+		}
+	}
+	for _, tc := range []struct {
+		name    string
+		arrange func(*state)
+		want    string
+	}{
+		{"every pod is an unattached master on its own replication ID", func(*state) {}, "r-0"},
+		{"the other masters are empty", func(s *state) { s.counts["r-1"], s.counts["r-2"] = 0, 0 }, "r-0"},
+		{"no master is recorded", func(s *state) { s.recorded = "" }, ""},
+		{"the recorded pod is not in the group", func(s *state) { s.recorded = "r-7" }, ""},
+		{"the recorded master is empty", func(s *state) { s.counts["r-0"] = 0 }, ""},
+		{"the recorded master's key count is unknown", func(s *state) { delete(s.counts, "r-0") }, ""},
+		{"another key count is unknown", func(s *state) { delete(s.counts, "r-2") }, ""},
+		{"a replication state is unknown", func(s *state) { delete(s.infos, "r-1") }, ""},
+		{"the recorded master has no replication ID", func(s *state) {
+			s.infos["r-0"] = ReplicationNodeInfo{Role: "master", MasterReplOffset: 12}
+		}, ""},
+		{"a pod is a replica", func(s *state) {
+			s.masters, s.slaves = []string{"r-0", "r-1"}, []string{"r-2"}
+			s.infos["r-2"] = ReplicationNodeInfo{Role: "slave", ReplID: "c3", MasterLinkStatus: "down"}
+		}, ""},
+		{"a pod is unobserved", func(s *state) { s.masters = []string{"r-0", "r-1"} }, ""},
+		{"another master has an attached replica", func(s *state) {
+			s.infos["r-1"] = ReplicationNodeInfo{Role: "master", ReplID: "b2", ConnectedSlaves: 1}
+		}, ""},
+		{"the recorded master has an attached replica", func(s *state) {
+			s.infos["r-0"] = ReplicationNodeInfo{Role: "master", ReplID: "a1", ConnectedSlaves: 1}
+		}, ""},
+		{"another master shares the recorded master's replication ID", func(s *state) {
+			s.infos["r-1"] = ReplicationNodeInfo{Role: "master", ReplID: "a1", MasterReplOffset: 6160}
+		}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := restarted()
+			tc.arrange(s)
+			size := int32(len(pods))
+			cr := &rrvb2.RedisReplication{
+				Spec:   rrvb2.RedisReplicationSpec{Size: &size},
+				Status: rrvb2.RedisReplicationStatus{MasterNode: s.recorded},
+			}
+			got, ok := RecordedMasterAmongUnrelatedMasters(cr, s.masters, s.slaves, s.counts, s.infos)
+			assert.Equal(t, tc.want, got)
+			assert.Equal(t, tc.want != "", ok)
+		})
+	}
+	_, ok := RecordedMasterAmongUnrelatedMasters(nil, pods, nil, nil, nil)
+	assert.False(t, ok)
+}

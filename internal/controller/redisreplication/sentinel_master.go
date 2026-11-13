@@ -280,7 +280,7 @@ func (r *Reconciler) sentinelElectedMaster(ctx context.Context, rr *rrvb2.RedisR
 			logger.Info("Sentinel authority unresolved; refusing fallback election", "sentinelMaster", pod, "reason", err.Error())
 			return "", true
 		}
-		logger.Info("Following the configured Sentinels: the others are unconfigured and every other self-declared master is empty",
+		logger.Info("Following the configured Sentinels: the others are unconfigured and the Redis data confirms the monitored master",
 			"sentinelMaster", pod)
 	}
 	return pod, true
@@ -315,8 +315,8 @@ func uncontestedSentinelAddress(answers []string, electorate int32) (string, boo
 	return named, named != ""
 }
 
-// verifySoleDataMaster proves that making candidate the master of every other
-// pod cannot discard data. It returns nil only when
+// verifySoleDataMaster proves that candidate holds the authoritative dataset
+// before every other pod is made its replica. It returns nil only when
 //   - every configured pod was observed, with its key count and replication
 //     state (a missing observation is never treated as empty),
 //   - candidate itself reports role:master,
@@ -324,7 +324,12 @@ func uncontestedSentinelAddress(answers []string, electorate int32) (string, boo
 //     offset and no attached replicas, and
 //   - the recovery lineage rules accept candidate against every remaining
 //     pod, so a replica holding data shares its replication ID and is not
-//     ahead of it.
+//     ahead of it,
+//
+// or when candidate is the recorded master among unattached masters that share
+// no replication history (see k8sutils.RecordedMasterAmongUnrelatedMasters):
+// pods restarted from their own disks hold data too, and then the record and
+// the Sentinels that monitor a master agree on the same pod.
 func (r *Reconciler) verifySoleDataMaster(ctx context.Context, rr *rrvb2.RedisReplication, candidate string) error {
 	if r.Checker == nil {
 		return errors.New("no checker configured")
@@ -350,6 +355,9 @@ func (r *Reconciler) verifySoleDataMaster(ctx context.Context, rr *rrvb2.RedisRe
 			return fmt.Errorf("replication state of %s is unknown", pod)
 		}
 	}
+	if recorded, ok := k8sutils.RecordedMasterAmongUnrelatedMasters(rr, topology.Masters, topology.Slaves, counts, infos); ok && recorded == candidate {
+		return nil
+	}
 	for _, master := range topology.Masters {
 		if master == candidate {
 			continue
@@ -364,6 +372,65 @@ func (r *Reconciler) verifySoleDataMaster(ctx context.Context, rr *rrvb2.RedisRe
 		validate = k8sutils.ValidateRecoveryLineage
 	}
 	return validate(ctx, r.K8sClient, rr, allPods, candidate, counts)
+}
+
+// noSentinelNamesAnotherPod reports whether every Sentinel monitoring rr
+// answered and none of them names a live Redis pod other than candidate. A
+// Sentinel may monitor nothing, the unspecified-address placeholder, candidate
+// itself, or an address that belongs to no live pod: none of those is an
+// election for a pod that exists. A Sentinel that is missing or does not
+// answer may hold one, so it refuses.
+func (r *Reconciler) noSentinelNamesAnotherPod(ctx context.Context, rr *rrvb2.RedisReplication, candidate string) bool {
+	if r.Client == nil {
+		return true
+	}
+	groups, err := listSentinelGroups(ctx, r.Client, rr)
+	if err != nil {
+		return false
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods, client.InNamespace(rr.Namespace), client.MatchingLabels(
+		common.GetRedisLabels(rr.Name, common.SetupTypeReplication, "replication", nil),
+	)); err != nil {
+		return false
+	}
+	checker := redishealer.NewChecker(r.K8sClient)
+	redisClient := r.SentinelClient
+	if redisClient == nil {
+		redisClient = redis.NewClient()
+	}
+	for _, group := range groups {
+		if int32(len(group.pods)) < group.size {
+			return false
+		}
+		password, err := checker.GetPassword(ctx, rr.Namespace, group.password)
+		if err != nil {
+			return false
+		}
+		for _, pod := range group.pods {
+			if pod.Status.PodIP == "" || pod.DeletionTimestamp != nil {
+				return false
+			}
+			connInfo := redishealer.ConnectionInfoForPod(ctx, pod, password, group.tls, r.K8sClient, rr.Namespace, "26379")
+			queryCtx, cancel := context.WithTimeout(ctx, sentinelQueryTimeout)
+			host, port, monitored, err := redisClient.Connect(connInfo).SentinelGetMasterAddrByName(queryCtx, group.masterGroup)
+			cancel()
+			if err != nil {
+				return false
+			}
+			if !monitored {
+				continue
+			}
+			addr := net.JoinHostPort(host, port)
+			if isUnspecifiedSentinelAddr(addr) {
+				continue
+			}
+			if named := podForAddress(pods.Items, addr); named != "" && named != candidate {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func sentinelsUnconfigured(answers []string, size int32) bool {

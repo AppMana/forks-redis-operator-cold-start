@@ -48,6 +48,9 @@ func (s sentinelOpinion) SentinelMyID(context.Context) (string, error) {
 }
 
 func (s sentinelOpinion) SentinelGetMasterAddrByName(context.Context, string) (string, string, bool, error) {
+	if s.unreachable {
+		return "", "", false, errors.New("i/o timeout")
+	}
 	if s.unmonitored {
 		return "", "", false, nil
 	}

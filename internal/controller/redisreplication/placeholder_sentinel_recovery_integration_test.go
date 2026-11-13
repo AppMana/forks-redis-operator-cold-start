@@ -10,26 +10,13 @@ import (
 	"testing"
 	"time"
 
-	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
 	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
-	rsvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redissentinel/v1beta2"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common"
-	redishealer "github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/common/redis"
-	"github.com/OT-CONTAINER-KIT/redis-operator/internal/controller/redissentinel"
-	intctrlutil "github.com/OT-CONTAINER-KIT/redis-operator/internal/controllerutil"
-	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	"github.com/go-logr/logr/testr"
-	rediscli "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	k8sfake "k8s.io/client-go/kubernetes/fake"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
-	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 // TestPlaceholderSentinelRecoveryIntegration drives both reconcilers against
@@ -67,10 +54,8 @@ func runPlaceholderSentinelRecovery(t *testing.T, secondDataMaster bool) {
 	ctx = ctrl.LoggerInto(ctx, testr.New(t))
 
 	const (
-		ns          = "default"
-		rrName      = "example-replication"
-		rsName      = "example"
-		masterGroup = "mymaster"
+		ns     = labNamespace
+		rrName = labReplication
 
 		survivorIP    = "127.0.1.10"
 		replacement1  = "127.0.1.11"
@@ -83,100 +68,15 @@ func runPlaceholderSentinelRecovery(t *testing.T, secondDataMaster bool) {
 		oldSentinel1  = "127.0.4.11"
 		oldSentinel2  = "127.0.4.12"
 		datasetKeys   = 200
-		downAfterMS   = "2000"
-		failoverMS    = "10000"
 		sentinelCount = 3
 	)
 
-	startRedis := func(ip, replicaOf string) *exec.Cmd {
-		t.Helper()
-		dir := t.TempDir()
-		conf := fmt.Sprintf("bind %s\nbind-source-addr %s\nreplica-announce-ip %s\nport 6379\nprotected-mode no\nsave \"\"\nappendonly no\ndir %s\n", ip, ip, ip, dir)
-		if replicaOf != "" {
-			conf += fmt.Sprintf("replicaof %s 6379\n", replicaOf)
-		}
-		return startProcess(t, dir, "redis-server", conf)
-	}
-	startSentinel := func(ip, monitor string) *exec.Cmd {
-		t.Helper()
-		dir := t.TempDir()
-		conf := fmt.Sprintf("bind %s\nbind-source-addr %s\nport 26379\nprotected-mode no\ndir %s\n"+
-			"sentinel announce-ip %s\nsentinel monitor %s %s 6379 2\n"+
-			"sentinel down-after-milliseconds %s %s\nsentinel failover-timeout %s %s\nsentinel parallel-syncs %s 1\n",
-			ip, ip, dir, ip, masterGroup, monitor, masterGroup, downAfterMS, masterGroup, failoverMS, masterGroup)
-		return startProcess(t, dir, "redis-sentinel", conf)
-	}
-	redisClient := func(ip, port string) *rediscli.Client {
-		return rediscli.NewClient(&rediscli.Options{Addr: ip + ":" + port, DialTimeout: 2 * time.Second})
-	}
-	type redisState struct {
-		info  k8sutils.ReplicationNodeInfo
-		keys  int64
-		runID string
-	}
-	observeRedis := func(ip string) (redisState, error) {
-		c := redisClient(ip, "6379")
-		defer c.Close()
-		raw, err := c.Info(ctx, "replication").Result()
-		if err != nil {
-			return redisState{}, err
-		}
-		info, err := k8sutils.ParseReplicationNodeInfo(raw)
-		if err != nil {
-			return redisState{}, err
-		}
-		keys, err := c.DBSize(ctx).Result()
-		if err != nil {
-			return redisState{}, err
-		}
-		server, err := c.Info(ctx, "server").Result()
-		if err != nil {
-			return redisState{}, err
-		}
-		return redisState{info: info, keys: keys, runID: infoField(server, "run_id")}, nil
-	}
-	type sentinelState struct {
-		host, flags, status string
-		slaves, sentinels   int
-		peers               map[string]string
-		quorumOK            bool
-	}
-	observeSentinel := func(ip string) (sentinelState, error) {
-		c := redisClient(ip, "26379")
-		defer c.Close()
-		masterCmd := rediscli.NewMapStringStringCmd(ctx, "SENTINEL", "MASTER", masterGroup)
-		if err := c.Process(ctx, masterCmd); err != nil {
-			return sentinelState{}, err
-		}
-		fields := masterCmd.Val()
-		state := sentinelState{host: fields["ip"], flags: fields["flags"], peers: map[string]string{}}
-		_, _ = fmt.Sscan(fields["num-slaves"], &state.slaves)
-		_, _ = fmt.Sscan(fields["num-other-sentinels"], &state.sentinels)
-		state.sentinels++
-		raw, err := c.Info(ctx, "sentinel").Result()
-		if err != nil {
-			return sentinelState{}, err
-		}
-		for _, line := range strings.Split(raw, "\n") {
-			if strings.HasPrefix(line, "master0:") {
-				for _, field := range strings.Split(strings.TrimSpace(strings.TrimPrefix(line, "master0:")), ",") {
-					if value, ok := strings.CutPrefix(field, "status="); ok {
-						state.status = value
-					}
-				}
-			}
-		}
-		peerCmd := rediscli.NewMapStringStringSliceCmd(ctx, "SENTINEL", "SENTINELS", masterGroup)
-		if err := c.Process(ctx, peerCmd); err != nil {
-			return sentinelState{}, err
-		}
-		for _, peer := range peerCmd.Val() {
-			state.peers[peer["ip"]] = peer["flags"]
-		}
-		quorum, err := c.Do(ctx, "SENTINEL", "CKQUORUM", masterGroup).Text()
-		state.quorumOK = err == nil && strings.HasPrefix(quorum, "OK ")
-		return state, nil
-	}
+	startRedis := func(ip, replicaOf string) *exec.Cmd { return labStartRedis(t, ip, replicaOf, "") }
+	startSentinel := func(ip, monitor string) *exec.Cmd { return labStartSentinel(t, ip, monitor) }
+	redisClient := labRedisClient
+	type redisState = labRedisState
+	observeRedis := func(ip string) (redisState, error) { return labObserveRedis(ctx, ip) }
+	observeSentinel := func(ip string) (labSentinelState, error) { return labObserveSentinel(ctx, ip) }
 
 	// 1. A healthy group: the survivor is the master of two replicas, watched
 	// by three Sentinels.
@@ -259,81 +159,13 @@ func runPlaceholderSentinelRecovery(t *testing.T, secondDataMaster bool) {
 		require.NoError(t, stray.Close())
 	}
 
-	// 3. The Kubernetes view of that state.
-	scheme := runtime.NewScheme()
-	require.NoError(t, rrvb2.AddToScheme(scheme))
-	require.NoError(t, rsvb2.AddToScheme(scheme))
-	require.NoError(t, corev1.AddToScheme(scheme))
-	require.NoError(t, appsv1.AddToScheme(scheme))
-
-	rr := &rrvb2.RedisReplication{
-		ObjectMeta: metav1.ObjectMeta{Name: rrName, Namespace: ns, UID: "rr-uid", Finalizers: []string{RedisReplicationFinalizer}},
-		Spec: rrvb2.RedisReplicationSpec{
-			Size:             ptr.To(int32(3)),
-			KubernetesConfig: commonapi.KubernetesConfig{Image: "redis:7"},
-		},
-		// The recorded master is one of the replaced pods.
-		Status: rrvb2.RedisReplicationStatus{MasterNode: rrName + "-2"},
-	}
-	rs := &rsvb2.RedisSentinel{
-		ObjectMeta: metav1.ObjectMeta{Name: rsName, Namespace: ns, UID: "rs-uid", Finalizers: []string{redissentinel.RedisSentinelFinalizer}},
-		Spec: rsvb2.RedisSentinelSpec{
-			Size:             ptr.To(int32(sentinelCount)),
-			KubernetesConfig: commonapi.KubernetesConfig{Image: "redis-sentinel:7"},
-			RedisSentinelConfig: &rsvb2.RedisSentinelConfig{
-				RedisSentinelConfig: commonapi.RedisSentinelConfig{
-					RedisReplicationName: rrName,
-					MasterGroupName:      masterGroup,
-					SentinelConfig: commonapi.SentinelConfig{
-						Quorum:                "2",
-						DownAfterMilliseconds: downAfterMS,
-						FailoverTimeout:       failoverMS,
-						ParallelSyncs:         "1",
-					},
-				},
-			},
-		},
-	}
-	redisLabels := common.GetRedisLabels(rr.Name, common.SetupTypeReplication, "replication", nil)
-	sentinelLabels := common.GetRedisLabels(rs.GetStatefulSetName(), common.SetupTypeSentinel, "sentinel", nil)
-	statefulSet := func(name string, labels map[string]string) *appsv1.StatefulSet {
-		return &appsv1.StatefulSet{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
-			Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(int32(3)), Selector: &metav1.LabelSelector{MatchLabels: labels}},
-			Status:     appsv1.StatefulSetStatus{Replicas: 3, ReadyReplicas: 3, UpdatedReplicas: 3},
-		}
-	}
-	redisSTS := statefulSet(rrName, redisLabels)
-	sentinelSTS := statefulSet(rs.GetStatefulSetName(), sentinelLabels)
-	survivorLabels := map[string]string{common.RedisRoleLabelKey: common.RedisRoleLabelSlave}
-	for k, v := range redisLabels {
-		survivorLabels[k] = v
-	}
-	pods := []*corev1.Pod{
-		newRunningPodForTest(ns, rrName+"-0", survivorIP, survivorLabels, true),
-		newRunningPodForTest(ns, rrName+"-1", replacement1, redisLabels, true),
-		newRunningPodForTest(ns, rrName+"-2", replacement2, redisLabels, true),
-		newRunningPodForTest(ns, rs.GetStatefulSetName()+"-0", sentinel0IP, sentinelLabels, true),
-		newRunningPodForTest(ns, rs.GetStatefulSetName()+"-1", sentinel1IP, sentinelLabels, true),
-		newRunningPodForTest(ns, rs.GetStatefulSetName()+"-2", sentinel2IP, sentinelLabels, true),
-	}
-	k8sObjects := []runtime.Object{redisSTS, sentinelSTS}
-	ctrlBuilder := clientfake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&rrvb2.RedisReplication{}, &rsvb2.RedisSentinel{}).
-		WithObjects(rr, rs, redisSTS, sentinelSTS)
-	for _, pod := range pods {
-		k8sObjects = append(k8sObjects, pod)
-		ctrlBuilder = ctrlBuilder.WithObjects(pod)
-	}
-	k8sClient := k8sfake.NewSimpleClientset(k8sObjects...)
-	ctrlClient := ctrlBuilder.Build()
-	healer := redishealer.NewHealer(k8sClient)
-	checker := redishealer.NewChecker(k8sClient)
-	rrReconciler := &Reconciler{Client: ctrlClient, StatefulSet: &fakeStatefulSetService{}, Healer: healer, Checker: checker, K8sClient: k8sClient}
-	rsReconciler := &redissentinel.RedisSentinelReconciler{
-		Client: ctrlClient, Checker: checker, Healer: healer, K8sClient: k8sClient,
-		ReplicationWatcher: intctrlutil.NewResourceWatcher(),
-	}
+	// 3. The Kubernetes view of that state. The recorded master is one of the
+	// replaced pods, and the survivor still carries its stale replica label.
+	lab := newLabControllers(t, rrName+"-2",
+		[3]string{survivorIP, replacement1, replacement2},
+		[3]string{sentinel0IP, sentinel1IP, sentinel2IP},
+		map[string]string{rrName + "-0": common.RedisRoleLabelSlave})
+	ctrlClient, k8sClient := lab.ctrlClient, lab.k8sClient
 
 	// 4. Reconcile as the manager would: a refusal is a requeue, not a test
 	// failure. The dataset must be intact on the survivor after every step.
@@ -388,25 +220,7 @@ func runPlaceholderSentinelRecovery(t *testing.T, secondDataMaster bool) {
 	reason := ""
 	done := false
 	for pass := 1; pass <= passes && !done; pass++ {
-		current := &rrvb2.RedisReplication{}
-		require.NoError(t, ctrlClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: rrName}, current))
-		if _, err := rrReconciler.reconcileStatus(ctx, current); err != nil {
-			t.Logf("pass %d: RedisReplication status: %v", pass, err)
-		}
-		requireSurvivorIntact(fmt.Sprintf("pass %d after RedisReplication status", pass))
-
-		require.NoError(t, ctrlClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: rrName}, current))
-		if result, err := rrReconciler.reconcileRedis(ctx, current); err != nil {
-			t.Logf("pass %d: RedisReplication redis: %v", pass, err)
-		} else {
-			t.Logf("pass %d: RedisReplication redis requeueAfter=%s", pass, result.RequeueAfter)
-		}
-		requireSurvivorIntact(fmt.Sprintf("pass %d after RedisReplication redis", pass))
-
-		if _, err := rsReconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: rsName}}); err != nil {
-			t.Logf("pass %d: RedisSentinel: %v", pass, err)
-		}
-		requireSurvivorIntact(fmt.Sprintf("pass %d after RedisSentinel", pass))
+		lab.reconcileOnce(ctx, t, pass, requireSurvivorIntact)
 
 		done, reason = converged()
 		if !done {
@@ -437,10 +251,8 @@ func runPlaceholderSentinelRecovery(t *testing.T, secondDataMaster bool) {
 		current := &rrvb2.RedisReplication{}
 		require.NoError(t, ctrlClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: rrName}, current))
 		require.Empty(t, current.Status.MasterNode, "the empty replacement must not stay recorded as master, and no ambiguous master may be recorded")
-		for _, pod := range pods[:3] {
-			live, err := k8sClient.CoreV1().Pods(ns).Get(ctx, pod.Name, metav1.GetOptions{})
-			require.NoError(t, err)
-			require.NotEqual(t, common.RedisRoleLabelMaster, live.Labels[common.RedisRoleLabelKey], "no pod may enter the writable Service")
+		for _, pod := range lab.redisPodName {
+			require.NotEqual(t, common.RedisRoleLabelMaster, lab.roleLabel(ctx, t, pod), "no pod may enter the writable Service")
 		}
 		return
 	}
